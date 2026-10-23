@@ -1,0 +1,1445 @@
+# tests/exchanges/test_ccxt_bot.py
+import logging
+import math
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"code": "200000", "data": {"apiKey": "SECRET"}}, "ok"),
+        ({"status": "ok", "message": "SECRET"}, "ok"),
+        ({"message": "No need SECRET"}, "ok (unchanged)"),
+        ({"leverage": "10", "secret": "SECRET"}, "leverage=10x"),
+        ({"code": "51039", "msg": "SECRET"}, "code=51039"),
+        ({"code": 10**100, "msg": "SECRET"}, "code_present"),
+        ({"code": "unsafe SECRET", "msg": "SECRET"}, "code_present"),
+        ({"msg": "SECRET"}, "message_present"),
+        ({"apiKey": "SECRET"}, "response=dict"),
+        ("SECRET", "result_type=str"),
+    ],
+)
+def test_format_exchange_config_response_is_value_safe(response, expected):
+    from exchanges.ccxt_bot import format_exchange_config_response
+
+    rendered = format_exchange_config_response(response)
+
+    assert rendered == expected
+    assert len(rendered) <= 64
+    assert "SECRET" not in rendered
+
+
+@pytest.mark.parametrize("leverage", [True, math.nan, math.inf, "not-a-number SECRET"])
+def test_format_exchange_config_response_rejects_non_numeric_leverage(leverage):
+    from exchanges.ccxt_bot import format_exchange_config_response
+
+    rendered = format_exchange_config_response(
+        {"leverage": leverage, "secret": "SECRET"}
+    )
+
+    assert rendered == "response=dict"
+    assert "SECRET" not in rendered
+
+
+class TestCCXTBotSessionCreation:
+    """Test CCXTBot CCXT session initialization."""
+
+    def test_build_ccxt_config_with_api_key(self):
+        """Should build CCXT config from api-keys with CCXT credential fields."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        # Use __new__ to create instance without calling __init__
+        # This bypasses complex Passivbot initialization
+        bot = CCXTBot.__new__(CCXTBot)
+        # Use CCXT field names directly (apiKey, secret, password)
+        bot.user_info = {
+            "exchange": "binance",
+            "apiKey": "test_key",
+            "secret": "test_secret",
+            "password": "test_pass",
+            "quote": "USDT",
+        }
+
+        config = bot._build_ccxt_config()
+
+        assert config["apiKey"] == "test_key"
+        assert config["secret"] == "test_secret"
+        assert config["password"] == "test_pass"
+        assert config["enableRateLimit"] is True
+        assert "walletAddress" not in config  # Not provided
+
+    def test_build_ccxt_config_with_wallet(self):
+        """Should build CCXT config from api-keys with CCXT wallet fields."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        # Use __new__ to create instance without calling __init__
+        bot = CCXTBot.__new__(CCXTBot)
+        # Use CCXT field names directly (walletAddress, privateKey)
+        bot.user_info = {
+            "exchange": "hyperliquid",
+            "walletAddress": "0xABC123",
+            "privateKey": "0xDEF456",
+            "quote": "USDC",
+        }
+
+        config = bot._build_ccxt_config()
+
+        assert config["walletAddress"] == "0xABC123"
+        assert config["privateKey"] == "0xDEF456"
+        assert "apiKey" not in config  # Not provided
+
+    def test_build_ccxt_config_default_timeout(self):
+        """Should set a default timeout of 30 000 ms when user_info has no timeout."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.user_info = {
+            "exchange": "bybit",
+            "apiKey": "k",
+            "secret": "s",
+            "quote": "USDT",
+        }
+
+        config = bot._build_ccxt_config()
+
+        assert config["timeout"] == 30000
+
+    def test_build_ccxt_config_user_timeout_not_overridden(self):
+        """User-supplied timeout in user_info must take precedence over the default."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.user_info = {
+            "exchange": "bybit",
+            "apiKey": "k",
+            "secret": "s",
+            "quote": "USDT",
+            "timeout": 60000,
+        }
+
+        config = bot._build_ccxt_config()
+
+        assert config["timeout"] == 60000
+
+
+class TestCCXTBotFetchBalance:
+    """Test CCXTBot balance fetching."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_balance_returns_quote_total(self):
+        """Should return total balance for quote currency."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        # Use __new__ to bypass complex Passivbot initialization
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.quote = "USDT"
+        bot.cca = AsyncMock()
+        bot.cca.fetch_balance = AsyncMock(
+            return_value={
+                "total": {"USDT": 1000.50, "BTC": 0.5},
+                "free": {"USDT": 900.0},
+            }
+        )
+
+        balance = await bot.fetch_balance()
+
+        assert balance == 1000.50
+
+    @pytest.mark.asyncio
+    async def test_fetch_balance_raises_when_quote_missing(self):
+        """Should fail loudly when quote currency is missing from total balance."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        # Use __new__ to bypass complex Passivbot initialization
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.quote = "USDC"
+        bot.cca = AsyncMock()
+        bot.cca.fetch_balance = AsyncMock(
+            return_value={
+                "total": {"USDT": 1000.0},
+            }
+        )
+
+        with pytest.raises(
+            KeyError,
+            match=r"testexchange: fetch_balance response missing total\['USDC'\]",
+        ):
+            await bot.fetch_balance()
+
+
+class TestCCXTBotFetchPositions:
+    """Test CCXTBot position fetching."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_positions_returns_open_positions(self):
+        """Should return list of open positions with normalized fields."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        # Use __new__ to bypass complex Passivbot initialization
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = AsyncMock()
+        bot.cca.fetch_positions = AsyncMock(
+            return_value=[
+                {
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "long",
+                    "contracts": 0.5,
+                    "entryPrice": 50000.0,
+                },
+                {
+                    "symbol": "ETH/USDT:USDT",
+                    "side": "short",
+                    "contracts": 2.0,
+                    "entryPrice": 3000.0,
+                },
+                {
+                    "symbol": "SOL/USDT:USDT",
+                    "side": "long",
+                    "contracts": 0,  # No position
+                    "entryPrice": 0,
+                },
+            ]
+        )
+
+        positions = await bot.fetch_positions()
+
+        assert len(positions) == 2
+        assert positions[0]["symbol"] == "BTC/USDT:USDT"
+        assert positions[0]["position_side"] == "long"
+        assert positions[0]["size"] == 0.5
+        assert positions[0]["price"] == 50000.0
+        assert positions[1]["position_side"] == "short"
+
+    @pytest.mark.asyncio
+    async def test_fetch_positions_handles_empty(self):
+        """Should return empty list when no positions."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        # Use __new__ to bypass complex Passivbot initialization
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = AsyncMock()
+        bot.cca.fetch_positions = AsyncMock(return_value=[])
+
+        positions = await bot.fetch_positions()
+
+        assert positions == []
+
+
+class TestCCXTBotFetchOpenOrders:
+    """Test CCXTBot open order fetching."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_open_orders_normalizes_fields(self):
+        """Should return orders with position_side and qty fields."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        # Use __new__ to bypass complex Passivbot initialization
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = AsyncMock()
+        bot.cca.fetch_open_orders = AsyncMock(
+            return_value=[
+                {
+                    "id": "123",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "buy",
+                    "amount": 0.1,
+                    "price": 50000.0,
+                    "timestamp": 1000,
+                    "info": {"positionSide": "LONG"},
+                },
+                {
+                    "id": "456",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "sell",
+                    "amount": 0.2,
+                    "price": 55000.0,
+                    "timestamp": 2000,
+                    "info": {},  # No positionSide
+                },
+            ]
+        )
+
+        orders = await bot.fetch_open_orders()
+
+        assert len(orders) == 2
+        assert orders[0]["id"] == "123"
+        assert orders[0]["position_side"] == "long"
+        assert orders[0]["qty"] == 0.1
+        assert orders[1]["position_side"] == "both"  # Fallback
+        assert orders[1]["qty"] == 0.2
+        # Should be sorted by timestamp
+        assert orders[0]["timestamp"] < orders[1]["timestamp"]
+
+
+class TestCCXTBotWatchOrders:
+    """Tests for watch_orders WebSocket handler."""
+
+    @pytest.mark.asyncio
+    async def test_watch_orders_normalizes_fields(self):
+        """Test that watch_orders normalizes position_side and qty."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.stop_websocket = False
+        bot.exchange = "test_exchange"
+
+        # Track calls to handle_order_update
+        handled_orders = []
+        bot.handle_order_update = lambda orders: handled_orders.append(orders)
+
+        # Mock WebSocket client
+        call_count = [0]
+
+        async def mock_watch_orders():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return [
+                    {"id": "order1", "amount": 0.5, "info": {"positionSide": "LONG"}}
+                ]
+            else:
+                # Stop after processing first batch
+                bot.stop_websocket = True
+                # Return order that triggers stop on next iteration
+                return [{"id": "order2", "amount": 1.0, "info": {}}]
+
+        bot.ccp = MagicMock()
+        bot.ccp.has = {"watchOrders": True}  # Required for can_watch_orders()
+        bot.ccp.watch_orders = mock_watch_orders
+
+        await bot.watch_orders()
+
+        # First batch processed and has proper normalization
+        assert len(handled_orders) >= 1
+        order = handled_orders[0][0]
+        assert order["position_side"] == "long"
+        assert order["qty"] == 0.5
+
+
+class TestCCXTBotUpdateExchangeConfig:
+    """Tests for update_exchange_config."""
+
+    @pytest.mark.asyncio
+    async def test_update_exchange_config_sets_hedge_mode(self, caplog):
+        """Test that hedge mode is set when exchange supports it."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+
+        bot.cca = MagicMock()
+        bot.cca.has = {"setPositionMode": True}
+        bot.cca.set_position_mode = AsyncMock(
+            return_value={"result": "success", "apiKey": "SECRET"}
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await bot.update_exchange_config()
+
+        bot.cca.set_position_mode.assert_called_once_with(True)
+        assert "set hedge mode response: response=dict" in caplog.text
+        assert "SECRET" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_update_exchange_config_skips_when_unsupported(self):
+        """Test that method skips gracefully when exchange doesn't support position mode."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+
+        bot.cca = MagicMock()
+        bot.cca.has = {"setPositionMode": False}
+        bot.cca.set_position_mode = AsyncMock()
+
+        await bot.update_exchange_config()
+
+        # Should not be called when not supported
+        bot.cca.set_position_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_exchange_config_skips_when_key_missing(self):
+        """Test that method skips gracefully when setPositionMode key is missing."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+
+        bot.cca = MagicMock()
+        bot.cca.has = {}  # No setPositionMode key at all
+        bot.cca.set_position_mode = AsyncMock()
+
+        await bot.update_exchange_config()
+
+        # Should not be called when key is missing
+        bot.cca.set_position_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_exchange_config_reraises_exception(self):
+        """Test that method logs and re-raises exceptions."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+
+        bot.cca = MagicMock()
+        bot.cca.has = {"setPositionMode": True}
+        bot.cca.set_position_mode = AsyncMock(side_effect=Exception("API error"))
+
+        # Should log and re-raise (fail loudly)
+        with pytest.raises(Exception, match="API error"):
+            await bot.update_exchange_config()
+
+
+class TestCCXTBotUpdateExchangeConfigBySymbols:
+    """Tests for update_exchange_config_by_symbols."""
+
+    @pytest.mark.asyncio
+    async def test_sets_leverage_when_supported(self):
+        """Test that leverage is set for each symbol when supported."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = MagicMock()
+        bot.cca.has = {"setLeverage": True, "setMarginMode": False}
+        bot.cca.set_leverage = AsyncMock()
+        bot.config_get = MagicMock(return_value=10)
+
+        await bot.update_exchange_config_by_symbols(["BTC/USDT:USDT", "ETH/USDT:USDT"])
+
+        assert bot.cca.set_leverage.call_count == 2
+        bot.cca.set_leverage.assert_any_call(10, symbol="BTC/USDT:USDT")
+        bot.cca.set_leverage.assert_any_call(10, symbol="ETH/USDT:USDT")
+
+    @pytest.mark.asyncio
+    async def test_sets_margin_mode_when_supported(self):
+        """Test that margin mode is set for each symbol when supported."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = MagicMock()
+        bot.cca.has = {"setLeverage": False, "setMarginMode": True}
+        bot.cca.set_margin_mode = AsyncMock()
+        bot.config_get = MagicMock(return_value=10)
+
+        await bot.update_exchange_config_by_symbols(["BTC/USDT:USDT"])
+
+        bot.cca.set_margin_mode.assert_called_once_with("cross", symbol="BTC/USDT:USDT")
+
+    @pytest.mark.asyncio
+    async def test_skips_unsupported_operations(self):
+        """Test that unsupported operations are skipped gracefully."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.cca = MagicMock()
+        bot.cca.has = {}  # Neither supported
+        bot.cca.set_leverage = AsyncMock()
+        bot.cca.set_margin_mode = AsyncMock()
+
+        await bot.update_exchange_config_by_symbols(["BTC/USDT:USDT"])
+
+        bot.cca.set_leverage.assert_not_called()
+        bot.cca.set_margin_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_leverage_error_is_logged_and_reraised(self):
+        """Test that leverage errors are logged and re-raised."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = MagicMock()
+        bot.cca.has = {"setLeverage": True}
+        bot.cca.set_leverage = AsyncMock(side_effect=Exception("Leverage API error"))
+        bot.config_get = MagicMock(return_value=10)
+
+        with pytest.raises(Exception, match="Leverage API error"):
+            await bot.update_exchange_config_by_symbols(["BTC/USDT:USDT"])
+
+    @pytest.mark.asyncio
+    async def test_margin_mode_error_is_logged_and_reraised(self):
+        """Test that margin mode errors are logged and re-raised."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = MagicMock()
+        bot.cca.has = {"setMarginMode": True}
+        bot.cca.set_margin_mode = AsyncMock(side_effect=Exception("Margin API error"))
+        bot.config_get = MagicMock(return_value=10)
+
+        with pytest.raises(Exception, match="Margin API error"):
+            await bot.update_exchange_config_by_symbols(["BTC/USDT:USDT"])
+
+
+class TestCCXTBotBatchOrderDiagnostics:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("batch_method", "single_method", "action"),
+        [
+            ("execute_orders", "execute_order", "create"),
+            ("execute_cancellations", "execute_cancellation", "cancel"),
+        ],
+    )
+    async def test_bounds_failures_and_preserves_restart(
+        self, batch_method, single_method, action, caplog, capsys
+    ):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.live_event_console_enabled = False
+        bot._live_event_pipeline = None
+        setattr(
+            bot,
+            single_method,
+            AsyncMock(
+                side_effect=RuntimeError(
+                    "exchange write failed Authorization: Bearer RAW_WRITE_SECRET"
+                )
+            ),
+        )
+        bot.restart_bot_on_too_many_errors = AsyncMock()
+        order = {
+            "id": "order-1",
+            "symbol": "BTC/USDT:USDT",
+            "pb_order_type": "entry_grid_normal_long",
+            "raw_payload": "RAW_ORDER_SECRET",
+        }
+
+        with caplog.at_level(logging.ERROR):
+            results = await getattr(bot, batch_method)([order])
+
+        assert len(results) == 1
+        assert isinstance(results[0], RuntimeError)
+        bot.restart_bot_on_too_many_errors.assert_awaited_once()
+        captured = capsys.readouterr()
+        rendered = captured.out + captured.err + caplog.text
+        assert "RAW_WRITE_SECRET" not in rendered
+        assert "RAW_ORDER_SECRET" not in rendered
+        assert "Authorization" not in rendered
+        assert "raw_payload" not in rendered
+        assert (
+            f"[order] write failed | action={action} symbol=BTC "
+            "type=entry_grid_normal_long error_type=RuntimeError"
+        ) in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_structured_console_suppresses_fallback(self, caplog):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.live_event_console_enabled = True
+        bot._live_event_pipeline = object()
+        bot.execute_order = AsyncMock(side_effect=RuntimeError("RAW_SUPPRESSED_SECRET"))
+        bot.restart_bot_on_too_many_errors = AsyncMock()
+
+        with caplog.at_level(logging.ERROR):
+            results = await bot.execute_orders(
+                [
+                    {
+                        "symbol": "ETH/USDT:USDT",
+                        "pb_order_type": "close_grid_long",
+                    }
+                ]
+            )
+
+        assert len(results) == 1
+        assert isinstance(results[0], RuntimeError)
+        bot.restart_bot_on_too_many_errors.assert_awaited_once()
+        assert "write failed" not in caplog.text
+        assert "RAW_SUPPRESSED_SECRET" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_restart_raise_forces_bounded_fallback(self, caplog, capsys):
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot_exceptions import RestartBotException
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.live_event_console_enabled = True
+        bot._live_event_pipeline = object()
+        bot.execute_order = AsyncMock(
+            side_effect=RuntimeError("write failed apiKey=RAW_RESTART_WRITE_SECRET")
+        )
+        bot.restart_bot_on_too_many_errors = AsyncMock(
+            side_effect=RestartBotException(
+                "restart failed Authorization: Bearer RAW_RESTART_SECRET"
+            )
+        )
+        order = {
+            "symbol": "XRP/USDT:USDT",
+            "pb_order_type": "entry_grid_normal_long",
+            "private": "RAW_RESTART_ORDER_SECRET",
+        }
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RestartBotException, match="restart failed"):
+                await bot.execute_orders([order])
+
+        bot.restart_bot_on_too_many_errors.assert_awaited_once()
+        captured = capsys.readouterr()
+        rendered = captured.out + captured.err + caplog.text
+        assert "RAW_RESTART_WRITE_SECRET" not in rendered
+        assert "RAW_RESTART_SECRET" not in rendered
+        assert "RAW_RESTART_ORDER_SECRET" not in rendered
+        assert (
+            "[order] write failed | action=create symbol=XRP "
+            "type=entry_grid_normal_long error_type=RuntimeError"
+        ) in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_base_sequential_writer_bounds_failure(self, caplog, capsys):
+        from passivbot import Passivbot
+
+        bot = Passivbot.__new__(Passivbot)
+        bot.live_event_console_enabled = False
+        bot._live_event_pipeline = None
+        bot.execute_order = AsyncMock(
+            side_effect=RuntimeError("sequential failed apiKey=RAW_SEQUENTIAL_SECRET")
+        )
+        bot.restart_bot_on_too_many_errors = AsyncMock()
+        order = {
+            "symbol": "SOL/USDT:USDT",
+            "pb_order_type": "entry_grid_normal_long",
+            "private": "RAW_SEQUENTIAL_ORDER_SECRET",
+        }
+
+        with caplog.at_level(logging.ERROR):
+            results = await bot.execute_multiple([order], "execute_order")
+
+        assert len(results) == 1
+        assert isinstance(results[0], RuntimeError)
+        bot.restart_bot_on_too_many_errors.assert_awaited_once()
+        captured = capsys.readouterr()
+        rendered = captured.out + captured.err + caplog.text
+        assert "RAW_SEQUENTIAL_SECRET" not in rendered
+        assert "RAW_SEQUENTIAL_ORDER_SECRET" not in rendered
+        assert "Traceback" not in rendered
+        assert (
+            "[order] write failed | action=create symbol=SOL "
+            "type=entry_grid_normal_long error_type=RuntimeError"
+        ) in caplog.text
+
+
+class TestCCXTBotConnectorCallEvents:
+    @pytest.mark.asyncio
+    async def test_execute_order_emits_before_connector_with_batch_ids(
+        self, monkeypatch
+    ):
+        # Connector diagnostics are tested after upstream admission; owner gates
+        # have separate current-account and stale-permission integration tests.
+        from live.hsl_live import Owner
+
+        monkeypatch.setattr(Owner, "admit", lambda self, order: True)
+
+        from exchanges.ccxt_bot import CCXTBot
+        from live.event_bus import EventTypes, ReasonCodes
+
+        markers = []
+        order = {
+            "symbol": "BTC/USDT:USDT",
+            "type": "limit",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 0.01,
+            "price": 100000.0,
+            "reduce_only": False,
+            "custom_id": "cid-1",
+        }
+
+        class CCA:
+            async def create_order(self, **params):
+                markers.append(("connector", params))
+                return {"id": "oid-1", "status": "open"}
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "binance"
+        bot.user = "binance_01"
+        bot.bot_id = "bot-1"
+        bot.cca = CCA()
+        bot.open_orders = {}
+        bot._build_order_params = lambda _order: {"postOnly": True}
+        bot._live_event_current_cycle_id = "cy_3"
+        bot._execution_connector_call_context = {
+            "action": "create",
+            "orders": [order],
+            "wave": {"event_id": "ow_3"},
+        }
+
+        def capture(event_type, **kwargs):
+            markers.append(("event", event_type, kwargs))
+
+        bot._emit_live_event = capture
+
+        result = await bot.execute_order(order)
+
+        assert result == {"id": "oid-1", "status": "open"}
+        assert [marker[0] for marker in markers[:3]] == ["event", "event", "connector"]
+        # The completed write also requests a fresh account confirmation.
+        assert set(bot._authoritative_pending_confirmations) == {
+            "balance",
+            "positions",
+            "open_orders",
+        }
+        assert markers[0][1] == EventTypes.EXECUTION_CREATE_SENT
+        _, event_type, event = markers[1]
+        assert event_type == EventTypes.EXECUTION_CREATE_CONNECTOR_CALL_STARTED
+        assert event["reason_code"] == ReasonCodes.CONNECTOR_CALL_STARTED
+        assert event["order_wave_id"] == "ow_3"
+        assert event["action_id"] == "ow_3:create:0"
+        assert event["data"]["connector_route"] == "base"
+        assert event["data"]["connector_method"] == "cca.create_order"
+
+    @pytest.mark.asyncio
+    async def test_cancel_connector_call_survives_event_failure(self, monkeypatch):
+        # Connector diagnostics are tested after upstream admission; owner gates
+        # have separate current-account and stale-permission integration tests.
+        from live.hsl_live import Owner
+
+        monkeypatch.setattr(Owner, "admit", lambda self, order: True)
+
+        from exchanges.ccxt_bot import CCXTBot
+
+        connector_calls = []
+
+        class CCA:
+            async def cancel_order(self, order_id, symbol=None):
+                connector_calls.append((order_id, symbol))
+                return {"id": order_id, "status": "canceled"}
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "binance"
+        bot.cca = CCA()
+        bot.recent_order_cancellations = []
+        bot.log_order_action = lambda *args, **kwargs: None
+        bot._log_order_action_summary = lambda *args, **kwargs: None
+
+        def fail_emit(*_args, **_kwargs):
+            raise RuntimeError("diagnostic sink unavailable")
+
+        bot._emit_live_event = fail_emit
+        result = await bot.execute_cancellation(
+            {"id": "oid-2", "symbol": "ETH/USDT:USDT"}
+        )
+
+        assert result == {"id": "oid-2", "status": "canceled"}
+        assert connector_calls == [("oid-2", "ETH/USDT:USDT")]
+
+
+class TestCCXTBotExecuteCancellation:
+    """Tests for execute_cancellation."""
+
+    @pytest.mark.asyncio
+    async def test_treats_bybit_order_not_exists_as_benign(self, caplog, monkeypatch):
+        # Connector diagnostics are tested after upstream admission; owner gates
+        # have separate current-account and stale-permission integration tests.
+        from live.hsl_live import Owner
+
+        monkeypatch.setattr(Owner, "admit", lambda self, order: True)
+
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "bybit"
+        bot.cca = MagicMock()
+        bot.cca.cancel_order = AsyncMock(
+            side_effect=Exception(
+                '{"retCode":110001,"retMsg":"order not exists or too late to cancel"}'
+            )
+        )
+
+        with caplog.at_level(logging.INFO):
+            result = await bot.execute_cancellation(
+                {"id": "abc123def456", "symbol": "SUI/USDT:USDT"}
+            )
+
+        assert result["id"] == "abc123def456"
+        assert result["symbol"] == "SUI/USDT:USDT"
+        assert result["status"] == "success"
+        assert (
+            result["_passivbot_cancel_requires_full_authoritative_confirmation"] is True
+        )
+        assert "cancel skipped" in caplog.text
+        assert "order likely already filled or cancelled" in caplog.text
+        assert not any(record.levelname == "ERROR" for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_unexpected_cancel_error_propagates_without_raw_output(
+        self, caplog, capsys, monkeypatch
+    ):
+        # Connector diagnostics are tested after upstream admission; owner gates
+        # have separate current-account and stale-permission integration tests.
+        from live.hsl_live import Owner
+
+        monkeypatch.setattr(Owner, "admit", lambda self, order: True)
+
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "bybit"
+        bot.cca = MagicMock()
+        bot.cca.cancel_order = AsyncMock(
+            side_effect=Exception(
+                "simulated network outage Authorization: Bearer RAW_CANCEL_SECRET"
+            )
+        )
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(Exception, match="simulated network outage"):
+                await bot.execute_cancellation(
+                    {
+                        "id": "abc123def456",
+                        "symbol": "SUI/USDT:USDT",
+                        "raw_payload": "RAW_CANCEL_ORDER_SECRET",
+                    }
+                )
+
+        captured = capsys.readouterr()
+        rendered = captured.out + captured.err + caplog.text
+        assert "RAW_CANCEL_SECRET" not in rendered
+        assert "RAW_CANCEL_ORDER_SECRET" not in rendered
+        assert "simulated network outage" not in rendered
+
+    def test_cross_only_blocks_isolated_only_symbol_for_entries(self, caplog):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.config = {"live": {"margin_mode_preference": "cross"}}
+        bot._blocked_margin_symbols_warned = set()
+        bot._blocked_margin_symbols_evented = set()
+        bot.markets_dict = {
+            "ISO/USDT:USDT": {
+                "info": {"onlyIsolated": True},
+                "marginModes": {"cross": False, "isolated": True},
+            }
+        }
+
+        with caplog.at_level("WARNING"):
+            filtered = bot._filter_approved_symbols("long", {"ISO/USDT:USDT"})
+
+        assert filtered == set()
+        assert bot._get_margin_mode_for_symbol("ISO/USDT:USDT") == "isolated"
+        assert "isolated margin support is currently disabled" in caplog.text
+
+    def test_isolated_only_market_event_is_bounded_and_requires_enqueue(self):
+        from exchanges.ccxt_bot import CCXTBot
+        from live.event_bus import EventTags, EventTypes, ReasonCodes
+
+        symbols = {f"ISO{idx:02d}/USDT:USDT" for idx in range(14)}
+        cross_symbol = "CROSS/USDT:USDT"
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.config = {"live": {"margin_mode_preference": "cross"}}
+        bot._blocked_margin_symbols_warned = set()
+        bot._blocked_margin_symbols_evented = set()
+        bot.markets_dict = {
+            symbol: {"info": {"onlyIsolated": True}} for symbol in symbols
+        }
+        bot.markets_dict[cross_symbol] = {"info": {}}
+        bot._emit_live_event = MagicMock(return_value=object())
+
+        assert bot._filter_approved_symbols("long", symbols | {cross_symbol}) == {
+            cross_symbol
+        }
+
+        bot._emit_live_event.assert_called_once()
+        args, kwargs = bot._emit_live_event.call_args
+        assert args == (EventTypes.CONFIG_MARKET_COMPATIBILITY,)
+        assert kwargs["level"] == "info"
+        assert kwargs["component"] == "config.market_compatibility"
+        assert kwargs["tags"] == (
+            EventTags.MARKET,
+            EventTags.MODE,
+            EventTags.AVAILABILITY,
+        )
+        assert kwargs["pside"] == "long"
+        assert kwargs["status"] == "degraded"
+        assert kwargs["reason_code"] == ReasonCodes.CONFIG_ISOLATED_ONLY_MARKET_BLOCKED
+        assert kwargs["require_enqueue"] is True
+        assert kwargs["data"] == {
+            "action": "initial_entries_blocked",
+            "margin_mode_preference": "cross",
+            "capability": "isolated_only",
+            "blocked_count": 14,
+            "blocked_symbols": sorted(symbols)[:12],
+            "blocked_symbols_truncated": True,
+        }
+
+    def test_isolated_only_market_warning_and_event_dedupe_are_separate(self, caplog):
+        from exchanges.ccxt_bot import CCXTBot
+
+        symbol = "ISO/USDT:USDT"
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.config = {"live": {"margin_mode_preference": "cross"}}
+        bot._blocked_margin_symbols_warned = set()
+        bot._blocked_margin_symbols_evented = set()
+        bot.markets_dict = {symbol: {"info": {"onlyIsolated": True}}}
+        bot._emit_live_event = MagicMock(return_value=object())
+
+        with caplog.at_level(logging.WARNING):
+            assert bot._filter_approved_symbols("long", {symbol}) == set()
+            assert bot._filter_approved_symbols("long", {symbol}) == set()
+            assert bot._filter_approved_symbols("short", {symbol}) == set()
+
+        assert bot._emit_live_event.call_count == 2
+        assert [
+            call.kwargs["pside"] for call in bot._emit_live_event.call_args_list
+        ] == [
+            "long",
+            "short",
+        ]
+        warnings = [
+            record for record in caplog.records if "disabling" in record.getMessage()
+        ]
+        assert len(warnings) == 2
+        assert bot._blocked_margin_symbols_warned == {
+            ("long", symbol, "isolated_only"),
+            ("short", symbol, "isolated_only"),
+        }
+        assert bot._blocked_margin_symbols_evented == {
+            ("long", symbol, "isolated_only"),
+            ("short", symbol, "isolated_only"),
+        }
+
+    def test_isolated_only_market_event_retries_after_enqueue_failure_without_warning(
+        self, caplog
+    ):
+        from exchanges.ccxt_bot import CCXTBot
+
+        symbol = "ISO/USDT:USDT"
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.config = {"live": {"margin_mode_preference": "cross"}}
+        bot._blocked_margin_symbols_warned = set()
+        bot._blocked_margin_symbols_evented = set()
+        bot.markets_dict = {symbol: {"info": {"onlyIsolated": True}}}
+        bot._emit_live_event = MagicMock(
+            side_effect=[RuntimeError("event enqueue failed"), None, object()]
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert bot._filter_approved_symbols("long", {symbol}) == set()
+            assert bot._filter_approved_symbols("long", {symbol}) == set()
+            assert bot._filter_approved_symbols("long", {symbol}) == set()
+            assert bot._filter_approved_symbols("long", {symbol}) == set()
+
+        assert bot._emit_live_event.call_count == 3
+        assert bot._blocked_margin_symbols_evented == {
+            ("long", symbol, "isolated_only")
+        }
+        warnings = [
+            record for record in caplog.records if "disabling" in record.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    def test_live_margin_mode_is_preserved_when_symbol_has_existing_state(self):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.config = {"live": {"margin_mode_preference": "cross"}}
+        bot._blocked_margin_symbols_warned = set()
+        bot._blocked_margin_symbols_evented = set()
+        bot.markets_dict = {
+            "ISO/USDT:USDT": {
+                "marginModes": {"cross": True, "isolated": True},
+                "info": {},
+            }
+        }
+        bot.positions = {
+            "ISO/USDT:USDT": {
+                "long": {"size": 1.0, "price": 100.0},
+                "short": {"size": 0.0, "price": 0.0},
+            }
+        }
+        bot.open_orders = {}
+        bot._live_margin_modes = {"ISO/USDT:USDT": "isolated"}
+
+        policy = bot._resolve_margin_policy_for_symbol("ISO/USDT:USDT")
+
+        assert policy["mode"] == "isolated"
+        assert policy["blocked"] is False
+        assert policy["live_margin_mode"] == "isolated"
+
+    def test_isolated_only_existing_live_state_is_not_blocked_or_emitted(self):
+        from exchanges.ccxt_bot import CCXTBot
+
+        symbol = "ISO/USDT:USDT"
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.config = {"live": {"margin_mode_preference": "cross"}}
+        bot._blocked_margin_symbols_warned = set()
+        bot._blocked_margin_symbols_evented = set()
+        bot.markets_dict = {symbol: {"info": {"onlyIsolated": True}}}
+        bot.positions = {
+            symbol: {
+                "long": {"size": 1.0},
+                "short": {"size": 0.0},
+            }
+        }
+        bot.open_orders = {}
+        bot._live_margin_modes = {symbol: "isolated"}
+        bot._emit_live_event = MagicMock(return_value=object())
+
+        assert bot._filter_approved_symbols("long", {symbol}) == {symbol}
+        bot._emit_live_event.assert_not_called()
+        assert bot._blocked_margin_symbols_warned == set()
+        assert bot._blocked_margin_symbols_evented == set()
+
+    def test_normalize_positions_records_live_margin_mode(self):
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot._live_margin_modes = {}
+        positions = bot._normalize_positions(
+            [
+                {
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "long",
+                    "contracts": 1.0,
+                    "entryPrice": 100.0,
+                    "marginMode": "isolated",
+                }
+            ]
+        )
+
+        assert positions[0]["margin_mode"] == "isolated"
+        assert bot._live_margin_modes["BTC/USDT:USDT"] == "isolated"
+
+
+class TestCCXTBotSetMarketSpecificSettings:
+    """Tests for set_market_specific_settings."""
+
+    def test_extracts_market_settings(self):
+        """Test that market settings are extracted from CCXT market info."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        # Initialize empty dicts that parent class would create
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+
+        bot.markets_dict = {
+            "BTC/USDT:USDT": {
+                "id": "BTCUSDT",
+                "limits": {
+                    "cost": {"min": 5.0},
+                    "amount": {"min": 0.001},
+                },
+                "precision": {
+                    "amount": 0.001,
+                    "price": 0.01,
+                },
+                "contractSize": 1,
+            }
+        }
+
+        # Mock parent's method
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            bot.set_market_specific_settings()
+
+        assert bot.symbol_ids["BTC/USDT:USDT"] == "BTCUSDT"
+        assert bot.min_costs["BTC/USDT:USDT"] == 5.0
+        assert bot.min_qtys["BTC/USDT:USDT"] == 0.001
+        assert bot.qty_steps["BTC/USDT:USDT"] == 0.001
+        assert bot.price_steps["BTC/USDT:USDT"] == 0.01
+        assert bot.c_mults["BTC/USDT:USDT"] == 1
+
+    def test_uses_default_min_cost_when_none(self):
+        """Test that min_cost defaults to 0.1 when exchange returns None."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+
+        bot.markets_dict = {
+            "ETH/USDT:USDT": {
+                "id": "ETHUSDT",
+                "limits": {
+                    "cost": {"min": None},  # Some exchanges don't provide this
+                    "amount": {"min": 0.01},
+                },
+                "precision": {
+                    "amount": 0.01,
+                    "price": 0.01,
+                },
+            }
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            bot.set_market_specific_settings()
+
+        assert bot.min_costs["ETH/USDT:USDT"] == 0.1  # Default fallback
+        assert bot.c_mults["ETH/USDT:USDT"] == 1  # Default when missing
+
+    def test_clamps_nonpositive_min_qty_to_qty_step(self):
+        """Test that zero min_qty is normalized to qty_step for executable sizing."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+
+        bot.markets_dict = {
+            "SOL/USDT:USDT": {
+                "id": "SOLUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": 0.0},
+                },
+                "precision": {
+                    "amount": 1.0,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            }
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            bot.set_market_specific_settings()
+
+        assert bot.min_qtys["SOL/USDT:USDT"] == 1.0
+        assert bot.qty_steps["SOL/USDT:USDT"] == 1.0
+
+    def test_missing_min_qty_and_qty_step_fails_loudly(self):
+        """Test that incomplete executable sizing metadata fails with symbol context."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+
+        bot.markets_dict = {
+            "BAD/USDT:USDT": {
+                "id": "BADUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": None},
+                },
+                "precision": {
+                    "amount": None,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            }
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            with pytest.raises(
+                ValueError,
+                match="BAD/USDT:USDT: missing min qty and qty step",
+            ):
+                bot.set_market_specific_settings()
+
+    def test_skips_ineligible_market_missing_sizing_metadata(self):
+        """Incomplete metadata on non-executable exchange inventory must not block startup."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+        bot.eligible_symbols = {"BTC/USDT:USDT"}
+        bot.active_symbols = []
+        bot.coin_overrides = {}
+        bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+        bot.positions = {}
+        bot.open_orders = {}
+
+        bot.markets_dict = {
+            "BTC/USDT:USDT": {
+                "id": "BTCUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": 0.001},
+                },
+                "precision": {
+                    "amount": 0.001,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            },
+            "TRX-USD_UM_XPERP": {
+                "id": "TRX-USD_UM_XPERP",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": None},
+                },
+                "precision": {
+                    "amount": None,
+                    "price": 0.0001,
+                },
+                "contractSize": 1.0,
+            },
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            bot.set_market_specific_settings()
+
+        assert bot.min_qtys["BTC/USDT:USDT"] == 0.001
+        assert "TRX-USD_UM_XPERP" not in bot.min_qtys
+        assert "TRX-USD_UM_XPERP" not in bot.qty_steps
+
+    def test_position_symbol_missing_sizing_metadata_fails_even_when_ineligible(self):
+        """Live-state symbols remain executable sizing inputs and must fail loudly."""
+        from exchanges.ccxt_bot import CCXTBot
+        from passivbot import Passivbot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.symbol_ids = {}
+        bot.min_costs = {}
+        bot.min_qtys = {}
+        bot.qty_steps = {}
+        bot.price_steps = {}
+        bot.c_mults = {}
+        bot.eligible_symbols = {"BTC/USDT:USDT"}
+        bot.active_symbols = []
+        bot.coin_overrides = {}
+        bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+        bot.positions = {
+            "BAD/USDT:USDT": {
+                "long": {"size": 1.0},
+                "short": {"size": 0.0},
+            }
+        }
+        bot.open_orders = {}
+
+        bot.markets_dict = {
+            "BTC/USDT:USDT": {
+                "id": "BTCUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": 0.001},
+                },
+                "precision": {
+                    "amount": 0.001,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            },
+            "BAD/USDT:USDT": {
+                "id": "BADUSDT",
+                "limits": {
+                    "cost": {"min": 0.1},
+                    "amount": {"min": None},
+                },
+                "precision": {
+                    "amount": None,
+                    "price": 0.01,
+                },
+                "contractSize": 1.0,
+            },
+        }
+
+        with patch.object(Passivbot, "set_market_specific_settings", lambda self: None):
+            with pytest.raises(
+                ValueError,
+                match="BAD/USDT:USDT: missing min qty and qty step",
+            ):
+                bot.set_market_specific_settings()
+
+
+class TestCCXTBotFetchTickers:
+    """Tests for fetch_tickers."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_tickers_returns_filtered_data(self):
+        """Test that tickers are filtered to markets_dict symbols."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.markets_dict = {"BTC/USDT:USDT": {}, "ETH/USDT:USDT": {}}
+        bot.cca = AsyncMock()
+        bot.cca.fetch_tickers = AsyncMock(
+            return_value={
+                "BTC/USDT:USDT": {"bid": 50000.0, "ask": 50010.0, "last": 50005.0},
+                "ETH/USDT:USDT": {"bid": 3000.0, "ask": 3001.0, "last": 3000.5},
+                "DOGE/USDT:USDT": {
+                    "bid": 0.1,
+                    "ask": 0.11,
+                    "last": 0.105,
+                },  # Not in markets_dict
+            }
+        )
+
+        tickers = await bot.fetch_tickers()
+
+        assert len(tickers) == 2
+        assert "BTC/USDT:USDT" in tickers
+        assert "ETH/USDT:USDT" in tickers
+        assert "DOGE/USDT:USDT" not in tickers
+        assert tickers["BTC/USDT:USDT"]["bid"] == 50000.0
+        assert tickers["BTC/USDT:USDT"]["ask"] == 50010.0
+        assert tickers["BTC/USDT:USDT"]["last"] == 50005.0
+
+    @pytest.mark.asyncio
+    async def test_fetch_tickers_handles_missing_values(self):
+        """Test that missing ticker values default to 0 or fallback."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.markets_dict = {"BTC/USDT:USDT": {}}
+        bot.cca = AsyncMock()
+        bot.cca.fetch_tickers = AsyncMock(
+            return_value={
+                "BTC/USDT:USDT": {"bid": 50000.0, "ask": None, "last": None},
+            }
+        )
+
+        tickers = await bot.fetch_tickers()
+
+        assert tickers["BTC/USDT:USDT"]["bid"] == 50000.0
+        assert tickers["BTC/USDT:USDT"]["ask"] == 0  # None -> 0
+        assert tickers["BTC/USDT:USDT"]["last"] == 50000.0  # Falls back to bid
+
+    @pytest.mark.asyncio
+    async def test_fetch_tickers_raises_on_error(self):
+        """Test that method raises on error (caller handles exceptions)."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.markets_dict = {"BTC/USDT:USDT": {}}
+        bot.cca = AsyncMock()
+        bot.cca.fetch_tickers = AsyncMock(side_effect=Exception("Network error"))
+
+        with pytest.raises(Exception, match="Network error"):
+            await bot.fetch_tickers()
+
+
+class TestCCXTBotFetchOHLCV:
+    """Tests for fetch_ohlcv and fetch_ohlcvs_1m."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_ohlcv_returns_candles(self):
+        """Test that fetch_ohlcv returns candlestick data."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = AsyncMock()
+        bot.cca.fetch_ohlcv = AsyncMock(
+            return_value=[
+                [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 100.0],
+                [1704067260000, 42050.0, 42150.0, 42000.0, 42100.0, 150.0],
+            ]
+        )
+
+        result = await bot.fetch_ohlcv("BTC/USDT:USDT", "1m")
+
+        assert len(result) == 2
+        assert result[0][0] == 1704067200000  # timestamp
+        bot.cca.fetch_ohlcv.assert_called_with(
+            "BTC/USDT:USDT", timeframe="1m", limit=1000
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_ohlcv_raises_on_error(self):
+        """Test that fetch_ohlcv raises on error (caller handles exceptions)."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = AsyncMock()
+        bot.cca.fetch_ohlcv = AsyncMock(side_effect=Exception("API error"))
+
+        with pytest.raises(Exception, match="API error"):
+            await bot.fetch_ohlcv("BTC/USDT:USDT")
+
+    @pytest.mark.asyncio
+    async def test_fetch_ohlcvs_1m_without_since(self):
+        """Test fetch_ohlcvs_1m without since parameter."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = AsyncMock()
+        bot.cca.fetch_ohlcv = AsyncMock(
+            return_value=[
+                [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 100.0],
+            ]
+        )
+
+        result = await bot.fetch_ohlcvs_1m("BTC/USDT:USDT")
+
+        assert len(result) == 1
+        bot.cca.fetch_ohlcv.assert_called_with(
+            "BTC/USDT:USDT", timeframe="1m", limit=1000
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_ohlcvs_1m_with_pagination(self):
+        """Test fetch_ohlcvs_1m paginates when needed."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.cca = AsyncMock()
+
+        # Simulate two pages of results
+        call_count = [0]
+
+        async def mock_fetch(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return [[1704067200000, 1, 2, 3, 4, 5]] * 1000  # Full page
+            else:
+                return [[1704067260000, 1, 2, 3, 4, 5]] * 500  # Partial page (stops)
+
+        bot.cca.fetch_ohlcv = mock_fetch
+
+        result = await bot.fetch_ohlcvs_1m("BTC/USDT:USDT", since=1704067200000)
+
+        assert call_count[0] == 2  # Two paginated calls
+
+
+class TestCCXTBotValidateWebSocketSupport:
+    """Tests for validate_websocket_support."""
+
+    @pytest.mark.asyncio
+    async def test_validates_watch_orders_support(self):
+        """Test that method passes when watchOrders is supported."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.exchange = "testexchange"
+        bot.ccp = MagicMock()
+        bot.ccp.has = {"watchOrders": True}
+
+        # Should not raise
+        await bot.validate_websocket_support()

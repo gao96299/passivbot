@@ -1,0 +1,1151 @@
+import logging
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import backtest as bt
+import plotting
+from backtest import (
+    BacktestPayload,
+    DISABLE_PLOTTING_HELP,
+    calc_backtest_completion_ratio,
+    execute_backtest,
+    expand_analysis,
+    parse_disabled_plot_groups,
+    process_forager_fills,
+)
+from plotting import (
+    create_forager_balance_figures,
+    create_forager_hard_stop_drawdown_figure,
+)
+
+
+def _make_analysis_entry(value):
+    base_keys = [
+        "adg",
+        "adg_w",
+        "mdg",
+        "mdg_w",
+        "gain",
+        "positions_held_per_day",
+        "position_held_time_weighted_mean_hours",
+        "position_held_hours_mean",
+        "position_held_hours_max",
+        "position_held_hours_median",
+        "position_unchanged_hours_max",
+        "position_held_days_mean",
+        "position_held_days_max",
+        "position_held_days_median",
+        "position_unchanged_days_max",
+        "win_rate",
+        "win_rate_w",
+        "trade_loss_max",
+        "trade_loss_mean",
+        "trade_loss_median",
+        "paper_loss_ratio",
+        "paper_loss_mean_ratio",
+        "exposure_ratio",
+        "exposure_mean_ratio",
+        "paper_loss_ratio_w",
+        "paper_loss_mean_ratio_w",
+        "exposure_ratio_w",
+        "exposure_mean_ratio_w",
+        "loss_profit_ratio",
+        "loss_profit_ratio_w",
+        "volume_pct_per_day_avg",
+        "volume_pct_per_day_avg_w",
+        "peak_recovery_hours_pnl",
+        "peak_recovery_days_pnl",
+        "total_wallet_exposure_max",
+        "total_wallet_exposure_mean",
+        "total_wallet_exposure_median",
+        "high_exposure_hours_mean_long",
+        "high_exposure_hours_max_long",
+        "high_exposure_hours_mean_short",
+        "high_exposure_hours_max_short",
+        "high_exposure_days_mean_long",
+        "high_exposure_days_max_long",
+        "high_exposure_days_mean_short",
+        "high_exposure_days_max_short",
+        "entry_initial_balance_pct_long",
+        "entry_initial_balance_pct_short",
+        "entry_interval_hours_p95",
+        "entry_interval_hours_p99",
+        "strategy_eq_recovery_days_mean",
+        "strategy_eq_recovery_days_median",
+        "strategy_eq_recovery_days_p95",
+        "strategy_eq_recovery_days_p99",
+        "strategy_eq_recovery_days_mean_worst_5pct",
+        "strategy_eq_recovery_days_mean_worst_1pct",
+        "strategy_eq_recovery_days_max",
+    ]
+    analysis = {key: value for key in base_keys}
+    analysis.update(
+        {
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "omega_ratio": 0.0,
+            "expected_shortfall_1pct": 0.0,
+            "calmar_ratio": 0.0,
+            "sterling_ratio": 0.0,
+            "drawdown_worst": 0.0,
+            "drawdown_worst_mean_1pct": 0.0,
+            "strategy_eq_underwater_pct_mean": 0.0,
+            "strategy_eq_underwater_pct_median": 0.0,
+            "equity_balance_diff_neg_max": 0.0,
+            "equity_balance_diff_neg_mean": 0.0,
+            "equity_balance_diff_pos_max": 0.0,
+            "equity_balance_diff_pos_mean": 0.0,
+            "peak_recovery_hours_equity": 0.0,
+            "peak_recovery_days_equity": 0.0,
+            "equity_choppiness": 0.0,
+            "equity_jerkiness": 0.0,
+            "exponential_fit_error": 0.0,
+            "equity_choppiness_w": 0.0,
+            "equity_jerkiness_w": 0.0,
+            "exponential_fit_error_w": 0.0,
+            "adg_per_exposure_long": 0.0,
+            "adg_per_exposure_short": 0.0,
+        }
+    )
+    return analysis
+
+
+def test_backtest_hsl_signal_mode_requires_normalized_live_config():
+    assert (
+        bt._resolve_backtest_hsl_signal_mode({"live": {"hsl_signal_mode": "coin"}})
+        == "coin"
+    )
+
+    with pytest.raises(KeyError, match="live.hsl_signal_mode"):
+        bt._resolve_backtest_hsl_signal_mode({"live": {}})
+
+
+def test_expand_analysis_includes_entry_balance_pct():
+    analysis_usd = _make_analysis_entry(0.123)
+    analysis_btc = _make_analysis_entry(0.456)
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+    assert "entry_initial_balance_pct_long" in result
+    assert "entry_initial_balance_pct_short" in result
+    assert result["entry_initial_balance_pct_long"] == 0.123
+    assert result["entry_initial_balance_pct_short"] == 0.123
+
+
+def test_expand_analysis_includes_high_exposure_hours():
+    analysis_usd = _make_analysis_entry(0.5)
+    analysis_btc = _make_analysis_entry(0.5)
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+    for side in ("long", "short"):
+        assert f"high_exposure_hours_mean_{side}" in result
+        assert f"high_exposure_hours_max_{side}" in result
+        assert result[f"high_exposure_hours_mean_{side}"] == 0.5
+        assert result[f"high_exposure_hours_max_{side}"] == 0.5
+
+
+def test_expand_analysis_includes_day_duration_metrics():
+    analysis_usd = _make_analysis_entry(2.0)
+    analysis_btc = _make_analysis_entry(4.0)
+    analysis_usd["peak_recovery_days_equity"] = 1.25
+    analysis_btc["peak_recovery_days_equity"] = 2.5
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+
+    assert result["position_held_days_max"] == 2.0
+    assert result["position_unchanged_days_max"] == 2.0
+    assert result["peak_recovery_days_pnl"] == 2.0
+    assert result["high_exposure_days_max_long"] == 2.0
+    assert result["high_exposure_days_max_short"] == 2.0
+    assert result["peak_recovery_days_equity_usd"] == 1.25
+    assert result["peak_recovery_days_equity_btc"] == 2.5
+
+
+def test_expand_analysis_includes_trade_level_metrics():
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.75)
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+
+    assert result["win_rate"] == 0.25
+    assert result["win_rate_w"] == 0.25
+    assert result["trade_loss_max"] == 0.25
+    assert result["trade_loss_mean"] == 0.25
+    assert result["trade_loss_median"] == 0.25
+    assert "win_rate_usd" not in result
+    assert "trade_loss_max_btc" not in result
+
+
+def test_expand_analysis_currency_suffixes_new_ratio_metrics():
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.75)
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+
+    for metric in (
+        "paper_loss_ratio",
+        "paper_loss_mean_ratio",
+        "exposure_ratio",
+        "exposure_mean_ratio",
+        "paper_loss_ratio_w",
+        "paper_loss_mean_ratio_w",
+        "exposure_ratio_w",
+        "exposure_mean_ratio_w",
+    ):
+        assert result[f"{metric}_usd"] == 0.25
+        assert result[f"{metric}_btc"] == 0.75
+        assert metric not in result
+
+
+def test_calc_backtest_completion_ratio_is_full_when_final_candle_reaches_end():
+    config = {
+        "backtest": {
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "candle_interval_minutes": 1,
+        }
+    }
+    equities = np.array(
+        [
+            [1767225600000, 1000.0, 1.0],
+            [1767311940000, 1000.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    assert calc_backtest_completion_ratio(equities, config) == pytest.approx(1.0)
+
+
+def test_calc_backtest_completion_ratio_detects_early_stop():
+    config = {
+        "backtest": {
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-03",
+            "candle_interval_minutes": 1,
+        }
+    }
+    equities = np.array(
+        [
+            [1767225600000, 1000.0, 1.0],
+            [1767311940000, 50.0, 0.05],
+        ],
+        dtype=np.float64,
+    )
+
+    assert calc_backtest_completion_ratio(equities, config) == pytest.approx(0.5)
+
+
+def test_expand_analysis_includes_backtest_completion_ratio_when_available():
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.75)
+    config = {
+        "backtest": {
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "candle_interval_minutes": 1,
+        },
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        },
+    }
+    equities = np.array(
+        [
+            [1767225600000, 1000.0, 1.0],
+            [1767311940000, 1000.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=equities,
+        config=config,
+    )
+
+    assert result["backtest_completion_ratio"] == pytest.approx(1.0)
+
+
+def test_execute_backtest_metrics_only_keeps_completion_ratio(monkeypatch):
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.25)
+    equities = np.array(
+        [
+            [1767225600000],
+            [1767311940000],
+        ],
+        dtype=np.float64,
+    )
+
+    def fake_run_backtest_bundle(*_args):
+        return None, equities, analysis_usd, analysis_btc
+
+    monkeypatch.setattr(bt.pbr, "run_backtest_bundle", fake_run_backtest_bundle)
+    payload = BacktestPayload(
+        bundle=object(),
+        bot_params_list=[],
+        strategy_params_list=[],
+        exchange_params=[],
+        backtest_params={"metrics_only": True},
+    )
+    config = {
+        "backtest": {
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "candle_interval_minutes": 1,
+        },
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        },
+    }
+
+    fills, equities_array, analysis = execute_backtest(payload, config)
+
+    assert fills is None
+    assert equities_array is None
+    assert analysis["backtest_completion_ratio"] == pytest.approx(1.0)
+
+
+def test_execute_backtest_captures_metrics_only_rust_profile(monkeypatch):
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.25)
+    rust_profile = {"rust_simulation_ms": 12.5, "rust_analysis_pair_ms": 3.25}
+    equities = np.array(
+        [
+            [1767225600000],
+            [1767311940000],
+        ],
+        dtype=np.float64,
+    )
+
+    def fake_run_backtest_bundle(*_args):
+        return (
+            None,
+            equities,
+            analysis_usd,
+            analysis_btc,
+            {"_rust_profile": rust_profile},
+        )
+
+    monkeypatch.setattr(bt.pbr, "run_backtest_bundle", fake_run_backtest_bundle)
+    payload = BacktestPayload(
+        bundle=object(),
+        bot_params_list=[],
+        strategy_params_list=[],
+        exchange_params=[],
+        backtest_params={"metrics_only": True},
+    )
+    config = {
+        "backtest": {
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "candle_interval_minutes": 1,
+        },
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        },
+    }
+
+    fills, equities_array, _analysis = execute_backtest(payload, config)
+
+    assert fills is None
+    assert equities_array is None
+    assert payload.rust_profile == rust_profile
+
+
+def test_expand_analysis_allows_skipped_btc_analysis():
+    analysis_usd = _make_analysis_entry(0.25)
+    result = expand_analysis(
+        analysis_usd,
+        {},
+        fills=None,
+        equities_array=None,
+        config={
+            "bot": {
+                "long": {"total_wallet_exposure_limit": 1.0},
+                "short": {"total_wallet_exposure_limit": 1.0},
+            }
+        },
+    )
+
+    assert result["adg_usd"] == pytest.approx(0.25)
+    assert result["adg_per_exposure_long_usd"] == pytest.approx(0.25)
+    assert "adg_btc" not in result
+    assert "adg_per_exposure_long_btc" not in result
+
+
+def test_make_table_includes_trade_metrics():
+    table = plotting.make_table(
+        {
+            "exchange": "binance",
+            "market_type": "futures",
+            "symbol": "BTC/USDT:USDT",
+            "passivbot_mode": "recursive_grid",
+            "adg_n_subdivisions": 10,
+            "long": {"enabled": False},
+            "short": {"enabled": False},
+            "result": {
+                "n_days": 7.0,
+                "starting_balance": 1000.0,
+                "win_rate": 0.625,
+                "trade_loss_max": 0.015,
+            },
+        }
+    ).get_string()
+
+    assert "Win rate" in table
+    assert "62.5%" in table
+    assert "Worst trade loss" in table
+    assert "1.5%" in table
+
+
+def test_expand_analysis_deduplicates_hard_stop_metrics():
+    analysis_usd = _make_analysis_entry(0.5)
+    analysis_btc = _make_analysis_entry(0.5)
+    analysis_usd.update(
+        {
+            "hard_stop_triggers": 3,
+            "hard_stop_triggers_per_year": 36.5,
+            "hard_stop_restarts": 2,
+            "hard_stop_total_loss_pct": 0.125,
+            "hard_stop_restarts_per_year": 24.3333333333,
+        }
+    )
+    analysis_btc.update(
+        {
+            "hard_stop_triggers": 3,
+            "hard_stop_triggers_per_year": 36.5,
+            "hard_stop_restarts": 2,
+            "hard_stop_total_loss_pct": 0.125,
+            "hard_stop_restarts_per_year": 24.3333333333,
+        }
+    )
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+
+    assert result["hard_stop_triggers"] == 3
+    assert result["hard_stop_triggers_per_year"] == 36.5
+    assert result["hard_stop_restarts"] == 2
+    assert result["hard_stop_total_loss_pct"] == 0.125
+    assert result["hard_stop_restarts_per_year"] == 24.3333333333
+    assert "hard_stop_triggers_usd" not in result
+    assert "hard_stop_triggers_btc" not in result
+    assert "hard_stop_triggers_per_year_usd" not in result
+    assert "hard_stop_triggers_per_year_btc" not in result
+    assert "hard_stop_restarts_usd" not in result
+    assert "hard_stop_restarts_btc" not in result
+    assert "hard_stop_total_loss_pct_usd" not in result
+    assert "hard_stop_total_loss_pct_btc" not in result
+    assert "hard_stop_restarts_per_year_usd" not in result
+    assert "hard_stop_restarts_per_year_btc" not in result
+
+
+def test_process_forager_fills_handles_zero_pnl_division():
+    """Zero-PnL inputs should not raise and should return stable neutral ratios."""
+    equities_array = np.array([[1704067200000, 1000.0, 0.02]], dtype=np.float64)
+
+    _fdf, analysis_appendix, _bal_eq = process_forager_fills(
+        fills=[],
+        coins=[],
+        hlcvs=np.empty((0, 0), dtype=np.float64),
+        equities_array=equities_array,
+        balance_sample_divider=1,
+    )
+
+    assert analysis_appendix["loss_profit_ratio_long"] == 1.0
+    assert analysis_appendix["loss_profit_ratio_short"] == 1.0
+    assert analysis_appendix["pnl_ratio_long_short"] == 0.5
+
+
+def test_process_forager_fills_no_fills_keeps_datetime_index_for_resample():
+    """No-fill balance/equity joins should stay resample-safe on a DatetimeIndex."""
+    t0 = 1_740_000_000_000
+    equities_array = np.array(
+        [
+            [t0, 1000.0, 0.02],
+            [t0 + 3_600_000, 1000.5, 0.02],
+        ],
+        dtype=np.float64,
+    )
+
+    fdf, _analysis_appendix, bal_eq = process_forager_fills(
+        fills=[],
+        coins=[],
+        hlcvs=np.empty((0, 0), dtype=np.float64),
+        equities_array=equities_array,
+        balance_sample_divider=60,
+    )
+
+    assert fdf.empty
+    assert isinstance(bal_eq.index, pd.DatetimeIndex)
+    assert not bal_eq.empty
+
+
+def test_expand_analysis_keeps_rust_fill_activity_metrics_shared():
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.75)
+    fill_metrics = {
+        "fills_active_days_count": 1.0,
+        "fills_active_days_ratio": 1.0,
+        "fills_active_symbols_count": 2.0,
+        "fills_analysis_duration_days": 4.0 / 24.0,
+        "fills_count": 2.0,
+        "fills_count_close": 1.0,
+        "fills_count_entry": 1.0,
+        "fills_count_long": 2.0,
+        "fills_count_short": 0.0,
+        "fills_entry_per_close": 1.0,
+        "fills_gap_longest_days": 2.0 / 24.0,
+        "fills_gap_mean_hours": 4.0 / 3.0,
+        "fills_gap_median_hours": 1.0,
+        "fills_gap_p95_hours": 1.9,
+        "fills_gap_p99_hours": 1.98,
+        "fills_gap_time_weighted_mean_hours": 1.5,
+        "fills_per_day": 12.0,
+        "fills_per_day_close": 6.0,
+        "fills_per_day_entry": 6.0,
+        "fills_per_day_long": 12.0,
+        "fills_per_day_per_position_slot": 6.0,
+        "fills_per_day_per_position_slot_long": 6.0,
+        "fills_per_day_per_position_slot_short": 0.0,
+        "fills_per_day_short": 0.0,
+        "fills_top_symbol_share": 0.5,
+    }
+    analysis_usd.update(fill_metrics)
+    analysis_btc.update(fill_metrics)
+
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config={
+            "bot": {
+                "long": {"total_wallet_exposure_limit": 1.0},
+                "short": {"total_wallet_exposure_limit": 0.0},
+            }
+        },
+    )
+
+    for key, value in fill_metrics.items():
+        assert result[key] == pytest.approx(value)
+        assert f"{key}_usd" not in result
+        assert f"{key}_btc" not in result
+
+
+def test_process_forager_fills_no_fills_leaves_fill_activity_to_rust_analysis():
+    start = 1_740_000_000_000
+    one_hour = 3_600_000
+    equities_array = np.array(
+        [
+            [start, 1000.0, 0.02],
+            [start + one_hour, 1001.0, 0.02],
+            [start + 2 * one_hour, 1002.0, 0.02],
+        ],
+        dtype=np.float64,
+    )
+
+    _fdf, analysis_appendix, _bal_eq = process_forager_fills(
+        fills=[],
+        coins=[],
+        hlcvs=np.empty((0, 0), dtype=np.float64),
+        equities_array=equities_array,
+        balance_sample_divider=1,
+    )
+
+    assert "fills_per_day" not in analysis_appendix
+
+
+def test_process_forager_fills_includes_strategy_equity_column():
+    t0 = 1_740_000_000_000
+    equities_array = np.array(
+        [
+            [t0, 1000.0, 0.02, 1000.0],
+            [t0 + 60_000, 990.0, 0.0198, 995.0],
+        ],
+        dtype=np.float64,
+    )
+
+    _fdf, _analysis_appendix, bal_eq = process_forager_fills(
+        fills=[],
+        coins=[],
+        hlcvs=np.empty((0, 0), dtype=np.float64),
+        equities_array=equities_array,
+        balance_sample_divider=1,
+    )
+
+    assert "strategy_equity" in bal_eq.columns
+    assert np.isclose(bal_eq["strategy_equity"].iloc[0], 1000.0)
+    assert np.isclose(bal_eq["strategy_equity"].iloc[-1], 995.0)
+
+
+def test_create_forager_balance_figures_adds_strategy_equity_drawdown():
+    idx = pd.date_range("2025-01-01", periods=4, freq="1h")
+    bal_eq = pd.DataFrame(
+        {
+            "usd_total_equity": [100.0, 90.0, 120.0, 96.0],
+            "strategy_equity": [100.0, 90.0, 120.0, 96.0],
+            "btc_total_equity": [1.0, 0.9, 1.2, 0.96],
+        },
+        index=idx,
+    )
+
+    figures = create_forager_balance_figures(
+        bal_eq,
+        autoplot=False,
+        return_figures=True,
+    )
+
+    assert "drawdown" in figures
+    plotted_drawdown = figures["drawdown"].axes[0].lines[0].get_ydata()
+    np.testing.assert_allclose(plotted_drawdown, [0.0, 0.1, 0.0, 0.2])
+    plotting.plt.close("all")
+
+
+def test_post_process_disable_plotting_skips_all_figure_generation(
+    tmp_path, monkeypatch
+):
+    calls = {"balance": 0, "twe": 0, "pnl": 0, "save": 0, "coin": 0}
+
+    def _fake_process_forager_fills(*args, **kwargs):
+        fdf = pd.DataFrame(columns=["coin", "pnl"])
+        bal_eq = pd.DataFrame({"balance": [1000.0], "equity": [1000.0]})
+        return fdf, {}, bal_eq
+
+    monkeypatch.setattr(bt, "process_forager_fills", _fake_process_forager_fills)
+    monkeypatch.setattr(bt, "format_config", lambda config, verbose=False: config)
+    monkeypatch.setattr(bt, "strip_config_metadata", lambda config: config)
+    monkeypatch.setattr(
+        bt, "dump_backtest_dataset_metadata", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        bt,
+        "dump_config",
+        lambda config, path: open(path, "w", encoding="utf-8").write("{}"),
+    )
+
+    monkeypatch.setattr(
+        bt,
+        "create_forager_balance_figures",
+        lambda *args, **kwargs: calls.__setitem__("balance", calls["balance"] + 1)
+        or {},
+    )
+    monkeypatch.setattr(
+        bt,
+        "create_forager_twe_figure",
+        lambda *args, **kwargs: calls.__setitem__("twe", calls["twe"] + 1) or {},
+    )
+    monkeypatch.setattr(
+        bt,
+        "create_forager_pnl_figure",
+        lambda *args, **kwargs: calls.__setitem__("pnl", calls["pnl"] + 1) or {},
+    )
+    monkeypatch.setattr(
+        bt,
+        "save_figures",
+        lambda *args, **kwargs: calls.__setitem__("save", calls["save"] + 1) or {},
+    )
+    monkeypatch.setattr(
+        bt,
+        "create_forager_coin_figures",
+        lambda *args, **kwargs: calls.__setitem__("coin", calls["coin"] + 1) or {},
+    )
+
+    config = {
+        "disable_plotting": True,
+        "backtest": {"balance_sample_divider": 60, "coins": {"binance": ["BTC"]}},
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 0.0},
+        },
+        "live": {},
+    }
+
+    bt.post_process(
+        plot_context=bt.BacktestPlotContext(
+            hard_stop_plot_data={
+                "hsl": {
+                    "schema_version": 1,
+                    "engine": "hsl",
+                    "mode": "coin",
+                    "detailed": False,
+                    "scopes": [],
+                    "samples": [],
+                    "events": [],
+                }
+            }
+        ),
+        config=config,
+        hlcvs=np.zeros((1, 1, 3), dtype=np.float64),
+        fills=[],
+        equities_array=np.array([[1704067200000, 1000.0, 1000.0]], dtype=np.float64),
+        btc_usd_prices=np.array([]),
+        analysis={"gain_usd": 1.0},
+        results_path=str(tmp_path),
+        exchange="binance",
+    )
+
+    assert calls == {"balance": 0, "twe": 0, "pnl": 0, "save": 0, "coin": 0}
+
+
+def test_post_process_writes_original_config_for_dataset_override(
+    tmp_path, monkeypatch
+):
+    dumped = []
+
+    def _fake_process_forager_fills(*args, **kwargs):
+        fdf = pd.DataFrame(columns=["coin", "pnl"])
+        bal_eq = pd.DataFrame({"balance": [1000.0], "equity": [1000.0]})
+        return fdf, {}, bal_eq
+
+    def _fake_dump_config(config, path):
+        dumped.append((config, path))
+        open(path, "w", encoding="utf-8").write("{}")
+
+    monkeypatch.setattr(bt, "process_forager_fills", _fake_process_forager_fills)
+    monkeypatch.setattr(bt, "format_config", lambda config, verbose=False: config)
+    monkeypatch.setattr(bt, "dump_config", _fake_dump_config)
+    monkeypatch.setattr(
+        bt, "create_forager_balance_figures", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(bt, "create_forager_twe_figure", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "create_forager_pnl_figure", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "save_figures", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "create_forager_coin_figures", lambda *args, **kwargs: {})
+
+    original_config = {
+        "backtest": {"start_date": "2025-01-01", "coins": {"binance": ["ETH"]}},
+        "live": {"approved_coins": {"long": ["ETH"], "short": []}},
+    }
+    config = {
+        "disable_plotting": True,
+        "backtest": {
+            "balance_sample_divider": 60,
+            "coins": {"binance": ["BTC"]},
+            "hlcvs_data_dir": "caches/hlcvs_data/custom__abc",
+        },
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 0.0},
+        },
+        "live": {"approved_coins": {"long": ["BTC"], "short": []}},
+        "_original_backtest_config": original_config,
+        "metrics": {"stale": True},
+        "suite_metrics": {"stale": True},
+    }
+
+    bt.post_process(
+        plot_context=bt.BacktestPlotContext(
+            hard_stop_plot_data={
+                "hsl": {
+                    "schema_version": 1,
+                    "engine": "hsl",
+                    "mode": "coin",
+                    "detailed": False,
+                    "scopes": [],
+                    "samples": [],
+                    "events": [],
+                }
+            }
+        ),
+        config=config,
+        hlcvs=np.zeros((1, 1, 3), dtype=np.float64),
+        fills=[],
+        equities_array=np.array([[1704067200000, 1000.0, 1000.0]], dtype=np.float64),
+        btc_usd_prices=np.array([]),
+        analysis={"gain_usd": 1.0},
+        results_path=str(tmp_path),
+        exchange="binance",
+    )
+
+    dumped_by_name = {path.split("/")[-1]: cfg for cfg, path in dumped}
+    assert dumped_by_name["config.original.json"]["backtest"]["coins"]["binance"] == [
+        "ETH"
+    ]
+    assert dumped_by_name["config.original.json"]["live"]["approved_coins"]["long"] == [
+        "ETH"
+    ]
+    assert dumped_by_name["config.json"]["backtest"]["coins"]["binance"] == ["BTC"]
+    assert dumped_by_name["config.json"]["metrics"]["stats"]["gain_usd"]["mean"] == 1.0
+    assert "suite_metrics" not in dumped_by_name["config.json"]
+    assert "metrics" not in dumped_by_name["config.original.json"]
+
+
+def test_post_process_disable_plotting_coin_fills_only(tmp_path, monkeypatch):
+    calls = {"balance": 0, "twe": 0, "pnl": 0, "save": 0, "coin": 0}
+
+    def _fake_process_forager_fills(*args, **kwargs):
+        fdf = pd.DataFrame(columns=["coin", "pnl"])
+        bal_eq = pd.DataFrame({"balance": [1000.0], "equity": [1000.0]})
+        return fdf, {}, bal_eq
+
+    monkeypatch.setattr(bt, "process_forager_fills", _fake_process_forager_fills)
+    monkeypatch.setattr(bt, "format_config", lambda config, verbose=False: config)
+    monkeypatch.setattr(bt, "strip_config_metadata", lambda config: config)
+    monkeypatch.setattr(
+        bt, "dump_backtest_dataset_metadata", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        bt,
+        "dump_config",
+        lambda config, path: open(path, "w", encoding="utf-8").write("{}"),
+    )
+
+    monkeypatch.setattr(
+        bt,
+        "create_forager_balance_figures",
+        lambda *args, **kwargs: calls.__setitem__("balance", calls["balance"] + 1)
+        or {"balance": object()},
+    )
+    monkeypatch.setattr(
+        bt,
+        "create_forager_twe_figure",
+        lambda *args, **kwargs: calls.__setitem__("twe", calls["twe"] + 1)
+        or {"twe": object()},
+    )
+    monkeypatch.setattr(
+        bt,
+        "create_forager_pnl_figure",
+        lambda *args, **kwargs: calls.__setitem__("pnl", calls["pnl"] + 1)
+        or {"pnl": object()},
+    )
+    monkeypatch.setattr(
+        bt,
+        "save_figures",
+        lambda *args, **kwargs: calls.__setitem__("save", calls["save"] + 1) or {},
+    )
+    monkeypatch.setattr(
+        bt,
+        "create_forager_coin_figures",
+        lambda *args, **kwargs: calls.__setitem__("coin", calls["coin"] + 1) or {},
+    )
+
+    config = {
+        "disable_plotting": "coin_fills",
+        "backtest": {"balance_sample_divider": 60, "coins": {"binance": ["BTC"]}},
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 0.0},
+        },
+        "live": {},
+    }
+
+    bt.post_process(
+        plot_context=bt.BacktestPlotContext(
+            hard_stop_plot_data={
+                "hsl": {
+                    "schema_version": 1,
+                    "engine": "hsl",
+                    "mode": "coin",
+                    "detailed": False,
+                    "scopes": [],
+                    "samples": [],
+                    "events": [],
+                }
+            }
+        ),
+        config=config,
+        hlcvs=np.zeros((1, 1, 3), dtype=np.float64),
+        fills=[],
+        equities_array=np.array([[1704067200000, 1000.0, 1000.0]], dtype=np.float64),
+        btc_usd_prices=np.array([]),
+        analysis={"gain_usd": 1.0},
+        results_path=str(tmp_path),
+        exchange="binance",
+    )
+
+    assert calls == {"balance": 1, "twe": 1, "pnl": 1, "save": 3, "coin": 0}
+
+
+def test_post_process_visible_metrics_filters_logged_output_only(
+    tmp_path, monkeypatch, caplog
+):
+    def _fake_process_forager_fills(*args, **kwargs):
+        fdf = pd.DataFrame(columns=["coin", "pnl"])
+        bal_eq = pd.DataFrame({"balance": [1000.0], "equity": [1000.0]})
+        return fdf, {}, bal_eq
+
+    monkeypatch.setattr(bt, "process_forager_fills", _fake_process_forager_fills)
+    monkeypatch.setattr(bt, "format_config", lambda config, verbose=False: config)
+    monkeypatch.setattr(bt, "strip_config_metadata", lambda config: config)
+    monkeypatch.setattr(
+        bt, "dump_backtest_dataset_metadata", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        bt,
+        "dump_config",
+        lambda config, path: open(path, "w", encoding="utf-8").write("{}"),
+    )
+    monkeypatch.setattr(
+        bt, "create_forager_balance_figures", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(bt, "create_forager_twe_figure", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "create_forager_pnl_figure", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "save_figures", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "create_forager_coin_figures", lambda *args, **kwargs: {})
+
+    config = {
+        "disable_plotting": True,
+        "backtest": {
+            "balance_sample_divider": 60,
+            "coins": {"binance": ["BTC"]},
+            "visible_metrics": None,
+        },
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 0.0},
+        },
+        "live": {},
+        "optimize": {
+            "scoring": ["adg"],
+            "limits": [{"metric": "loss_profit_ratio"}],
+        },
+    }
+
+    caplog.set_level(logging.INFO)
+    bt.post_process(
+        plot_context=bt.BacktestPlotContext(
+            hard_stop_plot_data={
+                "hsl": {
+                    "schema_version": 1,
+                    "engine": "hsl",
+                    "mode": "coin",
+                    "detailed": False,
+                    "scopes": [],
+                    "samples": [],
+                    "events": [],
+                }
+            }
+        ),
+        config=config,
+        hlcvs=np.zeros((1, 1, 3), dtype=np.float64),
+        fills=[],
+        equities_array=np.array([[1704067200000, 1000.0, 1000.0]], dtype=np.float64),
+        btc_usd_prices=np.array([]),
+        analysis={
+            "adg_usd": 0.01,
+            "adg_btc": 0.02,
+            "loss_profit_ratio": 0.5,
+            "peak_recovery_hours_hsl": 12.0,
+        },
+        results_path=str(tmp_path),
+        exchange="binance",
+    )
+
+    logged = caplog.text
+    assert "Showing 3 of 4 metrics" in logged
+    assert "adg_usd" in logged
+    assert "adg_btc" in logged
+    assert "loss_profit_ratio" in logged
+    assert "peak_recovery_hours_hsl" not in logged
+    analysis_path = next(tmp_path.glob("*/analysis.json"))
+    assert "peak_recovery_hours_hsl" in analysis_path.read_text(encoding="utf-8")
+
+
+def test_parse_disabled_plot_groups_accepts_summary_alias_and_commas():
+    assert parse_disabled_plot_groups("summary,coin_fills") == {
+        "balance",
+        "twe",
+        "pnl",
+        "hard_stop",
+        "coin_fills",
+    }
+
+
+def test_disable_plotting_help_lists_every_plot_group():
+    assert "hard_stop" in DISABLE_PLOTTING_HELP
+    assert "summary disables balance, twe, pnl, and hard_stop" in DISABLE_PLOTTING_HELP
+    assert "coin_fills disables per-coin fill plots only" in DISABLE_PLOTTING_HELP
+
+
+@pytest.mark.parametrize("columns", [1, 4])
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_analysis_period_uses_actual_equity_timestamps(columns, count):
+    timestamps = np.array([1704153600000, 1704196800000, 1704240000000])[:count]
+    equities = np.ones((count, columns))
+    equities[:, 0] = timestamps
+    duration = 1.0 if count == 3 else 0.0
+    result = expand_analysis(
+        {"fills_analysis_duration_days": duration},
+        {},
+        None,
+        equities,
+        {
+            "bot": {"long": {}, "short": {}},
+            "backtest": {"start_date": "2020-01-01", "end_date": "2025-01-01"},
+        },
+    )
+    assert result["n_days"] == result["fills_analysis_duration_days"] == duration
+    assert result["effective_start_date"] == ("2024-01-02T00:00:00Z" if count else None)
+    assert result["effective_end_date"] == (
+        "2024-01-03T00:00:00Z"
+        if count == 3
+        else "2024-01-02T00:00:00Z" if count else None
+    )
+
+
+def test_post_process_persists_artifacts_with_infinite_diagnostic(
+    tmp_path, monkeypatch
+):
+    import json
+    from copy import deepcopy
+
+    fdf = pd.DataFrame(columns=["coin", "pnl"])
+    bal_eq = pd.DataFrame({"balance": [1000.0, 1000.0], "equity": [1000.0, 1000.0]})
+    monkeypatch.setattr(
+        bt, "process_forager_fills", lambda *args, **kwargs: (fdf, {}, bal_eq)
+    )
+    monkeypatch.setattr(bt, "sanitize_prepared_config_for_dump", deepcopy)
+    monkeypatch.setattr(
+        bt, "dump_backtest_dataset_metadata", lambda *args, **kwargs: None
+    )
+    plot_calls = []
+    monkeypatch.setattr(
+        bt,
+        "create_forager_balance_figures",
+        lambda *args, **kwargs: plot_calls.append("balance") or {},
+    )
+    monkeypatch.setattr(
+        bt, "save_figures", lambda *args, **kwargs: plot_calls.append("save")
+    )
+    config = {
+        "disable_plotting": ["twe", "pnl", "hard_stop", "coin_fills"],
+        "backtest": {"balance_sample_divider": 60, "coins": {"binance": ["BTC"]}},
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 0.0},
+        },
+        "live": {},
+    }
+    bt.post_process(
+        plot_context=bt.BacktestPlotContext(
+            hard_stop_plot_data={
+                "hsl": {
+                    "schema_version": 1,
+                    "engine": "hsl",
+                    "mode": "coin",
+                    "detailed": False,
+                    "scopes": [],
+                    "samples": [],
+                    "events": [],
+                }
+            }
+        ),
+        config=config,
+        hlcvs=np.zeros((2, 1, 3), dtype=np.float64),
+        fills=[],
+        equities_array=np.array(
+            [[1704067200000, 1000.0, 1000.0], [1704240000000, 1000.0, 1000.0]]
+        ),
+        btc_usd_prices=np.array([]),
+        analysis={
+            "gain_usd": 1.0,
+            "n_days": 2.0,
+            "equity_choppiness": float("inf"),
+            "effective_start_date": "2024-01-01T00:00:00Z",
+            "effective_end_date": "2024-01-03T00:00:00Z",
+        },
+        results_path=str(tmp_path),
+        exchange="binance",
+    )
+    result_dir = next(tmp_path.iterdir())
+    raw = json.loads((result_dir / "analysis.json").read_text())
+    saved = json.loads((result_dir / "config.json").read_text())
+    assert np.isinf(raw["equity_choppiness"])
+    assert saved["metrics"]["stats"]["n_days"]["mean"] == 2.0
+    assert saved["metrics"]["nonfinite_diagnostics"]["equity_choppiness"] == "inf"
+    assert saved["metrics"]["effective_end_date"] == "2024-01-03T00:00:00Z"
+    assert (result_dir / "fills.csv").exists()
+    assert (result_dir / "balance_and_equity.csv.gz").exists()
+    assert plot_calls == ["balance", "save"]
+
+
+def test_expand_analysis_keeps_position_held_time_weighted_metric_shared():
+    result = expand_analysis(
+        _make_analysis_entry(2.5),
+        _make_analysis_entry(9.0),
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config={
+            "bot": {
+                side: {"total_wallet_exposure_limit": 1.0} for side in ("long", "short")
+            }
+        },
+    )
+    assert result["position_held_time_weighted_mean_hours"] == 2.5
+    assert "position_held_time_weighted_mean_hours_usd" not in result
+    assert "position_held_time_weighted_mean_hours_btc" not in result

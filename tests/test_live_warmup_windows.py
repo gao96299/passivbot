@@ -1,0 +1,331 @@
+"""Tests for live warmup window calculation."""
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from passivbot import compute_live_warmup_windows
+
+
+def test_compute_live_warmup_windows_forager_toggle():
+    symbols_by_side = {"long": {"BTC"}, "short": {"ETH"}}
+    values = {
+        ("long", "ema_span_0", "BTC"): 1000.0,
+        ("long", "ema_span_1", "BTC"): 1500.0,
+        ("long", "forager_volume_ema_span_1m", "BTC"): 2000.0,
+        ("long", "forager_volatility_ema_span_1m", "BTC"): 1800.0,
+        ("long", "entry_volatility_ema_span_1h", "BTC"): 48.0,
+        ("short", "ema_span_0", "ETH"): 900.0,
+        ("short", "ema_span_1", "ETH"): 800.0,
+        ("short", "forager_volume_ema_span_1m", "ETH"): 4000.0,
+        ("short", "forager_volatility_ema_span_1m", "ETH"): 3000.0,
+        ("short", "entry_volatility_ema_span_1h", "ETH"): 24.0,
+    }
+
+    def bp(pside, key, sym):
+        return values.get((pside, key, sym), 0.0)
+
+    wins, h1, skip = compute_live_warmup_windows(
+        symbols_by_side,
+        bp,
+        forager_enabled={"long": True, "short": False},
+        warmup_ratio=0.5,
+    )
+
+    assert wins["BTC"] == 3000
+    assert h1["BTC"] == 72
+    assert skip["BTC"] is False
+
+    assert wins["ETH"] == 1350
+    assert h1["ETH"] == 36
+    assert skip["ETH"] is True
+
+
+def test_compute_live_warmup_windows_override():
+    symbols_by_side = {"long": {"BTC", "ETH"}}
+
+    def bp(pside, key, sym):
+        return 0.0
+
+    wins, h1, skip = compute_live_warmup_windows(
+        symbols_by_side,
+        bp,
+        window_candles=120,
+    )
+
+    assert wins["BTC"] == 120
+    assert h1["BTC"] == 2
+    assert skip["BTC"] is True
+    assert wins["ETH"] == 120
+
+
+def test_compute_live_warmup_windows_uses_v8_strategy_and_forager_groups():
+    symbols_by_side = {"long": {"HYPE"}}
+
+    def bp(pside, key, sym):
+        return 0.0
+
+    def strategy(pside, key, sym):
+        values = {
+            "ema_span_0": 110.0,
+            "ema_span_1": 260.0,
+            "volatility_ema_span_1m": 86.0,
+            "volatility_ema_span_1h": 1785.0,
+        }
+        return values.get(key, 0.0)
+
+    def forager(pside, key, sym):
+        values = {
+            "forager_volume_ema_span_1m": 760.0,
+            "forager_volatility_ema_span_1m": 110.0,
+        }
+        return values.get(key, 0.0)
+
+    wins, h1, skip = compute_live_warmup_windows(
+        symbols_by_side,
+        bp,
+        forager_enabled={"long": True},
+        strategy_lookup=strategy,
+        forager_lookup=forager,
+        warmup_ratio=0.3,
+    )
+
+    assert wins["HYPE"] == 988
+    assert h1["HYPE"] == 2321
+    assert skip["HYPE"] is True
+
+
+def test_compute_live_warmup_windows_raises_on_malformed_strategy_span():
+    symbols_by_side = {"long": {"BTC"}}
+
+    def bp(pside, key, sym):
+        return 0.0
+
+    def strategy(pside, key, sym):
+        if key == "ema_span_0":
+            return "not-a-number"
+        return 10.0
+
+    with pytest.raises(ValueError, match="invalid live warmup span value"):
+        compute_live_warmup_windows(
+            symbols_by_side,
+            bp,
+            strategy_lookup=strategy,
+        )
+
+
+def test_live_strategy_warmup_value_raises_on_malformed_present_span():
+    import passivbot as pb_mod
+
+    class FakeBot:
+        def _strategy_params_to_rust_dict(self, pside, symbol):
+            return {
+                "ema_span_0": "bad",
+                "ema_span_1": 20.0,
+            }
+
+    with pytest.raises(ValueError, match="invalid live warmup value"):
+        pb_mod.Passivbot._live_strategy_warmup_value(
+            FakeBot(), "long", "ema_span_0", "BTC/USDT:USDT"
+        )
+
+
+def test_trailing_grid_v7_startup_warmup_uses_nested_entry_volatility_hours():
+    import passivbot as pb_mod
+
+    class FakeBot:
+        def _strategy_params_to_rust_dict(self, pside, symbol):
+            assert pside == "long"
+            assert symbol == "BTC"
+            return {
+                "ema_span_0": 1.0,
+                "ema_span_1": 1.0,
+                "entry": {
+                    "volatility_ema_span_hours": 4.0,
+                    "grid_spacing_volatility_weight": 1.0,
+                    "trailing_threshold_volatility_weight": 0.0,
+                    "trailing_retracement_volatility_weight": 0.0,
+                },
+            }
+
+    bot = FakeBot()
+
+    assert (
+        pb_mod.Passivbot._live_strategy_warmup_value(
+            bot, "long", "entry_volatility_ema_span_1h", "BTC"
+        )
+        == pytest.approx(4.0)
+    )
+
+    wins, h1, skip = compute_live_warmup_windows(
+        {"long": {"BTC"}},
+        lambda _pside, _key, _sym: 0.0,
+        strategy_lookup=lambda pside, key, sym: pb_mod.Passivbot._live_strategy_warmup_value(
+            bot, pside, key, sym
+        ),
+    )
+
+    assert wins["BTC"] == 1
+    assert h1["BTC"] == 4
+    assert skip["BTC"] is True
+
+
+def test_trailing_grid_v7_startup_warmup_rejects_malformed_nested_entry_span():
+    import passivbot as pb_mod
+
+    class FakeBot:
+        def _strategy_params_to_rust_dict(self, _pside, _symbol):
+            return {
+                "ema_span_0": 1.0,
+                "ema_span_1": 1.0,
+                "entry": {
+                    "volatility_ema_span_hours": None,
+                    "grid_spacing_volatility_weight": 1.0,
+                },
+            }
+
+    with pytest.raises(
+        ValueError,
+        match=r"strategy long\.entry\.volatility_ema_span_hours.*None",
+    ):
+        pb_mod.Passivbot._live_strategy_warmup_value(
+            FakeBot(), "long", "entry_volatility_ema_span_1h", "BTC"
+        )
+
+
+def test_live_forager_warmup_value_raises_on_malformed_span():
+    import passivbot as pb_mod
+
+    class FakeBot:
+        def bot_value(self, pside, key):
+            return "bad"
+
+    with pytest.raises(ValueError, match="invalid live warmup value"):
+        pb_mod.Passivbot._live_forager_warmup_value(
+            FakeBot(), "long", "forager_volume_ema_span_1m", ""
+        )
+
+
+@pytest.mark.parametrize("pside", ["long", "short"])
+@pytest.mark.parametrize(
+    "inactive",
+    [
+        None,
+        "manual",
+        "panic",
+        "unstuck_enabled",
+        "unstuck_ema_gating_enabled",
+        "unstuck_loss_allowance_pct",
+        "unstuck_close_pct",
+        "unstuck_threshold",
+        "total_wallet_exposure_limit",
+    ],
+)
+def test_unstuck_warmup_requires_held_statically_eligible_side(pside, inactive):
+    from types import SimpleNamespace
+    from passivbot import Passivbot
+
+    values = {
+        "ema_span_0": 10.0,
+        "ema_span_1": 20.0,
+        "unstuck_ema_span_0": 400_000.0,
+        "unstuck_ema_span_1": 500_000.0,
+        "unstuck_enabled": True,
+        "unstuck_ema_gating_enabled": True,
+        "unstuck_loss_allowance_pct": 0.1,
+        "unstuck_close_pct": 0.1,
+        "unstuck_threshold": 0.2,
+        "total_wallet_exposure_limit": 1.0,
+    }
+    if inactive in values:
+        values[inactive] = 0.0
+    bot = SimpleNamespace(
+        bp=lambda side, key, symbol: values.get(key, 0.0),
+        has_position=lambda pside, symbol: symbol == "HELD",
+    )
+    mode = inactive if inactive in {"manual", "panic"} else "normal"
+    windows, _, _ = compute_live_warmup_windows(
+        {pside: {"HELD", "FLAT"}},
+        bot.bp,
+        unstuck_eligible_lookup=lambda side, symbol: Passivbot._unstuck_ema_required(
+            bot, side, symbol, mode
+        ),
+        forager_enabled={pside: True},
+        warmup_ratio=0.0,
+        span_buffer=1.0,
+    )
+    assert windows["FLAT"] == 20
+    assert windows["HELD"] == (500_000 if inactive is None else 20)
+
+
+@pytest.mark.parametrize('kind', ['trailing_martingale', 'trailing_grid_v7', 'ema_anchor'])
+def test_warmup_reuses_strategy_only_within_calculation(kind):
+    from collections import Counter
+    from copy import deepcopy
+    from types import SimpleNamespace
+    from config.strategy_spec import get_strategy_defaults
+    from passivbot import Passivbot
+
+    defaults = get_strategy_defaults(kind)
+    calls = Counter()
+    spans = {('long', 'A'): 101.25, ('short', 'A'): 303.5, ('long', 'B'): 507.75}
+
+    def getter(side, symbol):
+        calls[side, symbol] += 1
+        params = deepcopy(defaults[side])
+        params['ema_span_0'] = spans[side, symbol]
+        return params
+
+    bot = SimpleNamespace(_strategy_params_to_rust_dict=getter)
+    symbols = {'long': {'A', 'B'}, 'short': {'A'}}
+
+    def calculate(lookup):
+        return compute_live_warmup_windows(symbols, lambda *args: 0.0, strategy_lookup=lookup)
+
+    uncached = calculate(lambda side, key, symbol: Passivbot._live_strategy_warmup_value(bot, side, key, symbol))
+    assert min(calls.values()) > 1
+    calls.clear()
+    assert calculate(Passivbot._live_strategy_warmup_lookup(bot)) == uncached
+    assert calls == Counter({pair: 1 for pair in spans})
+    spans['long', 'B'] = 100_000.125
+    calls.clear()
+    changed = calculate(Passivbot._live_strategy_warmup_lookup(bot))
+    assert changed[0]['B'] == 100_001
+    assert changed[0]['A'] == uncached[0]['A']
+    assert calls == Counter({pair: 1 for pair in spans})
+
+
+@pytest.mark.parametrize('bad', [None, [], 'invalid'])
+def test_warmup_cache_does_not_hide_invalid_resolution(bad):
+    from types import SimpleNamespace
+    from passivbot import Passivbot
+
+    bot = SimpleNamespace(_strategy_params_to_rust_dict=lambda *args: bad)
+    lookup = Passivbot._live_strategy_warmup_lookup(bot)
+    with pytest.raises(TypeError, match='expected dict'):
+        lookup('long', 'ema_span_0', 'A')
+    bot._strategy_params_to_rust_dict = lambda *args: {'ema_span_0': 123.5}
+    assert lookup('long', 'ema_span_0', 'A') == 123.5
+
+
+@pytest.mark.parametrize('bad', ['invalid', float('nan'), float('inf')])
+def test_warmup_cached_span_validation_matches_uncached(bad):
+    from types import SimpleNamespace
+    from passivbot import Passivbot
+
+    bot = SimpleNamespace(_strategy_params_to_rust_dict=lambda *args: {'ema_span_0': bad})
+    lookup = Passivbot._live_strategy_warmup_lookup(bot)
+    for read in (lookup, lambda side, key, symbol: Passivbot._live_strategy_warmup_value(bot, side, key, symbol)):
+        with pytest.raises(ValueError):
+            read('long', 'ema_span_0', 'A')
+
+
+def test_warmup_nonpositive_span_keeps_existing_zero_semantics():
+    from types import SimpleNamespace
+    from passivbot import Passivbot
+
+    bot = SimpleNamespace(_strategy_params_to_rust_dict=lambda *args: {'ema_span_0': -1.0})
+    assert Passivbot._live_strategy_warmup_lookup(bot)('long', 'ema_span_0', 'A') == 0.0

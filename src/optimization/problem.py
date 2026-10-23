@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Any, Sequence
+
+import numpy as np
+from pymoo.core.problem import ElementwiseProblem
+
+from optimization.backend_shared import drain_async_results
+from optimization.bounds import Bound
+from optimization.callback import build_pymoo_record_entry
+from optimization.evaluation_payload import unpack_evaluation_payload
+from optimization.random_seed import seed_worker_rngs
+
+
+_PYMOO_WORKER_EVALUATOR = None
+_PYMOO_WORKER_OVERRIDES_LIST: list[str] = []
+_PYMOO_WORKER_N_OBJ = 0
+_PYMOO_WORKER_HAS_CONSTRAINTS = False
+_PYMOO_WORKER_FAILURE_KEY = "__passivbot_pymoo_worker_failure__"
+OPTIMIZE_PROFILE_ENV = "PASSIVBOT_OPTIMIZE_PROFILE"
+
+
+def _optimize_profile_enabled() -> bool:
+    return os.environ.get(OPTIMIZE_PROFILE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+    }
+
+
+def _set_pymoo_worker_globals(
+    evaluator,
+    overrides_list: Sequence[str] | None,
+    n_obj: int,
+    has_constraints: bool,
+) -> None:
+    global _PYMOO_WORKER_EVALUATOR
+    global _PYMOO_WORKER_OVERRIDES_LIST
+    global _PYMOO_WORKER_N_OBJ
+    global _PYMOO_WORKER_HAS_CONSTRAINTS
+
+    _PYMOO_WORKER_EVALUATOR = evaluator
+    _PYMOO_WORKER_OVERRIDES_LIST = list(overrides_list or [])
+    _PYMOO_WORKER_N_OBJ = int(n_obj)
+    _PYMOO_WORKER_HAS_CONSTRAINTS = bool(has_constraints)
+
+
+def initialize_pymoo_worker(
+    evaluator,
+    overrides_list: Sequence[str] | None,
+    n_obj: int,
+    has_constraints: bool,
+    rng_seed: int | None = None,
+    ignore_sigint_in_worker=None,
+) -> None:
+    seed_worker_rngs(rng_seed, context="pymoo optimizer")
+    if ignore_sigint_in_worker is not None:
+        ignore_sigint_in_worker()
+    _set_pymoo_worker_globals(evaluator, overrides_list, n_obj, has_constraints)
+
+
+def _evaluate_pymoo_worker(
+    evaluator,
+    vector: Sequence[float],
+    overrides_list: Sequence[str] | None,
+    n_obj: int,
+    has_constraints: bool,
+) -> dict[str, Any]:
+    evaluated_vector = list(float(v) for v in vector)
+    objectives, constraint_violation, metrics, payload_vector = unpack_evaluation_payload(
+        evaluator.evaluate(
+            evaluated_vector,
+            list(overrides_list or []),
+        )
+    )
+    if payload_vector is not None:
+        evaluated_vector = list(float(v) for v in payload_vector)
+    objectives_arr = np.asarray(objectives, dtype=np.float64)
+    if len(objectives_arr) != int(n_obj):
+        raise ValueError(
+            f"pymoo objective length mismatch: expected {int(n_obj)}, got {len(objectives_arr)}"
+        )
+    payload = {
+        "F": objectives_arr,
+        "metrics": metrics or {},
+        "evaluation_vector": np.asarray(evaluated_vector, dtype=np.float64),
+    }
+    if has_constraints:
+        violation = float(constraint_violation)
+        payload["G"] = np.asarray([violation if violation > 0.0 else -1.0], dtype=np.float64)
+    return payload
+
+
+def _evaluate_pymoo_worker_from_globals(vector: Sequence[float]) -> dict[str, Any]:
+    if _PYMOO_WORKER_EVALUATOR is None:
+        raise RuntimeError("pymoo worker evaluator not initialized")
+    try:
+        return _evaluate_pymoo_worker(
+            _PYMOO_WORKER_EVALUATOR,
+            vector,
+            _PYMOO_WORKER_OVERRIDES_LIST,
+            _PYMOO_WORKER_N_OBJ,
+            _PYMOO_WORKER_HAS_CONSTRAINTS,
+        )
+    except BaseException as exc:
+        return {
+            _PYMOO_WORKER_FAILURE_KEY: {
+                "type": exc.__class__.__name__,
+                "message": str(exc),
+            }
+        }
+
+
+class PymooEvaluatorAdapter:
+    def __init__(self, evaluator, *, overrides_list: Sequence[str] | None = None):
+        self.evaluator = evaluator
+        self.overrides_list = list(overrides_list or [])
+
+    @property
+    def has_constraints(self) -> bool:
+        if hasattr(self.evaluator, "limit_checks"):
+            return bool(getattr(self.evaluator, "limit_checks"))
+        base = getattr(self.evaluator, "base", None)
+        return bool(getattr(base, "limit_checks", []))
+
+    def evaluate(self, vector: Sequence[float]) -> dict[str, Any]:
+        evaluated_vector = list(float(v) for v in vector)
+        objectives, constraint_violation, metrics, payload_vector = unpack_evaluation_payload(
+            self.evaluator.evaluate(
+                evaluated_vector,
+                self.overrides_list,
+            )
+        )
+        if payload_vector is not None:
+            evaluated_vector = list(float(v) for v in payload_vector)
+        return {
+            "objectives": list(objectives),
+            "constraint_violation": float(constraint_violation),
+            "metrics": metrics or {},
+            "evaluation_vector": np.asarray(evaluated_vector, dtype=np.float64),
+        }
+
+
+class PymooAsyncRecordingRunner:
+    def __init__(
+        self,
+        *,
+        evaluator,
+        has_constraints: bool,
+        n_obj: int,
+        pool,
+        recorder,
+        template: dict,
+        build_config_fn,
+        overrides_fn,
+        overrides_list: Sequence[str] | None = None,
+        poll_interval_seconds: float = 0.05,
+    ):
+        self.evaluator = evaluator
+        self.has_constraints = bool(has_constraints)
+        self.n_obj = int(n_obj)
+        self.pool = pool
+        self.recorder = recorder
+        self.template = template
+        self.build_config_fn = build_config_fn
+        self.overrides_fn = overrides_fn
+        self.overrides_list = list(overrides_list or [])
+        self.poll_interval_seconds = max(0.0, float(poll_interval_seconds))
+
+    def _capture_pool_workers(self) -> tuple[Any, ...]:
+        workers = getattr(self.pool, "_pool", ())
+        return tuple(workers or ())
+
+    @staticmethod
+    def _raise_if_pool_workers_exited(workers: Sequence[Any]) -> None:
+        exited = []
+        for worker in workers:
+            try:
+                exitcode = worker.exitcode
+            except Exception:
+                continue
+            if exitcode is not None:
+                exited.append(f"pid={getattr(worker, 'pid', None)} exitcode={exitcode}")
+        if exited:
+            raise RuntimeError(
+                "pymoo worker exited before returning all candidate results; "
+                "pending evaluations cannot be recovered safely "
+                f"({', '.join(exited)})"
+            )
+
+    @staticmethod
+    def _raise_if_worker_failure(payload: dict[str, Any], batch_index: int) -> None:
+        if _PYMOO_WORKER_FAILURE_KEY not in payload:
+            return
+        failure = payload[_PYMOO_WORKER_FAILURE_KEY]
+        raise RuntimeError(
+            "pymoo worker candidate evaluation failed "
+            f"at batch index {batch_index}: {failure.get('type', 'BaseException')}: "
+            f"{failure.get('message', '')}"
+        )
+
+    def _record_result(self, vector, metrics) -> None:
+        profile_enabled = _optimize_profile_enabled()
+        started = time.perf_counter() if profile_enabled else 0.0
+        entry = build_pymoo_record_entry(
+            vector=vector,
+            metrics=metrics,
+            template=self.template,
+            build_config_fn=self.build_config_fn,
+            overrides_fn=self.overrides_fn,
+            overrides_list=self.overrides_list,
+        )
+        self.recorder.record(entry)
+        if profile_enabled:
+            logging.info(
+                "[opt-profile] record_result_ms=%.3f metrics_keys=%d",
+                (time.perf_counter() - started) * 1000.0,
+                len(metrics) if isinstance(metrics, dict) else 0,
+            )
+
+    def __call__(self, _f, X):
+        xs = list(X)
+        workers = self._capture_pool_workers()
+        _set_pymoo_worker_globals(
+            self.evaluator,
+            self.overrides_list,
+            self.n_obj,
+            self.has_constraints,
+        )
+        ordered_results: list[dict[str, Any] | None] = [None] * len(xs)
+        pending = {
+            self.pool.apply_async(
+                _evaluate_pymoo_worker_from_globals,
+                (x,),
+            ): (idx, x)
+            for idx, x in enumerate(xs)
+        }
+
+        def _on_result(context, payload):
+            idx, x = context
+            self._raise_if_worker_failure(payload, idx)
+            self._record_result(
+                payload.get("evaluation_vector", x),
+                payload.get("metrics") or {},
+            )
+            slim_payload = dict(payload)
+            slim_payload.pop("metrics", None)
+            slim_payload.pop("evaluation_vector", None)
+            ordered_results[idx] = slim_payload
+
+        drain_async_results(
+            pending,
+            poll_interval_seconds=self.poll_interval_seconds,
+            on_result=_on_result,
+            pending_health_check=lambda: self._raise_if_pool_workers_exited(workers),
+            progress_label="Optimizer population",
+        )
+
+        return [payload for payload in ordered_results if payload is not None]
+
+
+class PassivbotProblem(ElementwiseProblem):
+    def __init__(
+        self,
+        *,
+        bounds: Sequence[Bound],
+        scoring_keys: Sequence[str],
+        evaluator_adapter: PymooEvaluatorAdapter,
+        **kwargs,
+    ):
+        self.bounds = list(bounds)
+        self.scoring_keys = list(scoring_keys)
+        self.evaluator_adapter = evaluator_adapter
+        xl = np.asarray([bound.low for bound in self.bounds], dtype=np.float64)
+        xu = np.asarray([bound.high for bound in self.bounds], dtype=np.float64)
+        super().__init__(
+            n_var=len(self.bounds),
+            n_obj=len(self.scoring_keys),
+            n_ieq_constr=1 if evaluator_adapter.has_constraints else 0,
+            xl=xl,
+            xu=xu,
+            **kwargs,
+        )
+
+    def _evaluate(self, x, out, *args, **kwargs):
+        payload = self.evaluator_adapter.evaluate(x)
+        objectives = np.asarray(payload["objectives"], dtype=np.float64)
+        if len(objectives) != self.n_obj:
+            raise ValueError(
+                f"pymoo objective length mismatch: expected {self.n_obj}, got {len(objectives)}"
+            )
+        out["F"] = objectives
+        if self.n_ieq_constr:
+            violation = float(payload["constraint_violation"])
+            out["G"] = np.asarray([violation if violation > 0.0 else -1.0], dtype=np.float64)
+        out["metrics"] = payload["metrics"]
+        out["evaluation_vector"] = payload["evaluation_vector"]

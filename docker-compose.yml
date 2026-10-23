@@ -1,0 +1,43 @@
+services:
+  passivbot:
+    profiles:
+      - default
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: passivbot:latest
+    container_name: passivbot
+    restart: unless-stopped
+    volumes:
+      - ./:/app/
+    working_dir: /app
+    # Default command runs src/main.py; override as needed
+    #command: python src/main.py configs/examples/forager_long_only.json
+    #command: python src/backtest.py configs/examples/top20mcap.json
+    #command: python src/optimize.py configs/examples/forager_long_only.json
+    
+  passivbot-live:
+    profiles:
+     - live
+    build:
+      context: .
+      dockerfile: Dockerfile_live
+    image: passivbot-live:latest
+    container_name: passivbot-live
+    restart: unless-stopped
+    environment:
+      PB_USER: ${PB_USER:-}
+      PB_CONFIG_PATH: ${PB_CONFIG_PATH:-/data/configs/live.json}
+      PB_API_KEYS_PATH: ${PB_API_KEYS_PATH:-/data/api-keys.json}
+      PB_LOG_DIR: ${PB_LOG_DIR:-/data/logs}
+      PB_MONITOR_ROOT: ${PB_MONITOR_ROOT:-/data/monitor}
+    volumes:
+      - ./configs/:/data/configs/:ro
+      - ./api-keys.json:/data/api-keys.json:ro
+      - ./logs/:/data/logs/
+      - ./monitor/:/data/monitor/
+    working_dir: /app
+    # Example:
+    # PB_USER=bitget_01 docker compose --profile live up passivbot-live
+    # command: ["--log-level", "info"]
+    

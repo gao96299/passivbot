@@ -1,0 +1,452 @@
+from __future__ import annotations
+
+import math
+import re
+import time
+
+import ccxt.async_support as ccxt_async
+import ccxt.pro as ccxt_pro
+
+from config.access import require_live_value
+from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
+from exchanges.ipv4_transport import IPv4TransportMixin
+from live.diagnostic_safety import bounded_exchange_error_context
+from passivbot import logging
+from passivbot_exceptions import FatalBotException
+from utils import symbol_to_coin
+
+
+class _WeexSuccessEnvelopeMixin:
+    """Accept WEEX's documented mutation success envelope.
+
+    CCXT 4.5.66 treats every response containing ``msg`` as an error, including
+    ``{"code": "200", "msg": "success"}`` from margin/leverage mutations.
+    Keep the workaround exact so genuine WEEX errors still use CCXT's mapping.
+    """
+
+    def handle_errors(
+        self,
+        code,
+        reason,
+        url,
+        method,
+        headers,
+        body,
+        response,
+        request_headers,
+        request_body,
+    ):
+        if isinstance(response, dict):
+            response_code = str(response.get("code") or "")
+            response_message = str(response.get("msg") or "").lower()
+            if response_code == "200" and response_message == "success":
+                return None
+        return super().handle_errors(
+            code,
+            reason,
+            url,
+            method,
+            headers,
+            body,
+            response,
+            request_headers,
+            request_body,
+        )
+
+
+class AsyncWeex(IPv4TransportMixin, _WeexSuccessEnvelopeMixin, ccxt_async.weex):
+    pass
+
+
+class ProWeex(IPv4TransportMixin, _WeexSuccessEnvelopeMixin, ccxt_pro.weex):
+    def handle_orders(self, client, message):
+        """Ignore WEEX order-channel heartbeats with no order rows.
+
+        CCXT Pro versions through 4.5.67 call ``get_market_from_symbols([])`` for an empty
+        ``d`` payload, which eventually evaluates ``None.endswith(...)`` in
+        the base market resolver.  Leaving the subscription unresolved is the
+        correct websocket behavior: the pending ``watch_orders`` call remains
+        active until an actual order update arrives.
+        """
+        rows = message.get("d") if isinstance(message, dict) else None
+        if isinstance(rows, list) and not rows:
+            return
+        return super().handle_orders(client, message)
+
+
+class WeexBot(CCXTBot):
+    """WEEX USDT-margined perpetual-futures adapter.
+
+    WEEX V3 uses base-asset quantities at the unified CCXT boundary and
+    configures combined-position/margin mode per symbol. Its 24-hour ticker
+    feed omits bid/ask, so live quotes come from the contract book-ticker endpoint.
+    """
+
+    MAX_OPEN_ORDERS = 100
+    CLIENT_ORDER_ID_PATTERN = re.compile(r"^[.A-Z:/a-z0-9_-]{1,36}$")
+    BROKER_ID_PATTERN = re.compile(r"^WEEX[0-9]{6}$")
+    PASSIVBOT_TYPE_MARKER_PATTERN = re.compile(r"0x[0-9A-Fa-f]{4}")
+
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.custom_id_max_length = 36
+        self.quote = "USDT"
+        self.hedge_mode = True
+
+    def create_ccxt_sessions(self):
+        # WEEX attributes API volume from the client-order-id prefix, not a
+        # session header or CCXT option. Validate at startup so an invalid
+        # registry entry cannot leave an apparently healthy but unattributed
+        # trading session.
+        self._broker_client_order_id_prefix()
+        ccxt_config = self._build_ccxt_config()
+        user_options = self.user_info.get("options", {})
+
+        self.cca = AsyncWeex(ccxt_config)
+        self.cca.options.update(self._build_ccxt_options())
+        self.cca.options.update(user_options)
+        self.cca.options["defaultType"] = "swap"
+        self._apply_endpoint_override(self.cca)
+
+        if self.ws_enabled:
+            self.ccp = ProWeex(ccxt_config)
+            self.ccp.options.update(self._build_ccxt_options())
+            self.ccp.options.update(user_options)
+            self.ccp.options["defaultType"] = "swap"
+            self._apply_endpoint_override(self.ccp)
+        else:
+            self.ccp = None
+            logging.info("weex: WebSocket disabled, using REST polling")
+
+    def _broker_client_order_id_prefix(self) -> str:
+        broker_id = str(self.broker_code or "")
+        if not self.BROKER_ID_PATTERN.fullmatch(broker_id):
+            raise ValueError(
+                "WEEX broker code must match WEEX followed by six digits"
+            )
+        return f"b-{broker_id}-"
+
+    def format_custom_id_single(self, order_type_id: int) -> str:
+        """Build WEEX's broker-prefixed ID while retaining Passivbot diagnostics."""
+        prefix = self._broker_client_order_id_prefix()
+        formatted = super().format_custom_id_single(order_type_id)
+        custom_id = (prefix + formatted)[: self.custom_id_max_length]
+        if not self.CLIENT_ORDER_ID_PATTERN.fullmatch(custom_id):
+            raise ValueError("generated invalid WEEX client order id")
+        if not self.PASSIVBOT_TYPE_MARKER_PATTERN.search(custom_id):
+            raise ValueError(
+                "WEEX client order id has no Passivbot order-type marker"
+            )
+        return custom_id
+
+    def _validate_protective_position_snapshot(self, positions):
+        # The raw position carries its own mode; symbol settings alone cannot
+        # authorize a quantity-based close of an existing split position.
+        for position in positions:
+            if float(position["size"]) != 0.0:
+                mode = str((position.get("info") or {}).get("separatedMode") or "").upper()
+                if mode != "COMBINED":
+                    raise FatalBotException("WEEX protective execution requires explicit COMBINED position mode")
+
+    async def update_exchange_config(self):
+        """WEEX has no account-wide position-mode endpoint.
+
+        Position and margin mode are applied per active symbol by
+        update_exchange_config_by_symbols() after markets are loaded.
+        """
+        logging.debug(
+            "[config] weex position and margin mode are configured per symbol"
+        )
+
+    def _classify_exchange_symbol_unavailable_error(
+        self, exc: BaseException
+    ) -> str | None:
+        """Classify only WEEX's documented API-symbol suspension code.
+
+        Other exchanges must add their own exact code classifier rather than
+        reusing WEEX semantics or matching human-readable response text.
+        """
+        if bounded_exchange_error_context(exc).get("error_code") == "-1058":
+            return "weex_api_symbol_unavailable"
+        return None
+
+    def _order_requires_exchange_config_before_create(self, order: dict) -> bool:
+        """WEEX leverage setup is an entry prerequisite, not a close prerequisite."""
+        return self._extract_order_reduce_only(order) is not True
+
+    def _pending_exchange_config_consumes_error_budget(
+        self, blocked_orders: list[dict]
+    ) -> bool:
+        """Charge only WEEX configuration writes that failed in this executor cycle."""
+        failed_symbols = set(
+            getattr(self, "_last_exchange_config_failed_attempt_symbols", set())
+            or set()
+        )
+        return any(
+            str(order.get("symbol") or "") in failed_symbols
+            for order in blocked_orders
+            if isinstance(order, dict)
+        )
+
+    async def update_exchange_config_by_symbols(self, symbols: list[str]):
+        for symbol in symbols:
+            margin_mode = self._get_margin_mode_for_symbol(symbol)
+            leverage = self._calc_leverage_for_symbol(symbol)
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
+
+            position_mode = await self.cca.fetch_position_mode(symbol)
+            current_margin = await self.cca.fetch_margin_mode(symbol)
+            is_separated = self._require_explicit_position_mode(
+                position_mode, symbol
+            )
+            current_margin_mode = str(
+                current_margin.get("marginMode") or ""
+            ).lower()
+
+            if is_separated or current_margin_mode != margin_mode:
+                started = time.time()
+                result = await self.cca.set_position_mode(
+                    False,
+                    symbol=symbol,
+                    params={"marginMode": margin_mode},
+                )
+                logging.debug(
+                    "[config] %s set WEEX combined-position/margin mode result=%s elapsed_ms=%.1f",
+                    log_symbol,
+                    format_exchange_config_response(result),
+                    (time.time() - started) * 1000.0,
+                )
+
+            started = time.time()
+            result = await self.cca.set_leverage(
+                leverage,
+                symbol=symbol,
+                params={"marginMode": margin_mode},
+            )
+            logging.debug(
+                "[config] %s set WEEX leverage=%sx result=%s elapsed_ms=%.1f",
+                log_symbol,
+                leverage,
+                format_exchange_config_response(result),
+                (time.time() - started) * 1000.0,
+            )
+
+    def _require_explicit_position_mode(
+        self, position_mode: dict, symbol: str
+    ) -> bool:
+        """Return whether WEEX explicitly reports SEPARATED mode.
+
+        CCXT maps an absent or unknown ``separatedType`` to ``hedged=False``.
+        That is not evidence of COMBINED mode, so inspect the raw symbol row and
+        reject missing, ambiguous, or internally inconsistent state.
+        """
+        if not isinstance(position_mode, dict):
+            raise ValueError(f"{symbol}: invalid WEEX position mode response")
+        raw = position_mode.get("info")
+        rows = raw if isinstance(raw, list) else [raw]
+        market_id = str((self.markets_dict.get(symbol) or {}).get("id") or "")
+        candidates = [row for row in rows if isinstance(row, dict)]
+        if market_id:
+            matching = [
+                row
+                for row in candidates
+                if str(row.get("symbol") or "") == market_id
+            ]
+            if len(matching) != 1:
+                raise ValueError(
+                    f"{symbol}: WEEX position mode response missing unique symbol row"
+                )
+            candidates = matching
+        if len(candidates) != 1:
+            raise ValueError(
+                f"{symbol}: WEEX position mode response did not contain exactly one symbol row"
+            )
+        separated_type = str(candidates[0].get("separatedType") or "").upper()
+        if separated_type not in {"COMBINED", "SEPARATED"}:
+            raise ValueError(
+                f"{symbol}: WEEX position mode missing explicit COMBINED/SEPARATED state"
+            )
+        is_separated = separated_type == "SEPARATED"
+        hedged = position_mode.get("hedged")
+        if not isinstance(hedged, bool) or hedged != is_separated:
+            raise ValueError(
+                f"{symbol}: WEEX normalized position mode disagrees with raw state"
+            )
+        return is_separated
+
+    def _build_order_params(self, order: dict) -> dict:
+        """Build the exact WEEX V3 hedge-order contract.
+
+        WEEX closes are selected by side + positionSide.  The V3 order API
+        does not expose reduceOnly, so do not leak that unsupported field into
+        the signed request.
+        """
+        position_side = str(order.get("position_side") or "").lower()
+        if position_side not in {"long", "short"}:
+            raise ValueError(f"WEEX order has invalid position_side: {position_side!r}")
+        client_order_id = str(order.get("custom_id") or "")
+        if not self.CLIENT_ORDER_ID_PATTERN.fullmatch(client_order_id):
+            raise ValueError(
+                "WEEX client order id must match ^[.A-Z:/a-z0-9_-]{1,36}$"
+            )
+        if not client_order_id.startswith(self._broker_client_order_id_prefix()):
+            raise ValueError(
+                "WEEX client order id must start with the configured broker prefix"
+            )
+        if not self.PASSIVBOT_TYPE_MARKER_PATTERN.search(client_order_id):
+            raise ValueError(
+                "WEEX client order id must retain the Passivbot order-type marker"
+            )
+        params = {
+            "positionSide": position_side.upper(),
+            "clientOrderId": client_order_id,
+        }
+        if order.get("type", "limit") == "limit":
+            params["timeInForce"] = (
+                "POST_ONLY"
+                if require_live_value(self.config, "time_in_force") == "post_only"
+                else "GTC"
+            )
+        return params
+
+    def _get_position_side_from_trade(self, trade: dict) -> str:
+        info = trade.get("info") or {}
+        position_side = str(info.get("positionSide") or "").lower()
+        if position_side not in {"long", "short"}:
+            raise ValueError(
+                "weex fill missing explicit LONG/SHORT positionSide"
+            )
+        return position_side
+
+    def _get_position_side_for_order(self, order: dict) -> str:
+        """Require WEEX's explicit hedge side on every futures order."""
+        info = order.get("info") or {}
+        if not isinstance(info, dict):
+            raise ValueError("weex order has invalid raw info payload")
+        position_side = str(info.get("positionSide") or "").lower()
+        if position_side not in {"long", "short"}:
+            raise ValueError(
+                "weex order missing explicit LONG/SHORT positionSide"
+            )
+        return position_side
+
+    def _canonical_open_order_reduce_only(self, order: dict) -> bool:
+        """Normalize WEEX V3's authoritative hedge action to close-only effect."""
+        side = str(
+            order.get("side") or (order.get("info") or {}).get("side") or ""
+        ).lower()
+        position_side = self._get_position_side_for_order(order)
+        if side not in {"buy", "sell"}:
+            raise ValueError("weex order missing explicit buy/sell side")
+        action_close = (position_side == "long" and side == "sell") or (
+            position_side == "short" and side == "buy"
+        )
+        # V3 COMBINED orders cannot send reduceOnly.  WEEX nevertheless exposes
+        # a response field with that name and has been observed returning false
+        # for valid side + positionSide closes.  Treating it as authoritative
+        # makes the bot reject its own resting close.  The documented hedge
+        # action tuple is the connector-native close-only contract.
+        return action_close
+
+    def _get_balance(self, fetched: dict) -> float:
+        """Return WEEX wallet balance, excluding unrealized position PnL.
+
+        WEEX V3's ``balance`` moves with ``unrealizePnl``.  Passivbot's raw
+        balance is the realized wallet balance used by Rust and backtests, so
+        normalize equity back to wallet balance from the same authoritative
+        response row.
+        """
+        raw = fetched.get("info") if isinstance(fetched, dict) else None
+        rows = raw if isinstance(raw, list) else [raw]
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("asset") or "").upper() == self.quote
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"weex: balance response missing unique {self.quote} asset row"
+            )
+        row = matches[0]
+        try:
+            equity = float(row["balance"])
+            unrealized_pnl = float(row["unrealizePnl"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "weex: balance response missing finite balance/unrealizePnl"
+            ) from exc
+        wallet_balance = equity - unrealized_pnl
+        if not all(
+            math.isfinite(value)
+            for value in (equity, unrealized_pnl, wallet_balance)
+        ):
+            raise ValueError(
+                "weex: balance response contains non-finite balance/unrealizePnl"
+            )
+        return wallet_balance
+
+    async def _do_fetch_tickers(self) -> list[dict]:
+        return await self.cca.contract_get_capi_v3_market_ticker_bookticker()
+
+    async def _do_fetch_tickers_for_symbols(self, symbols: list[str]) -> list[dict]:
+        # One bulk book-ticker call is cheaper and more consistent than one
+        # request per symbol.  Callers filter the normalized mapping.
+        return await self._do_fetch_tickers()
+
+    def _normalize_tickers(self, fetched: list[dict] | dict) -> dict:
+        rows = fetched if isinstance(fetched, list) else [fetched]
+        tickers = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            market_id = str(row.get("symbol") or "")
+            symbol = self.symbol_ids_inv.get(market_id)
+            if symbol not in self.markets_dict:
+                continue
+            try:
+                bid = float(row["bidPrice"])
+                ask = float(row["askPrice"])
+                timestamp = int(row["time"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(bid) or not math.isfinite(ask):
+                continue
+            if bid <= 0.0 or ask <= 0.0 or bid > ask or timestamp <= 0:
+                continue
+            tickers[symbol] = {
+                "bid": bid,
+                "ask": ask,
+                "last": (bid + ask) / 2.0,
+                "timestamp": timestamp,
+                # WEEX's V3 book-ticker endpoint has no last-trade field.  Keep
+                # the bounded midpoint derivation explicit for downstream
+                # trading inputs and incident reconstruction.
+                "source": "weex_book_ticker_mid",
+            }
+        return tickers
+
+    def set_market_specific_settings(self):
+        super().set_market_specific_settings()
+        for symbol in self.symbols_requiring_market_sizing():
+            market = self.markets_dict[symbol]
+            if not (
+                market.get("swap")
+                and market.get("linear")
+                and market.get("settle") == self.quote
+            ):
+                continue
+            # WEEX's unified order quantity is already expressed in base units.
+            # contractVal is metadata, not a contracts-to-base multiplier here.
+            self.c_mults[symbol] = 1.0
+            raw_max_leverage = (market.get("limits") or {}).get("leverage", {}).get(
+                "max"
+            )
+            if raw_max_leverage is None:
+                raw_max_leverage = (market.get("info") or {}).get("maxLeverage")
+            max_leverage = float(raw_max_leverage)
+            if not math.isfinite(max_leverage) or max_leverage <= 0.0:
+                raise ValueError(
+                    f"{symbol}: invalid WEEX max leverage metadata: {raw_max_leverage!r}"
+                )
+            self.max_leverage[symbol] = int(max_leverage)

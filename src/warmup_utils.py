@@ -1,0 +1,562 @@
+import math
+from typing import Iterator, Tuple
+
+from config.access import require_config_value, require_live_value
+from config.optimize_bounds import flatten_optimize_bounds
+from config.shared_bot import flatten_shared_bot_side
+from config.strategy import (
+    build_runtime_strategy_side,
+    get_active_strategy_config,
+    normalize_strategy_kind,
+)
+from optimization.bounds import Bound
+from strategy_warmup import (
+    iter_strategy_warmup_flat_bound_keys,
+    strategy_warmup_requirements,
+)
+
+
+def _to_float(value, *, context: str) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid warmup value for {context}: {value!r}") from None
+    if not math.isfinite(numeric):
+        raise ValueError(f"invalid warmup value for {context}: {value!r}")
+    return numeric
+
+
+def _require_max_warmup_minutes(config: dict) -> float:
+    return _to_float(
+        require_live_value(config, "max_warmup_minutes"),
+        context="live.max_warmup_minutes",
+    )
+
+
+def _accumulate_max_minutes(max_minutes: float, *values, context: str) -> float:
+    for value in values:
+        numeric = _to_float(value, context=context)
+        max_minutes = max(max_minutes, numeric)
+    return max_minutes
+
+
+def _iter_param_sets(config: dict) -> Iterator[Tuple[str, dict, dict]]:
+    bot_cfg = config.get("bot", {})
+    strategy_kind = normalize_strategy_kind(config.get("live", {}).get("strategy_kind"))
+    strategy_cfg = get_active_strategy_config(config, strategy_kind=strategy_kind)
+    base_long = flatten_shared_bot_side(bot_cfg.get("long", {}) or {})
+    base_short = flatten_shared_bot_side(bot_cfg.get("short", {}) or {})
+    default_long_strategy = (
+        build_runtime_strategy_side(
+            strategy_cfg.get("long", {}),
+            strategy_kind=strategy_kind,
+            pside="long",
+        )
+        if strategy_cfg.get("long")
+        else {}
+    )
+    default_short_strategy = (
+        build_runtime_strategy_side(
+            strategy_cfg.get("short", {}),
+            strategy_kind=strategy_kind,
+            pside="short",
+        )
+        if strategy_cfg.get("short")
+        else {}
+    )
+    yield (
+        "__default__",
+        base_long,
+        base_short,
+        default_long_strategy,
+        default_short_strategy,
+    )
+
+    coin_overrides = config.get("coin_overrides", {})
+    for coin, overrides in coin_overrides.items():
+        bot_overrides = overrides.get("bot", {})
+        long_params = dict(base_long)
+        short_params = dict(base_short)
+        long_params.update(flatten_shared_bot_side(bot_overrides.get("long", {}) or {}))
+        short_params.update(flatten_shared_bot_side(bot_overrides.get("short", {}) or {}))
+        for params, base, side in (
+            (long_params, base_long, "long"),
+            (short_params, base_short, "short"),
+        ):
+            patch = flatten_shared_bot_side(bot_overrides.get(side, {}) or {}).get(
+                "entry_cooldown_weights_minutes", {}
+            )
+            if "entry_cooldown_weights_minutes" in base:
+                params["entry_cooldown_weights_minutes"] = {
+                    **base["entry_cooldown_weights_minutes"],
+                    **patch,
+                }
+        yield (
+            coin,
+            long_params,
+            short_params,
+            (
+                build_runtime_strategy_side(
+                    strategy_cfg.get("long", {}),
+                    strategy_kind=strategy_kind,
+                    pside="long",
+                    override_side=bot_overrides.get("long", {}),
+                )
+                if strategy_cfg.get("long") or bot_overrides.get("long", {}).get("strategy")
+                else {}
+            ),
+            (
+                build_runtime_strategy_side(
+                    strategy_cfg.get("short", {}),
+                    strategy_kind=strategy_kind,
+                    pside="short",
+                    override_side=bot_overrides.get("short", {}),
+                )
+                if strategy_cfg.get("short") or bot_overrides.get("short", {}).get("strategy")
+                else {}
+            ),
+        )
+
+
+def _unstuck_gate_may_run(config: dict, coin: str, pside: str, params: dict) -> bool:
+    """Keep warmup for optimizer reactivation, but omit statically inert reducers."""
+    if not params.get("unstuck_enabled", True) or not params.get(
+        "unstuck_ema_gating_enabled", True
+    ):
+        return False
+    bounds = flatten_optimize_bounds(
+        config.get("optimize", {}).get("bounds", {}),
+        strategy_kind=config.get("live", {}).get("strategy_kind"),
+    )
+    pinned = flatten_shared_bot_side(
+        config.get("coin_overrides", {}).get(coin, {}).get("bot", {}).get(pside, {})
+    )
+    if pinned.get("wallet_exposure_limit") == 0:
+        return False
+    for key in (
+        "unstuck_loss_allowance_pct",
+        "unstuck_close_pct",
+        "unstuck_threshold",
+        "total_wallet_exposure_limit",
+        "n_positions",
+    ):
+        if key not in params or _to_float(params[key], context=key) > 0.0:
+            continue
+        bound = bounds.get(f"{pside}_{key}") if key not in pinned else None
+        if bound is None or Bound.from_config(f"{pside}_{key}", bound).high <= 0.0:
+            return False
+    return True
+
+
+def rms_side_enabled(params, pside, *, bounds=None):
+    """RMS consumers need an enabled fixed side or an optimizer-reachable side."""
+    gates = ("total_wallet_exposure_limit", "n_positions")
+    fixed = [float(params.get(key, 0.0)) for key in gates]
+    if all(value > 0.0 for value in fixed):
+        return True
+    if not bounds:
+        return False
+    searched = [
+        Bound.from_config(f"{pside}_{key}", bounds[f"{pside}_{key}"]).high
+        if f"{pside}_{key}" in bounds else value
+        for key, value in zip(gates, fixed)
+    ]
+    return all(value > 0.0 for value in searched)
+
+
+def _rms_warmup_minutes(params, pside, *, bounds=None, for_trade_activation=False, ranking_possible=True):
+    if not rms_side_enabled(params, pside, bounds=None if for_trade_activation else bounds):
+        return 0
+    scoring = params.get("forager_score_weights", {}).get("unilateralness", 0.0)
+    adverse = params.get("entry_cooldown_weights_minutes", {}).get("adverse_directionality", 0.0)
+    span = params.get("unilateralness_ema_span_1m")
+    if bounds and not for_trade_activation:
+        def upper(key, fixed):
+            raw = bounds.get(f"{pside}_{key}")
+            if raw is None:
+                return fixed
+            high = _to_float(Bound.from_config(key, raw).high, context=f"{pside}_{key}")
+            return max(fixed, high) if fixed is not None else high
+
+        scoring = upper("forager_score_weights_unilateralness", scoring)
+        adverse = upper("entry_cooldown_weights_minutes_adverse_directionality", adverse)
+        span = upper("unilateralness_ema_span_1m", span)
+    from config.entry_cooldown import constant_duration
+    duration_params = dict(params)
+    if bounds and not for_trade_activation:
+        for key in ("risk_entry_cooldown_minutes", "entry_cooldown_min_duration_minutes"):
+            raw = bounds.get(f"{pside}_{key}")
+            if raw is not None:
+                duration_params[key] = min(params.get(key, 0.0), Bound.from_config(key, raw).low)
+        duration_params["entry_cooldown_max_duration_minutes"] = upper(
+            "entry_cooldown_max_duration_minutes", params.get("entry_cooldown_max_duration_minutes")
+        )
+    if constant_duration(duration_params) is not None:
+        adverse = 0.0
+    if adverse <= 0.0 and (for_trade_activation or not ranking_possible or scoring <= 0.0):
+        return 0
+    n_returns = math.ceil(_to_float(span, context=f"{pside}.unilateralness_ema_span_1m") * 20.0)
+    # N returns need N+1 closes, available at offset N from the first valid close.
+    return n_returns if for_trade_activation else n_returns + 1
+
+
+def _rms_policy_keys(config, eligible, overrides):
+    """Resolve selected markets to override keys without fetching market metadata.
+
+    Like the payload resolver, alias matching uses the venue's coin-to-symbol map,
+    never a lossy ticker comparison. Before metadata/venue selection is available,
+    retain all possible policies plus the default rather than underfetch history.
+    """
+    from backtest_universe import normalize_backtest_coin
+    from utils import (
+        coin_to_symbol, looks_like_exact_market_identifier,
+        MarketIdentifierExchangeMismatch, UnknownMarketIdentifier,
+    )
+
+    if eligible is None:
+        return {"__default__", *overrides}
+    coins = config.get("backtest", {}).get("coins", {})
+    exchanges = config.get("backtest", {}).get("exchanges", [])
+    policies = set()
+    for coin in eligible:
+        candidates = {
+            key for key in overrides if key != coin and (
+                looks_like_exact_market_identifier(key) or looks_like_exact_market_identifier(coin)
+            )
+        }
+        if not candidates:
+            policies.add(coin if coin in overrides else "__default__")
+            continue
+        venues = {
+            venue for venue, selected in coins.items()
+            if isinstance(selected, (list, tuple, set))
+            and coin in {normalize_backtest_coin(c) for c in selected}
+        } if isinstance(coins, dict) else set()
+        if not venues:
+            venues = set(exchanges)
+        if not venues or "combined" in venues:
+            policies.update({"__default__", *overrides})
+            continue
+        for venue in venues:
+            matches = {coin} if coin in overrides else set()
+            try:
+                target = coin_to_symbol(coin, venue, verbose=False)
+            except MarketIdentifierExchangeMismatch:
+                continue
+            except UnknownMarketIdentifier:
+                policies.update({"__default__", *overrides})
+                continue
+            unresolved = False
+            for key in candidates:
+                try:
+                    if coin_to_symbol(key, venue, verbose=False) == target:
+                        matches.add(key)
+                except MarketIdentifierExchangeMismatch:
+                    continue
+                except UnknownMarketIdentifier:
+                    # The dataset may be sized before this venue's metadata exists.
+                    unresolved = True
+            if unresolved:
+                policies.update({"__default__", *overrides})
+            else:
+                policies.update(matches or {"__default__"})
+    return policies
+
+
+def _rms_param_sets(config, bounds, *, param_sets=None):
+    """Size RMS from eligible coin-side policies, retaining unresolved defaults."""
+    from backtest_universe import normalize_backtest_coin
+    from utils import heuristic_symbol_to_coin, looks_like_exact_market_identifier
+
+    coins = config.get("backtest", {}).get("coins", {})
+    groups = list(coins.values()) if isinstance(coins, dict) else [coins]
+    selected = {
+        normalize_backtest_coin(coin) for group in groups
+        if isinstance(group, (list, tuple, set)) for coin in group
+    }
+    approved = config.get("live", {}).get("approved_coins", {})
+    if not selected and isinstance(approved, dict):
+        selected = {
+            normalize_backtest_coin(coin) for group in approved.values()
+            if isinstance(group, (list, tuple, set)) for coin in group
+        }
+    selected.discard("ALL")
+    by_side = {}
+    for side in ("long", "short"):
+        raw = approved.get(side) if isinstance(approved, dict) else None
+        if selected and isinstance(raw, (list, tuple, set)) and not any(str(x).lower() == "all" for x in raw):
+            exact = {normalize_backtest_coin(coin) for coin in raw}
+            aliases = {heuristic_symbol_to_coin(coin) for coin in exact if not looks_like_exact_market_identifier(coin)}
+            by_side[side] = {coin for coin in selected if coin in exact or heuristic_symbol_to_coin(coin) in aliases}
+        else:
+            by_side[side] = selected or None
+    overrides = config.get("coin_overrides", {})
+    policies_by_side = {side: _rms_policy_keys(config, eligible, overrides) for side, eligible in by_side.items()}
+    # Count selected side-specific markets, not override-policy rows. Unresolved
+    # market aliases retain the upper bound; exclude only proven zero-WEL pins.
+    eligible_counts = {}
+    for side, eligible in by_side.items():
+        eligible_counts[side] = None if eligible is None else sum(
+            any(
+                overrides.get(key, {}).get("bot", {}).get(side, {}).get("wallet_exposure_limit") != 0.0
+                for key in _rms_policy_keys(config, {coin}, overrides)
+            )
+            for coin in eligible
+        )
+    for coin, long, short, *_ in (param_sets if param_sets is not None else _iter_param_sets(config)):
+        for side, params in (("long", long), ("short", short)):
+            if coin not in policies_by_side[side]:
+                continue
+            patch = flatten_shared_bot_side(overrides.get(coin, {}).get("bot", {}).get(side, {}))
+            if patch.get("wallet_exposure_limit") == 0.0:
+                continue
+            # Coin pins supersede global search dimensions for this side.
+            effective_bounds = dict(bounds)
+            for key in list(effective_bounds):
+                prefix = f"{side}_"
+                if not key.startswith(prefix):
+                    continue
+                name = key[len(prefix):]
+                weights = "entry_cooldown_weights_minutes_"
+                if (name in patch or (name.startswith(weights) and
+                        name[len(weights):] in patch.get("entry_cooldown_weights_minutes", {}))):
+                    del effective_bounds[key]
+            count = eligible_counts[side]
+            slots = params.get("n_positions", 0.0)
+            slot_bound = effective_bounds.get(f"{side}_n_positions")
+            if slot_bound is not None:
+                slots = min(slots, Bound.from_config(f"{side}_n_positions", slot_bound).low)
+            ranking_possible = count is None or (
+                count > 1 and (
+                    config.get("backtest", {}).get("dynamic_wel_by_tradability", True)
+                    or count > int(round(slots))
+                )
+            )
+            yield coin, side, params, effective_bounds, ranking_possible
+
+
+def _rms_history_configs(config, bounds):
+    """Yield effective RMS values and only bounds not superseded by pins."""
+    from config.param_paths import require_existing_config_path
+    from optimization.config_adapter import resolve_optimization_bound_path
+    from optimization.fine_tune_anchors import get_anchor_plan
+    from optimization.warmup import _build_optimizer_boundary_configs, _try_get_path
+
+    if get_anchor_plan(config) is not None:
+        # Each anchor supplies its own fixed values. Evaluate finalized corners
+        # independently rather than combining pins from different anchors.
+        for candidate in _build_optimizer_boundary_configs(config, rms_consumer_corner=True):
+            yield candidate, {}
+        return
+    pins = config.get("optimize", {}).get("fixed_runtime_overrides", {}) or {}
+    fixed_keys = set(config.get("_optimizer_anchor", {}).get("fixed_keys", []))
+    if not pins and not fixed_keys:
+        yield config, bounds
+        return
+    # Only materialized pins supersede bounds. A standalone backtest may keep
+    # optimizer overrides which differ from the bot values it actually runs.
+    pinned_paths = {
+        tuple(path) for key, value in pins.items()
+        if _try_get_path(config, path := require_existing_config_path(config, key)) == value
+    }
+    effective_bounds = {
+        key: value for key, value in bounds.items()
+        if key not in fixed_keys
+        and tuple(resolve_optimization_bound_path(config, key) or ()) not in pinned_paths
+    }
+    yield config, effective_bounds
+
+
+def compute_backtest_warmup_minutes(
+    config: dict, *, for_trade_activation: bool = False, include_rms: bool = True
+) -> int:
+    """History covers searched RMS values; activation consumes only the fixed policy."""
+
+    def _extract_bound_max(bounds: dict, key: str) -> tuple[float, bool]:
+        if key not in bounds:
+            return 0.0, True
+        parsed = Bound.from_config(key, bounds[key])
+        max_val = max(
+            _to_float(parsed.low, context=f"optimize warmup bound {key}"),
+            _to_float(parsed.high, context=f"optimize warmup bound {key}"),
+        )
+        return max_val, True
+
+    max_minutes = 0.0
+    unstuck_gate_sides = set()
+    minute_fields = [
+        "ema_span_0",
+        "ema_span_1",
+        "unstuck_ema_span_0",
+        "unstuck_ema_span_1",
+        "forager_volume_ema_span_1m",
+        "forager_volatility_ema_span_1m",
+    ]
+
+    for (
+        coin,
+        long_params,
+        short_params,
+        long_strategy,
+        short_strategy,
+    ) in _iter_param_sets(config):
+        side_sets = (
+            ("long", long_params, long_strategy),
+            ("short", short_params, short_strategy),
+        )
+        for pside, params, strategy in side_sets:
+            unstuck_gate = _unstuck_gate_may_run(config, coin, pside, params)
+            if unstuck_gate:
+                unstuck_gate_sides.add(pside)
+            for field in minute_fields:
+                if field.startswith("unstuck_ema_span_") and not unstuck_gate:
+                    continue
+                if field not in params:
+                    continue
+                max_minutes = _accumulate_max_minutes(
+                    max_minutes,
+                    params[field],
+                    context=f"{pside}.{field}",
+                )
+            requirements = strategy_warmup_requirements(
+                strategy,
+                pside=pside,
+                error_label="warmup",
+            )
+            max_minutes = max(
+                max_minutes,
+                requirements.max_1m_span_minutes,
+                requirements.max_h1_span_hours * 60.0,
+            )
+
+    bounds = flatten_optimize_bounds(
+        config.get("optimize", {}).get("bounds", {}),
+        strategy_kind=config.get("live", {}).get("strategy_kind"),
+    )
+    bound_keys_minutes = [
+        "long_forager_volume_ema_span_1m",
+        "long_forager_volatility_ema_span_1m",
+        "short_forager_volume_ema_span_1m",
+        "short_forager_volatility_ema_span_1m",
+    ]
+    bound_keys_minutes.extend(
+        f"{side}_unstuck_ema_span_{i}"
+        for side in sorted(unstuck_gate_sides)
+        for i in (0, 1)
+    )
+    bound_keys_minutes.extend(iter_strategy_warmup_flat_bound_keys("1m"))
+    bound_keys_hours = iter_strategy_warmup_flat_bound_keys("1h")
+
+    for key in bound_keys_minutes:
+        extracted, is_valid = _extract_bound_max(bounds, key)
+        if not is_valid:
+            return 0
+        max_minutes = max(max_minutes, extracted)
+    for key in bound_keys_hours:
+        extracted, is_valid = _extract_bound_max(bounds, key)
+        if not is_valid:
+            return 0
+        max_minutes = max(max_minutes, extracted * 60.0)
+
+    warmup_ratio = _to_float(
+        require_config_value(config, "live.warmup_ratio"),
+        context="live.warmup_ratio",
+    )
+    limit = _require_max_warmup_minutes(config)
+
+    warmup_minutes = max_minutes * max(0.0, warmup_ratio)
+    if limit > 0:
+        warmup_minutes = min(warmup_minutes, limit)
+    if include_rms:
+        warmup_minutes = max(
+            warmup_minutes,
+            max(
+                (
+                    _rms_warmup_minutes(
+                        params, side, bounds=effective_bounds, for_trade_activation=for_trade_activation,
+                        ranking_possible=ranking_possible
+                    )
+                    for rms_config, rms_bounds in (
+                        [(config, {})] if for_trade_activation else _rms_history_configs(config, bounds)
+                    )
+                    for _, side, params, effective_bounds, ranking_possible in _rms_param_sets(rms_config, rms_bounds)
+                ),
+                default=0,
+            ),
+        )
+    return int(math.ceil(warmup_minutes)) if warmup_minutes > 0.0 else 0
+
+
+def compute_per_coin_warmup_minutes(
+    config: dict, *, for_trade_activation: bool = False, include_rms: bool = True
+) -> dict:
+    warmup_ratio = _to_float(
+        require_config_value(config, "live.warmup_ratio"),
+        context="live.warmup_ratio",
+    )
+    limit = _require_max_warmup_minutes(config)
+    per_coin = {}
+    param_sets = list(_iter_param_sets(config))
+    rms_pairs = {
+        (coin, side): ranking_possible
+        for coin, side, _, _, ranking_possible in _rms_param_sets(config, {}, param_sets=param_sets)
+    } if include_rms else {}
+    minute_fields = [
+        "ema_span_0",
+        "ema_span_1",
+        "unstuck_ema_span_0",
+        "unstuck_ema_span_1",
+        "forager_volume_ema_span_1m",
+        "forager_volatility_ema_span_1m",
+    ]
+    for coin, long_params, short_params, long_strategy, short_strategy in param_sets:
+        max_minutes = 0.0
+        side_sets = (
+            ("long", long_params, long_strategy),
+            ("short", short_params, short_strategy),
+        )
+        for pside, params, strategy in side_sets:
+            unstuck_gate = _unstuck_gate_may_run(config, coin, pside, params)
+            for field in minute_fields:
+                if field.startswith("unstuck_ema_span_") and not unstuck_gate:
+                    continue
+                if field not in params:
+                    continue
+                max_minutes = _accumulate_max_minutes(
+                    max_minutes,
+                    params[field],
+                    context=f"{coin}.{pside}.{field}",
+                )
+            requirements = strategy_warmup_requirements(
+                strategy,
+                pside=pside,
+                symbol=coin if coin != "__default__" else None,
+                error_label="warmup",
+            )
+            max_minutes = max(
+                max_minutes,
+                requirements.max_1m_span_minutes,
+                requirements.max_h1_span_hours * 60.0,
+            )
+        warmup_minutes = max_minutes * max(0.0, warmup_ratio)
+        if limit > 0:
+            warmup_minutes = min(warmup_minutes, limit)
+        if include_rms:
+            for side, params in (("long", long_params), ("short", short_params)):
+                if (coin, side) not in rms_pairs:
+                    continue
+                warmup_minutes = max(
+                    warmup_minutes,
+                    _rms_warmup_minutes(
+                        params, side, for_trade_activation=for_trade_activation,
+                        ranking_possible=rms_pairs[coin, side],
+                    ),
+                )
+        per_coin[coin] = int(math.ceil(warmup_minutes)) if warmup_minutes > 0.0 else 0
+    return per_coin
+
+
+__all__ = [
+    "compute_backtest_warmup_minutes",
+    "compute_per_coin_warmup_minutes",
+]

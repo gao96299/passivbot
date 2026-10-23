@@ -1,0 +1,499 @@
+from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
+from live.balance_composition import normalize_okx_balance_composition
+from live.diagnostic_safety import bounded_exception_type
+from passivbot import logging
+from live import hsl_live
+import passivbot_rust as pbr
+
+import asyncio
+from utils import symbol_to_coin, ts_to_date, utc_ms
+from config.access import require_live_value
+
+calc_order_price_diff = pbr.calc_order_price_diff
+
+
+class OKXBot(CCXTBot):
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.order_side_map = {
+            "buy": {"long": "open_long", "short": "close_short"},
+            "sell": {"long": "close_long", "short": "open_short"},
+        }
+        self.custom_id_max_length = 32
+        # Track whether dual-side/hedge mode is available; default to True.
+        self.okx_dual_side = True
+        self.okx_pm_account = False
+
+    async def _detect_account_config(self):
+        """
+        Inspect account configuration to detect portfolio margin (PM) and position mode.
+        Startup must know whether OKX is in dual-side or net mode before building orders.
+        """
+        self.okx_dual_side = False
+        try:
+            cfg = await self.cca.private_get_account_config()
+            data = cfg.get("data")
+            if (
+                not isinstance(data, list)
+                or len(data) != 1
+                or not isinstance(data[0], dict)
+            ):
+                raise ValueError(
+                    "OKX account configuration requires one explicit mode row"
+                )
+            data0 = data[0]
+            pos_mode = str(
+                data0.get("posMode", "")
+            ).lower()  # "long_short_mode" or "net_mode"
+            acct_lv = str(
+                data0.get("acctLv", "")
+            ).lower()  # "pm" for portfolio margin accounts
+            if pos_mode == "net_mode":
+                self.okx_dual_side = False
+                self.hedge_mode = False
+                raise RuntimeError(
+                    "OKX account is in net (one-way) mode; Passivbot requires "
+                    "dual-side/hedge mode for live order side safety"
+                )
+            elif pos_mode == "long_short_mode":
+                self.okx_dual_side = True
+                self.hedge_mode = True
+            else:
+                raise ValueError(
+                    "OKX account configuration missing explicit position mode"
+                )
+            self.okx_pm_account = acct_lv == "pm"
+            if self.okx_pm_account:
+                logging.info(
+                    "OKX account detected as Portfolio Margin (PM); mode/leverage changes may be restricted."
+                )
+        except Exception as e:
+            if isinstance(
+                e, RuntimeError
+            ) and "Passivbot requires dual-side/hedge mode" in str(e):
+                raise
+            raise RuntimeError(
+                "Unable to detect OKX account configuration before live order setup"
+            ) from e
+
+    # ═══════════════════ HOOK OVERRIDES ═══════════════════
+
+    async def _do_fetch_open_orders(self, symbol: str = None) -> list:
+        """Read every pending-order page before exposing an account snapshot."""
+        orders = {}
+        cursor = None
+        for _ in range(1000):
+            params = {"paginate": False}
+            if cursor is not None:
+                params["after"] = str(cursor)
+            page = await self.cca.fetch_open_orders(
+                symbol=symbol, limit=100, params=params
+            )
+            if not isinstance(page, list) or len(page) > 100:
+                raise ValueError("OKX returned an invalid open-order page")
+            page_ids = []
+            for order in page:
+                order_id = order.get("id") if isinstance(order, dict) else None
+                if not isinstance(order_id, str) or not order_id.isdecimal():
+                    raise ValueError("OKX open order missing a numeric pagination ID")
+                page_ids.append(int(order_id))
+                orders.setdefault(order_id, order)
+            # CCXT sorts parsed orders by timestamp, so list position does not
+            # identify the oldest order. OKX's `after` cursor uses order IDs.
+            if page_ids:
+                next_cursor = min(page_ids)
+                if cursor is not None and next_cursor >= cursor:
+                    raise RuntimeError("OKX open-order pagination did not advance")
+                cursor = next_cursor
+            if len(page) < 100:
+                return list(orders.values())
+        raise RuntimeError("OKX open-order pagination exhausted before completion")
+
+    def _get_position_side_for_order(self, order: dict) -> str:
+        """OKX provides posSide in info."""
+        info = order.get("info") or {}
+        position_side = str(
+            order.get("position_side") or info.get("posSide") or ""
+        ).lower()
+        if not bool(
+            getattr(self, "_config_hedge_mode", True)
+            and getattr(self, "hedge_mode", True)
+        ):
+            return self._normalize_one_way_position_side(order)
+        if position_side in {"long", "short"}:
+            return position_side
+        if position_side == "net":
+            return self._normalize_one_way_position_side(order)
+        raise ValueError("OKX order missing authoritative position-side semantics")
+
+    def _canonical_open_order_reduce_only(self, order: dict) -> bool:
+        """Normalize OKX long/short-mode action tuples to close-only effect."""
+        info = order.get("info") or {}
+        raw_position_side = str(info.get("posSide") or "").lower()
+        effective_hedge_mode = bool(
+            getattr(self, "_config_hedge_mode", True)
+            and getattr(self, "hedge_mode", True)
+        )
+        if effective_hedge_mode and raw_position_side in {"long", "short"}:
+            side = str(order.get("side") or info.get("side") or "").lower()
+            if side not in {"buy", "sell"}:
+                raise ValueError("OKX hedge order missing explicit buy/sell side")
+            return (raw_position_side == "long" and side == "sell") or (
+                raw_position_side == "short" and side == "buy"
+            )
+        reduce_only = self._strict_order_reduce_only_response(order)
+        if not isinstance(reduce_only, bool):
+            raise ValueError("OKX one-way order missing authoritative reduceOnly")
+        return reduce_only
+
+    def _normalize_positions(self, fetched: list) -> list:
+        """OKX: Preserve live positions across both cross and isolated margin modes."""
+        positions = []
+        for elm in fetched:
+            contracts = float(elm.get("contracts", 0))
+            if contracts != 0:
+                normalized = {
+                    "symbol": elm["symbol"],
+                    "position_side": elm.get("side", "long").lower(),
+                    "size": contracts,
+                    "price": float(elm.get("entryPrice", 0)),
+                }
+                self._preserve_position_timing(elm, normalized)
+                margin_mode = self._extract_live_margin_mode(elm)
+                if margin_mode is not None:
+                    normalized["margin_mode"] = margin_mode
+                    self._record_live_margin_mode(normalized["symbol"], margin_mode)
+                positions.append(normalized)
+        return positions
+
+    def _get_pnl_from_trade(self, trade: dict) -> float:
+        """OKX uses fillPnl in info."""
+        return float(trade.get("info", {}).get("fillPnl", 0))
+
+    def _get_position_side_from_trade(self, trade: dict) -> str:
+        """OKX provides posSide in info."""
+        return trade.get("info", {}).get("posSide", "long").lower()
+
+    # ═══════════════════ OKX-SPECIFIC METHODS ═══════════════════
+
+    async def fetch_balance(self) -> float:
+        """OKX: return wallet balance in quote terms, including multi-asset collateral."""
+        fetched = await self._do_fetch_balance()
+        return self._get_balance(fetched)
+
+    def _get_balance(self, fetched: dict) -> float:
+        """OKX account equity includes UPL; Passivbot raw balance should not."""
+        info = fetched["info"]
+        data = info["data"]
+        if not data:
+            raise KeyError("okx: fetch_balance response missing info.data[0]")
+        account = data[0]
+        details = account.get("details", [])
+        if "totalEq" in account:
+            upl_sum = sum(float(detail.get("upl") or 0.0) for detail in details)
+            return float(account["totalEq"]) - upl_sum
+
+        balance = 0.0
+        for detail in details:
+            collateral_enabled = detail.get("collateralEnabled")
+            if (
+                str(collateral_enabled).lower() not in {"true", "1"}
+                and collateral_enabled is not True
+            ):
+                continue
+            ccy = detail["ccy"]
+            if ccy == self.quote:
+                balance += float(detail["cashBal"])
+            elif "eqUsd" in detail:
+                balance += float(detail["eqUsd"]) - float(detail.get("upl") or 0.0)
+            else:
+                raise KeyError(f"okx: collateral detail for {ccy} missing eqUsd")
+        if balance == 0.0:
+            total = fetched.get("total")
+            if not isinstance(total, dict) or self.quote not in total:
+                raise KeyError(
+                    f"okx: fetch_balance response missing total[{self.quote!r}]"
+                )
+            return float(total[self.quote])
+        return balance
+
+    def _normalize_balance_diagnostics(self, fetched: object) -> dict:
+        """Expose only bounded documented OKX account-detail diagnostics."""
+        return normalize_okx_balance_composition(fetched)
+
+    async def fetch_pnls(
+        self, start_time: int = None, end_time: int = None, limit=None
+    ):
+        if limit is None:
+            limit = 100
+        if start_time is None and end_time is None:
+            return await self.fetch_pnl()
+        all_fetched = {}
+        while True:
+            fetched = await self.fetch_pnl(start_time=start_time, end_time=end_time)
+            if fetched == []:
+                break
+            for elm in fetched:
+                all_fetched[elm["id"]] = elm
+            if len(fetched) < limit:
+                break
+            logging.debug(f"fetching income {ts_to_date(fetched[-1]['timestamp'])}")
+            end_time = fetched[0]["timestamp"]
+        return sorted(all_fetched.values(), key=lambda x: x["timestamp"])
+
+    async def gather_fill_events(self, start_time=None, end_time=None, limit=None):
+        """Return canonical fill events for OKX."""
+        events = []
+        fills = await self.fetch_pnls(
+            start_time=start_time, end_time=end_time, limit=limit
+        )
+        for fill in fills:
+            events.append(
+                {
+                    "id": fill.get("id"),
+                    "timestamp": fill.get("timestamp"),
+                    "symbol": fill.get("symbol"),
+                    "side": fill.get("side"),
+                    "position_side": fill.get("position_side"),
+                    "qty": fill.get("amount"),
+                    "price": fill.get("price"),
+                    "pnl": fill.get("pnl"),
+                    "fee": fill.get("fee"),
+                    "info": fill.get("info"),
+                }
+            )
+        return events
+
+    async def fetch_pnl(
+        self,
+        start_time: int = None,
+        end_time: int = None,
+    ):
+        """Fetch trades from OKX. If there are more than 100 fills, fetches latest."""
+        if end_time is None:
+            end_time = utc_ms() + 1000 * 60 * 60 * 24
+        if start_time is None:
+            start_time = end_time - 1000 * 60 * 60 * 24 * 7
+        fetched = await self.cca.fetch_my_trades(
+            since=int(start_time), params={"until": int(end_time)}
+        )
+        for i in range(len(fetched)):
+            fetched[i]["pnl"] = float(fetched[i]["info"]["fillPnl"])
+            fetched[i]["position_side"] = fetched[i]["info"]["posSide"]
+        return sorted(fetched, key=lambda x: x["timestamp"])
+
+    @hsl_live.connector_write("cancel")
+    async def execute_cancellation(self, order: dict) -> dict:
+        """OKX: Cancel order with special handling for 51400 (already cancelled/filled)."""
+        try:
+            self._emit_execution_connector_call_started_event(
+                order=order,
+                action="cancel",
+                connector_route="okx",
+            )
+            return await self.cca.cancel_order(order["id"], symbol=order["symbol"])
+        except Exception as e:
+            # 51400 = order already cancelled or filled - not an error
+            if '"sCode":"51400"' in str(e):
+                logging.info(
+                    "[order] cancel skipped: %s - order already cancelled or filled | error_type=%s",
+                    self._log_symbol(order.get("symbol")),
+                    type(e).__name__,
+                )
+                return self._ambiguous_cancel_success_result(order)
+            raise
+
+    def _build_order_params(self, order: dict) -> dict:
+        if not bool(getattr(self, "okx_dual_side", True)):
+            raise RuntimeError(
+                "OKX order construction requires dual-side/hedge mode; "
+                "refusing to build net-mode order params"
+            )
+        margin_mode = self._get_margin_mode_for_symbol(order["symbol"])
+        params = {
+            "postOnly": require_live_value(self.config, "time_in_force") == "post_only",
+            "reduceOnly": order["reduce_only"],
+            "hedged": True,
+            "tag": self.broker_code,
+            "clOrdId": order["custom_id"],
+            "marginMode": margin_mode,
+        }
+        params["positionSide"] = order["position_side"]
+        return params
+
+    def _emit_exchange_config_outcome_event(
+        self,
+        *,
+        symbol: str,
+        status: str,
+        outcome: str,
+        level: str,
+        response_code: str | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        try:
+            self._emit_exchange_config_refresh_event(
+                context="update_exchange_config_by_symbols",
+                operation="set_margin_mode",
+                status=status,
+                symbol=symbol,
+                outcome=outcome,
+                response_code=response_code,
+                error=error,
+                level=level,
+            )
+        except Exception as exc:
+            logging.debug(
+                "[event] failed to emit OKX exchange config-refresh outcome | error_type=%s",
+                bounded_exception_type(exc),
+            )
+
+    async def update_exchange_config_by_symbols(self, symbols: [str]):
+        coros_to_call_margin_mode = {}
+        for symbol in symbols:
+            margin_mode = self._get_margin_mode_for_symbol(symbol)
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
+            try:
+                leverage = self._calc_leverage_for_symbol(symbol)
+                coros_to_call_margin_mode[symbol] = asyncio.create_task(
+                    self.cca.set_margin_mode(
+                        margin_mode,
+                        symbol=symbol,
+                        params={"lever": leverage},
+                    )
+                )
+            except Exception as e:
+                logging.error(
+                    "[config] %s %s-margin task creation failed | %s",
+                    log_symbol,
+                    margin_mode,
+                    self._format_exchange_config_error(e),
+                )
+        for symbol in symbols:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
+            res = None
+            to_print = ""
+            unchanged = False
+            try:
+                res = await coros_to_call_margin_mode[symbol]
+                to_print += f"margin={format_exchange_config_response(res)}"
+                self._emit_exchange_config_outcome_event(
+                    symbol=symbol,
+                    status="succeeded",
+                    outcome="confirmed",
+                    level="info",
+                )
+            except Exception as e:
+                err_str = str(e)
+                if '"code":"59107"' in err_str:
+                    to_print += f"margin=ok (unchanged)"
+                    unchanged = True
+                    self._emit_exchange_config_outcome_event(
+                        symbol=symbol,
+                        status="succeeded",
+                        outcome="unchanged",
+                        response_code="59107",
+                        level="debug",
+                    )
+                elif '"code":"51039"' in err_str:
+                    logging.warning(
+                        f"{log_symbol}: unable to adjust margin mode/leverage (possibly PM or open positions)"
+                    )
+                    self._emit_exchange_config_outcome_event(
+                        symbol=symbol,
+                        status="failed",
+                        outcome="failed",
+                        response_code="51039",
+                        error=e,
+                        level="warning",
+                    )
+                    continue
+                else:
+                    logging.error(
+                        "[config] %s cross-margin update failed | %s",
+                        log_symbol,
+                        self._format_exchange_config_error(e),
+                    )
+                    if symbol in coros_to_call_margin_mode:
+                        self._emit_exchange_config_outcome_event(
+                            symbol=symbol,
+                            status="failed",
+                            outcome="failed",
+                            error=e,
+                            level="error",
+                        )
+            if to_print:
+                if unchanged:
+                    logging.debug(f"{log_symbol}: {to_print}")
+                else:
+                    logging.info(f"{log_symbol}: {to_print}")
+
+    async def _prepare_protective_account(self):
+        await self._detect_account_config()
+        if not self.okx_dual_side:
+            raise RuntimeError(
+                "OKX protective startup requires existing hedge position mode"
+            )
+
+    async def update_exchange_config(self):
+        # Detect current account mode; adjust expectations before attempting changes.
+        await self._detect_account_config()
+        if not self.okx_dual_side:
+            raise RuntimeError(
+                "OKX account is not in dual-side/hedge mode; Passivbot refuses "
+                "to continue in net mode"
+            )
+        try:
+            res = await self.cca.set_position_mode(True)
+            logging.debug(
+                "[config] set hedge mode response: %s",
+                format_exchange_config_response(res),
+            )
+        except Exception as e:
+            err_str = str(e)
+            if '"code":"59000"' in err_str:
+                logging.info("[config] hedge mode update skipped | code=59000")
+            elif '"code":"51039"' in err_str or '"code":"51000"' in err_str:
+                # Cannot switch to dual/hedge (often due to PM or open orders/positions).
+                self.okx_dual_side = False
+                self.hedge_mode = False
+                raise RuntimeError(
+                    "OKX rejected hedge/dual-side switch (51039/51000); "
+                    "Passivbot refuses to continue in net mode"
+                ) from e
+            else:
+                raise
+
+    async def calc_ideal_orders(self):
+        # okx has max 100 open orders. Drop orders whose pprice diff is greatest.
+        ideal_orders = await super().calc_ideal_orders()
+        market_prices = await self._get_live_last_prices(
+            ideal_orders.keys(),
+            max_age_ms=10_000,
+            context="okx_order_cap_sort",
+            allow_completed_candle_fallback=True,
+        )
+        ideal_orders_tmp = []
+        for s in ideal_orders:
+            for x in ideal_orders[s]:
+                ideal_orders_tmp.append(
+                    (
+                        calc_order_price_diff(
+                            x["side"],
+                            x["price"],
+                            market_prices[s],
+                        ),
+                        {**x, **{"symbol": s}},
+                    )
+                )
+        ideal_orders_tmp = [x[1] for x in sorted(ideal_orders_tmp, key=lambda x: x[0])][
+            :100
+        ]
+        ideal_orders = {symbol: [] for symbol in self.active_symbols}
+        for x in ideal_orders_tmp:
+            ideal_orders[x["symbol"]].append(x)
+        return ideal_orders
+
+    def format_custom_id_single(self, order_type_id: int) -> str:
+        formatted = super().format_custom_id_single(order_type_id)
+        return (self.broker_code + formatted)[: self.custom_id_max_length]

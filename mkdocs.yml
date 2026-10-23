@@ -1,0 +1,45 @@
+site_name: Passivbot
+site_url: https://www.passivbot.com
+repo_url: https://github.com/enarjord/passivbot
+use_directory_urls: True
+docs_dir: docs
+nav:
+  - Home: index.md
+  - Releases: releases.md
+  - Installation: installation.md
+  - Configuration: configuration.md
+  - Strategy Parameters: config.bot.md
+  - Config Workflow: config_workflow.md
+  - Running live: live.md
+  - Monitor: monitor.md
+  - Backtesting: backtesting.md
+  - Suite Examples: suite_examples.md
+  - Optimizing: optimizing.md
+  - Tools: tools.md
+  - Forager: forager.md
+  - Risk Management: risk_management.md
+  - Equity Hard Stop Loss: equity_hard_stop_loss.md
+  - Coin Overrides: coin_overrides.md
+  - Fake Live: fake_live.md
+  - Container Deployment: container_deployment.md
+  - Stock Perps: stock_perps.md
+  - Metrics: metrics.md
+  - Troubleshooting: troubleshooting.md
+theme:
+  name: material
+  logo: 'images/logo.png'
+  favicon: 'images/logo.png'
+  custom_dir: 'docs/overrides'
+  palette:
+    primary: 'blue grey'
+    accent: 'tear'
+markdown_extensions:
+  - attr_list
+  - admonition
+  - toc:
+      permalink: True
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+extra:
+  version:
+    provider: mike

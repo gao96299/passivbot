@@ -1,0 +1,58 @@
+# Stage 1: Build the Passivbot live wheel
+FROM python:3.12-slim-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install dependencies required to compile Rust + Python extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev \
+    pkg-config \
+    libssl-dev \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+
+WORKDIR /app
+
+# Copy only files needed to build the live package wheel
+COPY pyproject.toml pyproject.toml
+COPY setup.py setup.py
+COPY requirements-dev.txt requirements-dev.txt
+COPY requirements-full.txt requirements-full.txt
+COPY requirements-live.txt requirements-live.txt
+COPY requirements-rust.txt requirements-rust.txt
+COPY src src
+COPY passivbot-rust/Cargo.toml passivbot-rust/Cargo.toml
+COPY passivbot-rust/src passivbot-rust/src
+
+# Install build requirements and build the wheel without dependency resolution
+RUN pip install --no-cache-dir -r requirements-rust.txt setuptools-rust wheel \
+    && python -m pip wheel . --no-deps --no-build-isolation -w /tmp/wheels
+
+# Stage 2: Final minimal image
+FROM python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SKIP_RUST_COMPILE=true
+
+WORKDIR /app
+
+# Copy runtime support files
+COPY broker_codes.hjson broker_codes.hjson
+COPY container container
+
+# Copy the built Passivbot wheel from the builder stage
+COPY --from=builder /tmp/wheels/*.whl /tmp/wheels/
+
+# Install the live package and make the entrypoint executable
+RUN pip install --no-cache-dir /tmp/wheels/passivbot-*.whl \
+    && chmod +x /app/container/entrypoint.sh \
+    && rm -rf /tmp/* ~/.cache/pip
+
+# Keep the wrapper on the command path and pass runtime args through it
+ENTRYPOINT ["/app/container/entrypoint.sh"]

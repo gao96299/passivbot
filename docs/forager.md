@@ -1,0 +1,229 @@
+# Forager Mode
+
+This document explains Passivbot's dynamic coin-selection system, referred to in code and config as `forager`.
+
+## Motivation
+
+Forager mode exists to answer one question:
+
+Which symbols should be allowed to occupy the limited entry slots right now?
+
+Forager answers that question in a simple sequence:
+
+1. prune obviously weak candidates by volume
+2. rank the survivors by a weighted score
+3. fill the available shortlist slots from that ranking
+
+This lets you control the tradeoff between liquidity, volatility, entry readiness, and sustained directionality directly in config.
+
+## Inputs
+
+For each side (`bot.long` and `bot.short`), forager uses:
+
+- `forager_volume_drop_pct`
+- `forager_volume_ema_span_1m`
+- `forager_volatility_ema_span_1m`
+- `forager_score_weights`
+- `unilateralness_ema_span_1m` (floating-point span, default 60)
+- `ema_span_0`
+- `ema_span_1`
+- `entry_initial_ema_dist`
+
+It also depends on live/backtest market state:
+
+- latest market price
+- EMA bands derived from `ema_span_0`, `ema_span_1`, and `sqrt(span_0 * span_1)`
+- 1m EMA quote volume
+- 1m EMA log range
+- completed 1m close returns for enabled RMS unilateralness scoring
+- tradability / enabled flags / slot availability
+
+## Selection Flow
+
+At a high level, forager selection is:
+
+1. Build candidate inputs for all approved symbols that are old enough.
+2. Disable candidates that fail trading constraints such as effective min cost.
+3. Apply coarse low-volume pruning using `forager_volume_drop_pct`.
+4. Normalize the remaining feature values.
+5. Compute a weighted score using `forager_score_weights`.
+6. Return the best candidates needed to fill the available shortlist slots.
+
+The canonical shortlist logic now lives in Rust and is shared by live selection and orchestrator/backtest selection.
+
+Live refreshes of broad candidate candles are best-effort and budgeted. The live bot should refresh
+the stalest eligible candidates first and spread remote candle calls over time, but stale candles
+within `live.max_forager_candle_staleness_minutes` do not by themselves remove a flat candidate
+from ranking. This prevents the shortlist from being chosen from a random subset of candidates
+that happened to have the freshest candles.
+
+## Feature Definitions
+
+### Volume
+
+`forager_volume_ema_span_1m` controls the 1m EMA of quote volume used in ranking and pruning.
+
+- Higher is better.
+- If `forager_volume_drop_pct > 0`, volume is required even if the volume score weight is zero.
+
+### Volatility
+
+`forager_volatility_ema_span_1m` controls the 1m EMA of log range:
+
+`log_range = ln(high / low)`
+
+- Higher is better.
+- This is a ranking input, not an entry trigger by itself.
+
+### EMA Readiness
+
+EMA readiness measures distance to the actual initial-entry threshold, not just distance to raw EMA bands.
+
+For long:
+
+`readiness = bid / (ema_lower * (1 - entry_initial_ema_dist)) - 1`
+
+For short:
+
+`readiness = 1 - ask / (ema_upper * (1 + entry_initial_ema_dist))`
+
+Lower is better.
+
+Interpretation:
+
+- negative: already beyond the initial-entry threshold
+- near zero: close to triggering
+- larger positive: farther away from entry
+
+### Unilateralness
+
+`bot.<side>.forager.score_weights.unilateralness` optionally penalizes sustained
+one-way movement equally up or down. It uses the absolute signed RMS score from
+completed one-minute close returns. Lower is better; the candidate normalization
+inverts this penalty so higher total scores remain preferable. The weight defaults
+to zero and the floating-point `unilateralness_ema_span_1m` defaults to 60.
+See [adaptive entry cooldown and RMS](adaptive_entry_cooldown.md) for the formula,
+normalization, completed-candle readiness and decay through flat prices.
+
+## `forager_score_weights`
+
+`forager_score_weights` is a dict with required keys:
+
+- `volume`
+- `ema_readiness`
+- `volatility`
+- `unilateralness`
+
+Rules:
+
+- each value must be finite and non-negative
+- positive weights are relative; only their proportions matter
+- positive weights are normalized to unit sum before scoring
+- if all four weights are zero, Passivbot normalizes them to EMA-readiness-only ranking
+
+Examples:
+
+- `{"volume": 0.0, "ema_readiness": 0.0, "volatility": 1.0, "unilateralness": 0.0}`
+  - prioritize the most volatile candidates
+- `{"volume": 1.0, "ema_readiness": 0.0, "volatility": 0.0, "unilateralness": 0.0}`
+  - maximize liquidity after coarse pruning
+- `{"volume": 0.0, "ema_readiness": 1.0, "volatility": 0.0, "unilateralness": 0.0}`
+  - prioritize symbols closest to a real initial entry
+- `{"volume": 0.2, "ema_readiness": 0.6, "volatility": 0.2, "unilateralness": 0.0}`
+  - bias toward actual setups while still preferring liquid, active symbols
+- `{"volume": 0.0, "ema_readiness": 0.0, "volatility": 0.0, "unilateralness": 0.0}`
+  - normalize to EMA-readiness-only ranking
+
+- `{"volume": 0.0, "ema_readiness": 0.0, "volatility": 0.0, "unilateralness": 1.0}`
+  - prefer the least unilateral retained candidates
+- `{"volume": 0.0, "ema_readiness": 0.2, "volatility": 0.4, "unilateralness": 0.4}`
+  - balance entry readiness and volatility against sustained one-way movement
+
+These sub-weights are also available under `optimize.bounds` as:
+
+- `long_forager_score_weights_volume`
+- `long_forager_score_weights_ema_readiness`
+- `long_forager_score_weights_volatility`
+- `long_forager_score_weights_unilateralness`
+- `short_forager_score_weights_volume`
+- `short_forager_score_weights_ema_readiness`
+- `short_forager_score_weights_volatility`
+- `short_forager_score_weights_unilateralness`
+
+The optional span dimensions are `long_unilateralness_ema_span_1m` and
+`short_unilateralness_ema_span_1m`. Missing unilateralness weight and span bounds
+are hydrated as `[configured_value, configured_value]`, using the normalized
+Forager weight and the configured floating-point span for each side. New configs
+default to `[0.0, 0.0]` for the weight and `[60.0, 60.0]` for the span. Templates
+leave these bounds absent until parsing derives them from the bot values. These
+bounds are visible but fixed; widen them explicitly to include unilateralness in the
+optimizer search. Explicit ranges are preserved. Canonical exports use
+`optimize.bounds.<side>.forager.score_weights_unilateralness` and
+`optimize.bounds.<side>.forager.unilateralness_ema_span_1m`.
+
+Important: these weights only rank candidates for available initial-entry slots. They do not force
+entries, bypass entry conditions, or bypass risk/min-size gates. If all four weights are set to
+zero, the canonical config is EMA-readiness-only ranking, so the saved config will show
+`{"volume": 0.0, "ema_readiness": 1.0, "volatility": 0.0, "unilateralness": 0.0}`. That means forager prefers symbols
+closest to their real initial-entry threshold when filling empty slots; it does not mean every
+approved symbol will immediately open or keep adding entries.
+
+## Live Stale-Candle Policy
+
+Forager ranking inputs are decision-critical, but broad flat-candidate candles do not have the
+same freshness contract as candles for held symbols or symbols about to receive an order. For live
+forager ranking:
+
+- The candidate universe should be refreshed oldest-first in the background.
+- Candidates inside `live.max_forager_candle_staleness_minutes` remain rankable even if their
+  latest completed candle is stale.
+- When that setting is `null`, the budget-derived window is never shorter than
+  `live.max_active_candle_tail_gap_minutes` (10 minutes by default). An explicit positive forager
+  staleness cap may intentionally shorten the window.
+- Close EMA readiness may use bounded flat-close/no-trade projection for the stale tail.
+- Quote-volume and log-range EMA inputs should use the latest known EMA value without appending
+  synthetic zero-volume or zero-range tail candles.
+- Synthetic zero volume/log-range is valid for verified no-trade continuity gaps, not for unknown
+  stale tails caused by REST delay or refresh budgeting.
+- A candidate with no prior feature basis, non-finite carried values, or feature age beyond the
+  configured cap is unavailable for new forager entries until refreshed.
+
+When a candidate becomes unavailable, that state should be explicit in diagnostics. The bot should
+not silently replace missing volume/log-range with neutral values such as `0.0`, `(0.0, 0.0)`, or
+`inf`. If unavailable candidates materially narrow the ranking universe, the degraded universe
+should be visible and new forager entries may be deferred; the bot should not silently fill empty
+slots from the subset of symbols that refreshed first.
+
+## Failure Policy
+
+Forager inputs are trading-critical once a symbol is selected for an actual initial entry. Before
+placing or keeping an initial-entry order, the live bot still needs fresh account-critical surfaces,
+a fresh enough market snapshot, finite candidate features, and feature age within policy.
+
+The only fallback philosophy accepted in Passivbot for critical indicator paths is explicitly
+reviewed, bounded, observable reuse of prior indicator state in approved paths. Forager should not
+invent local substitute values.
+
+## Caveats
+
+- Live currently uses the latest available market price as both bid and ask in the Python-collected payload. The shortlist math itself is side-aware in Rust, so moving to real order-book bid/ask later does not require changing the ranking definition.
+- If a feature weight is zero and no other part of the selection requires that feature, the feature may be skipped entirely.
+
+## Practical Tuning Notes
+
+- Start with volatility-only if you want the shortlist to favor active, moving symbols.
+- Add `ema_readiness` when you want empty slots to favor symbols closer to producing a real initial entry.
+- Keep some volume pruning or volume weight if your candidate universe contains many illiquid tails.
+- If rankings look noisy, first widen the forager EMA spans before changing entry parameters.
+
+## Implementation Notes
+
+- Canonical shortlist scoring and selection live in Rust.
+- Python is responsible for gathering market data, building payloads, and calling Rust.
+- The canonical config names are `forager_volume_ema_span_1m` and `forager_volatility_ema_span_1m`.
+
+When unilateralness is enabled, the monitor's ranking total comes from the latest
+Rust scoring diagnostic, including all four components, volume pruning and tie
+ordering. Its source timestamp identifies the observation. No total is shown when
+there is no current scoring diagnostic; the monitor does not fetch RMS data or
+reconstruct selection to fill that gap.

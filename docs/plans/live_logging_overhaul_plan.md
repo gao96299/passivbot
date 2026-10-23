@@ -1,0 +1,488 @@
+# Live Logging Overhaul Plan
+
+## Goal
+
+Make live observability a first-class part of the Python live bot's data-gatherer,
+payload-builder, orchestrator, and executor role.
+
+Rust remains the source of truth for trading logic. Python remains responsible for
+fetching exchange data, proving freshness and coverage, building Rust payloads,
+executing returned orders, and explaining every degraded, deferred, skipped, or
+executed decision. The logging overhaul should make that explanation cheap to
+collect, bounded on a small VPS, and reliable enough for post-incident debugging.
+
+## Scope And Stopping Rule
+
+This plan defines the implementation and migration scope for the shared
+live-event pipeline and high-value decision/action logs. Canonical logging,
+redaction, and sink behavior remains owned by `docs/ai/logging_policy.md`;
+event-family payload contracts remain owned by
+`docs/ai/features/live_events.md`. This plan is not an umbrella for every
+capability that consumes events.
+
+In scope:
+
+- correctness, boundedness, and failure isolation of the canonical event
+  pipeline;
+- one structured owner for high-value lifecycle, readiness, planning,
+  execution, fill, position, balance, and safety evidence;
+- removal of duplicate or unsafe human/structured output;
+- the minimal query and validation needed to prove the event contract across
+  rotation and restart;
+- consolidation that reduces duplicated event-reader or projection code.
+
+Out of scope unless a concrete event-contract defect blocks the work:
+
+- trading policy, reconciliation, readiness enforcement, and risk behavior;
+- restart/deployment execution and process supervision;
+- HSL, candle, fill, startup, shutdown, or connector performance work;
+- general incident, performance, configuration, repository, dashboard, export,
+  and operator-convenience tooling.
+
+The overhaul ends when the finite migration and correctness criteria in
+`live_logging_overhaul_current_status.md` are satisfied. It does not remain
+open because another event type, report field, debug profile, selector, or
+operational edge case could be useful. New work requires observed evidence,
+must identify which completion criterion is unmet, and should prefer deletion,
+consolidation, demotion, or aggregation before adding another surface.
+
+## Current State
+
+This section records the baseline that motivated the overhaul. Consult
+`live_logging_overhaul_current_status.md` for the implemented state and resume
+instructions. At the baseline, the problem was fragmentation, not absence:
+
+1. Standard Python logging from `src/logging_setup.py`.
+   Console/file logs are operator-readable and already use familiar text tags
+   such as `[order]`, `[ema]`, `[candle]`, `[risk]`, `[fills]`, `[state]`,
+   `[health]`, and `[forager]`. They are not backed by one structured event
+   envelope, so fields, ids, reason codes, and throttling differ by call site.
+2. Monitor artifacts from `src/monitor_publisher.py`.
+   `MonitorPublisher.record_event()` writes rotated NDJSON envelopes and already
+   supports snapshots, history streams, manifests, compression, retention, and
+   byte caps. It is the best current persistence base, but it only covers a
+   subset of live behavior and writes synchronously from the caller.
+3. Diagnostic event wrappers in `src/live/events.py`.
+   `DiagnosticEvent` gives `data_packet.updated`, `snapshot.built`, and
+   `planning_unavailable` a typed path into monitor events, but the envelope is
+   narrow: `kind`, `tags`, `payload`, `ts_ms`, `symbol`, `pside`.
+4. Structured freshness/planning models in `src/live/`.
+   `DataPacketMetadata`, `FreshnessLedger`, and `PlanningSnapshot` already model
+   much of the information a proper event stream needs.
+5. Domain-specific instrumentation hooks.
+   `CandlestickManager` has remote fetch callback hooks. Fill refresh has fetch
+   timing and coverage metadata. Order waves, staged refresh, HSL, EMA readiness,
+   and forager selection already log useful details, but not through one event
+   contract.
+
+Recent live work on VPS5 and the local Bybit bot showed why this matters:
+
+## Target Shape
+
+Build one live event pipeline with multiple sinks. Do not merge all outputs into
+one physical file. Instead, emit one canonical event and project it differently
+for each audience.
+
+Primary components:
+
+1. `src/live/event_bus.py`
+   A small facade for creating, enriching, routing, throttling, and enqueueing
+   events. Live code calls `emit(...)` or domain helpers, not each sink directly.
+2. `LiveEvent`
+   A stable structured event envelope.
+3. `LiveEventContext`
+   Per-cycle and per-action context propagated through the live loop.
+4. Sinks
+   Console, text logfile, structured NDJSON, monitor projection, history streams,
+   and optional bounded diagnostic artifacts for permitted non-exchange data.
+5. Routing table
+   One declarative policy mapping event types and levels to sinks, retention,
+   throttling, and console formatting.
+
+The event bus must not become a trading control plane. Event emission must never
+decide whether an order is safe. If sinks fail or fall behind, emit/surface
+`sink.degraded`, increment counters, and preserve trading behavior.
+
+## Event Envelope
+
+Each event should include a stable envelope:
+
+Compatibility mapping:
+
+- Current monitor `kind` maps to `event_type`.
+- Current monitor `payload` maps to `data`.
+- Current text tags map to `tags`.
+- `FreshnessLedger.epoch` feeds authoritative cohort diagnostics; `cycle_id`
+  remains the separate execution-loop lifecycle correlation id.
+- `PlanningSnapshot.snapshot_id` should pass through unchanged.
+
+## Event Registry
+
+Start with a small event registry and expand as components migrate. Initial
+stable names:
+
+Names should be stable and dotted. Text prefixes can remain for console
+readability, but they should be projections of the event registry.
+
+## Sinks
+
+### Console Sink
+
+Human-readable, low-volume, tail-safe. INFO defaults should include:
+
+- lifecycle start/ready/stop
+- real exchange writes and results
+- fills and realized PnL
+- balance and position changes
+- mode changes
+- HSL/WEL/TWEL/unstuck transitions
+- execution-loop errors and terminal startup failures
+- blocking/degraded states that explain why the bot waits
+- bounded fallback use
+- periodic health summaries
+
+Keep out of INFO by default:
+
+- every remote poll
+- every EMA update
+- full Rust payloads
+- raw exchange/account payloads, which no sink may retain
+- repeated candidate-only forager misses
+- high-frequency cache maintenance with no state change
+
+Default console output should be compact summaries fed from structured events,
+for example:
+
+```text
+[cycle] 2026-06-22T12:00:01Z id=cy_abc ready symbols=42 rust=8ms reconcile=3ms plan=create:2 cancel:1
+[gate] cy_abc deferred creates=5 stale_ema=3 pending_config=2 protective=allowed
+[execute] wave=17 cancel=1 ok create=2 ok elapsed=642ms confirm=open_orders requested
+[forager] long selected=3/40 unavailable=7 budget_skipped=12 max_age=180s
+[risk] BTCUSDT long RED panic activated dd=12.4% threshold=10.0%
+```
+
+The full event details remain on disk. Console is a view, not the source of
+truth.
+
+### Text File Sink
+
+Same human projection as console, with bounded size rotation. This remains useful
+for existing tail workflows and simple VPS debugging.
+
+### Structured Event Sink
+
+Authoritative forensic stream. Reuse and evolve `MonitorPublisher`'s current
+rotated NDJSON/event-history machinery rather than inventing a parallel
+`logs/events.jsonl` format.
+
+Changes needed:
+
+- accept the full `LiveEvent` envelope
+- keep `current.ndjson` compatibility during migration
+- move writes off the trading hot path via a bounded queue and dedicated writer
+- preserve manifest, compression, retention, and byte caps
+- emit/drop counters and `sink.degraded` if the queue overflows or disk fails
+
+### Monitor Sink
+
+Curated live subset for relay/TUI/web. Keep `state.latest.json` as a projection,
+not a replacement for the event stream. The monitor should be able to answer
+"what is the bot doing now?" while structured events answer "what happened?".
+
+### History Streams
+
+High-volume domain streams should stay physically separate because their volume
+and retention needs differ:
+
+- fills
+- orders
+- positions
+- balances
+- completed candles
+- candle fetches
+- EMA bundles or EMA summaries
+- Rust diagnostic hashes and bounded scrubbed summaries
+
+### Diagnostic Artifact Store
+
+Raw exchange/account payloads must never be retained. Exchange and Rust
+orchestrator diagnostics keep hashes and bounded normalized summaries by
+default. A targeted Rust artifact may retain only a bounded scrubbed projection
+that omits account state; it also requires explicit policy, short retention, and
+byte caps.
+
+## High-Volume Policy
+
+The event bus needs event-type-specific sampling and suppression. Suppression
+must itself be observable.
+
+Defaults:
+
+## Correlation Model
+
+Post-incident reconstruction depends on correlation ids.
+
+- `cycle_id`: one live-loop cycle or staged refresh epoch.
+- `snapshot_id`: planning snapshot id already produced by `PlanningSnapshot`.
+- `remote_call_group_id`: concurrent fetch cohort.
+- `remote_call_id`: individual request.
+- `plan_id`: one Rust planning invocation.
+- `action_id`: one planned order action or decision.
+- `order_wave_id`: one create/cancel reconciliation wave.
+
+These ids should connect:
+
+1. why data was fetched
+2. which remote calls were made
+3. which data packets changed
+4. which snapshot was built
+5. which Rust payload was sent
+6. which Rust output came back
+7. which actions were planned
+8. which exchange writes happened
+9. how confirmations/fills changed state
+
+For any exchange write, the structured stream should make the following chain
+traceable:
+
+1. Rust ideal order
+2. Python executable order
+3. gate decision
+4. bounded normalized submitted-order summary and payload hash
+5. bounded normalized exchange outcome and response hash
+6. local open-order update
+7. confirmation refresh request
+8. confirmation satisfied, timed out, or ambiguous terminal state
+
+## Remote Call Instrumentation
+
+Every exchange/network call should eventually emit:
+
+- `remote_call.started`
+- `remote_call.succeeded` or `remote_call.failed`
+
+Fields:
+
+`CandlestickManager.remote_fetch_callback` should be wired into this pipeline
+rather than staying a dead-end hook.
+
+## Rust Orchestrator Instrumentation
+
+The call to Rust should become a first-class event chain:
+
+- `rust_orchestrator.called`
+  Bounded summary plus hash for the full input payload, which is not persisted.
+- `rust_orchestrator.returned`
+  Bounded summary plus hash for the output.
+- `action.planned`
+  Per order or compact batch summary with reason and source.
+
+Targeted Rust diagnostics may retain only policy-permitted bounded scrubbed
+projections that omit account state such as balances, position sizes, and entry
+prices. Full Rust inputs and raw exchange/account payloads are never persisted;
+their diagnostics remain hashes and bounded normalized summaries.
+
+## Cache And Disk Instrumentation
+
+Cache load/flush events should explain:
+
+- symbol/timeframe/data kind
+- requested range
+- loaded/written range
+- row counts
+- bytes read/written
+- elapsed ms
+- overlap detected
+- overwrite/merge behavior
+- synthetic vs real rows
+- shard/index path or sanitized relative path
+- error and recovery policy
+
+This is especially important for candle and fill-history issues, where runtime
+behavior often depends on local cache coverage.
+
+## Adjacent Operational Restart Goals
+
+These are adjacent behavior/performance goals discovered while smoke-testing the
+logging work. They should be implemented as reviewed slices with tests and live
+smoke, not hidden inside observability-only PRs or counted toward logging
+completion. Their implementation belongs in the live-operations backlog or a
+dedicated handoff.
+
+## Historical Migration Plan
+
+The phases below are the historical implementation sequence that established
+the current architecture. They are retained as design rationale, not as resume
+instructions. Do not restart these phases or branch from their historical `v8`
+baseline; select any remaining work only through
+`live_logging_overhaul_current_status.md`.
+
+### Phase 0: Contract And Routing Table
+
+No behavior change.
+
+- Freeze the initial `LiveEvent` envelope.
+- Create the event registry and routing table.
+- Define console defaults, structured retention defaults, diagnostic-artifact
+  policy, and redaction rules.
+- Document how current monitor `kind` events map to `event_type`.
+
+### Phase 1: Event Bus Around Existing Structured Events
+
+No trading behavior change.
+
+- Add `src/live/event_bus.py`.
+- Add `LiveEvent`, `LiveEventContext`, and `emit_event(...)`.
+- Wrap current `DiagnosticEvent` or replace it with a compatibility adapter.
+- Route `data_packet.updated`, `snapshot.built`, and `planning_unavailable`
+  through the bus.
+- Add queue-backed structured sink using current `MonitorPublisher` storage.
+- Emit sink health counters and `sink.degraded`.
+- Add fake-live tests proving one cycle emits a coherent event chain.
+- Emit minimal `cycle.started` and `cycle.completed` summaries.
+
+### Phase 2: Data Gatherer Events
+
+No trading behavior change.
+
+- Instrument staged account refresh cohorts.
+- Wire candle remote fetch callback into `remote_call.*`.
+- Instrument fill refresh request stats and coverage decisions.
+- Instrument cache load/flush summaries.
+- Add call ids and call group ids.
+- Add tests for concurrent vs isolated remote-call reconstruction.
+
+### Phase 3: Rust Planning And Bounded Payload Diagnostics
+
+No trading behavior change.
+
+- Emit `rust_orchestrator.called` and `rust_orchestrator.returned`.
+- Retain hashes and bounded summaries; any targeted artifact must be a scrubbed
+  projection that omits account state and satisfies the diagnostic-artifact
+  policy.
+- Emit planning summaries and per-symbol unavailable reasons from the same
+  snapshot context.
+- Add payload redaction/hash tests and retention tests.
+
+### Phase 4: Order Lifecycle And Risk Transitions
+
+No trading behavior change.
+
+- Convert order wave summaries into structured events.
+- Instrument create/cancel sent/succeeded/failed/ambiguous/confirmed lifecycle.
+- Route HSL/WEL/TWEL/unstuck transitions through the bus.
+- Keep existing text output stable via the console sink.
+
+For order writes, acceptance requires events for:
+
+- create sent/succeeded/failed/rejected/ambiguous
+- cancel sent/succeeded/failed
+- cancel ambiguous terminal state
+- confirmation requested
+- confirmation satisfied or timed out
+
+### Phase 5: Migrate Meaningful Text Logs
+
+Mostly observability cleanup.
+
+- Move high-value ad-hoc `logging.*` call sites to structured events.
+- Bridge the remaining stdlib logs into the event stream at low fidelity where
+  useful.
+- Avoid chasing every low-value log site if it adds risk or churn.
+- Remove duplicate text once facade projections cover that component.
+
+### Phase 6: Gatekeeper Integration
+
+After the event bus exists.
+
+- Feed gatekeeper diagnostics into the same pipeline.
+- Treat gatekeeper output as one producer, not as a separate logging system.
+- Console shows only gatekeeper decisions that affect execution or explain
+  blocked/degraded behavior.
+- Structured events retain bounded, policy-permitted diagnostic context.
+
+## Validation Strategy
+
+- Unit tests for envelope defaults, routing, redaction, queue overflow, and sink
+  degradation.
+- Unit tests for payload digest/scrubbed-artifact behavior and context propagation across
+  `cycle_id`, `remote_call_group_id`, `plan_id`, and `order_wave_id`.
+- Fake-live integration tests for a full chain:
+  `cycle.started -> remote_call.* -> data_packet.updated -> snapshot.built ->
+  rust_orchestrator.* -> action.planned -> execution.* -> fill.ingested`.
+- Fake exchange tests for concurrent candle fetch batches: one batch id, one
+  request/response pair per call, and latency on every result.
+- Rust orchestrator tests: input captured, output captured, and exceptions
+  captured with input digest.
+- Gatekeeper tests: stale market snapshot defers normal creates, panic close can
+  use its reduced freshness contract, candidate-only stale EMA excludes the
+  candidate, and active-symbol EMA absence is visible at the Rust consumer scope
+  without globally deferring independent actions.
+- Executor tests: partial create response emits an ambiguous event, terminal
+  rejection emits a non-ambiguous rejected event, and confirmation requested is
+  emitted before confirmation refresh.
+- Snapshot tests for console formatting and suppression counters.
+- Rotation/retention tests using small byte limits.
+- A replay utility that loads one structured event directory and reconstructs a
+  planning cycle by ids.
+- After explicit approval in the current task, manual VPS smoke with DEBUG off
+  may verify that console remains tail-safe and CPU does not materially regress.
+- After the same explicit approval, operational verification may trace one live
+  order from Rust output to exchange result and confirm that rotated NDJSON
+  segments remain valid and monitor relay still serves snapshots/events.
+
+## Settled Design Decisions
+
+These decisions describe the established architecture and guide any remaining
+work unless later live evidence forces a revision.
+
+1. Implement the pipeline in a new live logging module or package, not inside
+   `passivbot.py`. The intended first home is `src/live/event_bus.py` or a small
+   `src/live/logging/` package if the sink/router split grows.
+2. Console output is a sink fed from the structured event stream. Aside from
+   early startup/bootstrap messages, default console text should not contain
+   material that is absent from the event stream.
+3. Console output is operator-facing and trading-focused. It should hide
+   internal technical detail by default and emphasize fills, position changes,
+   balance changes, order create/cancel results, HSL/WEL/TWEL/unstuck
+   transitions, staged entries blocked by high-level gates, trailing orders
+   waiting for threshold/retracement, and compact health summaries.
+4. EMA, candle, and forager internals belong in structured events. Console INFO
+   should summarize only user-relevant effects, such as entries deferred,
+   forager unavailable counts, stale market data, or degraded readiness. Per-span
+   EMA diagnostics are DEBUG/TRACE material.
+5. Raw Rust input/output payloads are not retained. Diagnostics use summaries
+   plus hashes. Explicit DEBUG/targeted diagnostic policy may retain only a
+   bounded scrubbed projection that omits account state and has short retention.
+6. Raw exchange/account payloads are never retained, including in DEBUG/TRACE.
+   Events keep hashes and bounded normalized summaries only.
+7. Reuse and evolve monitor storage as the canonical structured sink instead of
+   creating a parallel `events/` tree. Monitor snapshots remain projections of
+   the structured event stream.
+8. Use a dedicated writer thread with a bounded queue. Sink failure or overflow
+   emits `sink.degraded` and drop counters but must not change trading behavior.
+9. Conservative default disk budgets per bot on a small VPS:
+   - structured event stream: roughly 100-250 MB
+   - human text projection: roughly 25-50 MB
+   - permitted bounded scrubbed diagnostic artifacts: disabled by default; when
+     enabled, roughly 50-100 MB with short retention
+   These limits should be configurable.
+10. Migrate meaningful decision/action stdlib logs first: lifecycle, cycle
+    summary, Rust planning, reconciliation, order lifecycle, fills, positions,
+    balance, HSL/WEL/TWEL/unstuck, forager selection summaries, and
+    blocking/degraded states. Bridge remaining stdlib logs temporarily and avoid
+    churn on low-value maintenance chatter.
+11. Phase 1 should include only a minimal event validator/query helper that can
+    validate rotated NDJSON and reconstruct a single `cycle_id` chain. A richer
+    replay CLI should wait until remote-call and cache instrumentation exist.
+12. Gatekeeper diagnostics should be one producer in the same event pipeline, not
+    a separate logging system. Console shows gate decisions that affect
+    execution; structured events retain the full reason tree within volume
+    policy.
+13. Add a compact `live.logging` config surface eventually. Phase 1 may use
+    conservative defaults and environment overrides to avoid schema churn.
+    Durable knobs should include level, structured retention, console verbosity,
+    diagnostic-artifact policy, redaction mode, and queue size.
+14. Event emission is behavior-neutral. Logging failures may degrade
+    observability, but they must not block order execution, alter risk decisions,
+    or become a trading control plane.

@@ -1,0 +1,2459 @@
+"""
+Shared helpers for running backtest/optimizer suites.
+
+The suite runner prepares shared datasets, applies scenario overrides, and
+invokes the existing backtest pipeline for every scenario.  Both the CLI
+backtester and the optimizer import this module when operating in suite mode.
+"""
+
+from __future__ import annotations
+from simulation_data import simulation_data_scope
+
+import asyncio
+import json
+import hashlib
+import logging
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+from config.load import load_input_config, prepare_config
+from config.hsl import require_current_hsl_schema
+from config_utils import effective_config_payload
+from config.access import require_config_value, require_live_value
+from config.metrics import canonicalize_metric_name
+from config.overrides import parse_overrides
+from config.param_paths import require_existing_config_path
+from config.parse import load_raw_config
+from config.scenario_overrides import (
+    normalize_scenario_overrides as _normalize_scenario_overrides,
+)
+from config.shared_bot import canonicalize_shared_bot_side
+from config.reducers import canonicalize_reducer_mapping, reducer_mapping_from_aliases
+from config_transform import ConfigTransformTracker, record_transform
+from logging_setup import configure_logging
+from materialized_cache import release_materialized_payload
+from backtest_universe import normalize_backtest_coin
+from utils import (
+    MarketIdentifierExchangeMismatch,
+    UnknownMarketIdentifier,
+    coin_to_symbol,
+    format_approved_ignored_coins,
+    format_end_date,
+    load_markets,
+    reject_cross_exchange_market_identifier_collisions,
+    split_exchange_qualified_market_identifier,
+    to_standard_exchange_name,
+    ts_to_date,
+    utc_ms,
+    date_to_ts,
+)
+from warmup_utils import (
+    compute_backtest_warmup_minutes,
+    compute_per_coin_warmup_minutes,
+)
+from ohlcv_utils import align_and_aggregate_hlcvs
+from shared_arrays import SharedArraySpec
+from metrics_schema import (
+    attach_result_metrics,
+    flatten_metric_stats,
+    merge_suite_payload,
+)
+from config_utils import dump_config, sanitize_prepared_config_for_dump
+from session_artifacts import (
+    LAYOUT_VERSION,
+    SESSION_MANIFEST,
+    artifact_paths,
+    create_session_dir,
+    date_span,
+    effective_setup_config,
+    safe_component,
+    utc_datetime,
+    write_json,
+)
+from optimization.prepared_dataset_identity import materialized_dataset_identity
+from optimization.evaluation_implementation import evaluation_implementation_identity
+
+_SCENARIO_KEYS = frozenset(
+    {
+        "label",
+        "start_date",
+        "end_date",
+        "coins",
+        "ignored_coins",
+        "exchanges",
+        "coin_sources",
+        "overrides",
+    }
+)
+
+# --------------------------------------------------------------------------- #
+# Data containers
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SuiteScenario:
+    label: str
+    start_date: Optional[str]
+    end_date: Optional[str]
+    coins: Optional[List[str]]
+    ignored_coins: Optional[List[str]]
+    exchanges: Optional[List[str]] = None
+    coin_sources: Optional[Dict[str, str]] = None
+    overrides: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class ScenarioResult:
+    scenario: SuiteScenario
+    per_exchange: Dict[str, Dict[str, Any]]
+    metrics: Dict[str, Any]
+    elapsed_seconds: float
+    output_path: Optional[Path]
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+@dataclass
+class SuiteSummary:
+    suite_id: str
+    scenarios: List[ScenarioResult]
+    aggregate: Dict[str, Any]
+    output_dir: Path
+    suite_metrics: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class DatasetWindow:
+    start_date: str
+    end_date: str
+    scenario_labels: Tuple[str, ...]
+
+
+# --------------------------------------------------------------------------- #
+# Suite specification helpers
+# --------------------------------------------------------------------------- #
+
+
+def extract_suite_config(
+    base_config: Dict[str, Any], suite_override: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Extract suite configuration from the new flattened config structure.
+
+    New structure reads from:
+    - backtest.scenarios (list of scenario dicts)
+    - backtest.reducer (scenario reduction settings)
+    - backtest.exchanges (default exchanges for scenarios)
+    - backtest.volume_normalization (bool, default True)
+    - backtest.suite_enabled (bool, default False) - master switch for suite mode
+
+    Args:
+        base_config: Full config dict
+        suite_override: Optional override dict with scenarios/reducer keys
+
+    Returns:
+        Dict with 'scenarios', 'reducer', 'exchanges', 'volume_normalization', and 'enabled' keys
+    """
+    backtest = base_config.get("backtest", {})
+
+    # Build config from new flattened structure
+    reducer_cfg, reducer_present = reducer_mapping_from_aliases(
+        backtest,
+        path="config.backtest",
+    )
+    cfg = {
+        "scenarios": deepcopy(backtest.get("scenarios", [])),
+        "reducer": reducer_cfg if reducer_present else {"default": "mean"},
+        "exchanges": deepcopy(backtest.get("exchanges", [])),
+        "volume_normalization": backtest.get("volume_normalization", True),
+    }
+
+    # Apply overrides if provided
+    if suite_override:
+        suite_override = deepcopy(suite_override)
+        canonicalize_reducer_mapping(suite_override, path="suite override")
+        if "scenarios" in suite_override:
+            cfg["scenarios"] = deepcopy(suite_override["scenarios"])
+        if "reducer" in suite_override:
+            cfg["reducer"] = deepcopy(suite_override["reducer"])
+        if "exchanges" in suite_override:
+            cfg["exchanges"] = deepcopy(suite_override["exchanges"])
+        if "volume_normalization" in suite_override:
+            cfg["volume_normalization"] = suite_override["volume_normalization"]
+
+    # Determine if suite mode is enabled:
+    # - suite_enabled config param must be true (default: false)
+    # - AND scenarios must exist
+    suite_enabled_config = backtest.get("suite_enabled", False)
+    has_scenarios = bool(cfg.get("scenarios"))
+    cfg["enabled"] = suite_enabled_config and has_scenarios
+
+    return cfg
+
+
+def _suite_override_from_section(
+    section: Dict[str, Any], *, source_label: str
+) -> Dict[str, Any]:
+    if not isinstance(section, dict):
+        raise ValueError(f"Suite config {source_label} must be a mapping.")
+    if "suite" in section:
+        suite = section["suite"]
+        if not isinstance(suite, dict):
+            raise ValueError(
+                f"Suite config {source_label} field 'suite' must be a mapping."
+            )
+        suite_override = deepcopy(suite)
+        canonicalize_reducer_mapping(
+            suite_override,
+            path=f"suite config {source_label}.suite",
+        )
+        return suite_override
+    if "scenarios" not in section:
+        raise ValueError(f"Suite config {source_label} must define scenarios.")
+    scenarios = section["scenarios"]
+    if not isinstance(scenarios, list):
+        raise ValueError(
+            f"Suite config {source_label} field 'scenarios' must be a list."
+        )
+    suite_override: Dict[str, Any] = {
+        "scenarios": deepcopy(scenarios),
+    }
+    reducer_cfg, reducer_present = reducer_mapping_from_aliases(
+        section,
+        path=f"suite config {source_label}",
+    )
+    if reducer_present:
+        suite_override["reducer"] = reducer_cfg
+    for key in ("exchanges", "volume_normalization"):
+        if key in section:
+            suite_override[key] = deepcopy(section[key])
+    return suite_override
+
+
+def load_suite_override_config(
+    suite_config_path: str | Path, *, source_config=None, base_config_path=""
+) -> Dict[str, Any]:
+    """
+    Load a suite override file without normalizing it as a full bot config.
+
+    External suite files are intentionally partial: they may contain only
+    backtest.scenarios/backtest.reducer or a legacy backtest.suite wrapper.
+    Full config flavor detection is therefore the wrong boundary here. File
+    entry points pass their still-raw base as source_config so old HSL policies
+    are gated before schema hydration; parsing-only callers may omit it.
+    """
+
+    raw = load_raw_config(str(suite_config_path), log_errors=True)
+    if not isinstance(raw, dict):
+        raise ValueError(f"Suite config {suite_config_path} must be a mapping.")
+    source_label = str(suite_config_path)
+    backtest = raw.get("backtest")
+    if isinstance(backtest, dict) and ("scenarios" in backtest or "suite" in backtest):
+        override = _suite_override_from_section(backtest, source_label=source_label)
+    elif "scenarios" in raw or "suite" in raw:
+        override = _suite_override_from_section(raw, source_label=source_label)
+    else:
+        raise ValueError(
+            f"Suite config {suite_config_path} must define backtest.scenarios "
+            "or legacy backtest.suite."
+        )
+    if source_config is not None:
+        require_current_hsl_schema(
+            effective_config_payload(source_config),
+            base_config_path=base_config_path,
+            additional_inputs=(override,),
+        )
+    return override
+
+
+def _normalize_scenario_label(raw_label: Any, index: int) -> str:
+    label = str(raw_label).strip() if raw_label else ""
+    return label or f"scenario_{index:02d}"
+
+
+def filter_scenarios_by_label(
+    scenarios: List[Dict[str, Any]],
+    labels: List[str],
+) -> List[Dict[str, Any]]:
+    """Filter scenarios to only include those matching the given labels.
+
+    Args:
+        scenarios: List of scenario dicts (each with a 'label' key)
+        labels: List of labels to keep
+
+    Returns:
+        Filtered list of scenarios
+
+    Raises:
+        ValueError: If no scenarios match the given labels
+    """
+    if not labels:
+        return scenarios
+
+    label_set = {str(label).strip() for label in labels}
+    filtered = []
+    for index, scenario in enumerate(scenarios, 1):
+        normalized_label = _normalize_scenario_label(scenario.get("label"), index)
+        if normalized_label not in label_set:
+            continue
+        normalized_scenario = dict(scenario)
+        normalized_scenario["label"] = normalized_label
+        filtered.append(normalized_scenario)
+
+    if not filtered:
+        available = [
+            _normalize_scenario_label(scenario.get("label"), index)
+            for index, scenario in enumerate(scenarios, 1)
+        ]
+        raise ValueError(
+            f"No scenarios match the requested labels {labels}. "
+            f"Available labels: {available}"
+        )
+
+    return filtered
+
+
+def _flatten_coin_list(value: Any) -> List[str]:
+    if isinstance(value, dict):
+        coins = set(value.get("long", [])) | set(value.get("short", []))
+        return sorted(coins)
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def _normalized_coin_set(value: Any, exchanges: Sequence[str] = ()) -> set[str]:
+    out: set[str] = set()
+    if isinstance(value, str):
+        value = [value]
+    for entry in value or []:
+        coin = normalize_backtest_coin(entry)
+        if not coin:
+            continue
+        qualified_exchange, _ = split_exchange_qualified_market_identifier(coin)
+        resolved_symbols = set()
+        for exchange in exchanges:
+            try:
+                symbol = coin_to_symbol(coin, exchange, verbose=False)
+                resolved_symbols.add(
+                    f"{qualified_exchange}::{symbol}"
+                    if qualified_exchange is not None
+                    else symbol
+                )
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+        out.update(resolved_symbols or {coin})
+    return out
+
+
+def _reconcile_suite_identifiers_to_available(
+    identifiers: Sequence[str],
+    available_coins: set[str],
+    exchanges: Sequence[str],
+) -> list[str]:
+    """Match exact/alias scenario identifiers to prepared dataset coin keys."""
+    reconciled = []
+    for identifier in identifiers:
+        raw = str(identifier)
+        if raw in available_coins:
+            reconciled.append(raw)
+            continue
+        matches = set()
+        for exchange in exchanges:
+            try:
+                target_symbol = coin_to_symbol(raw, exchange, verbose=False)
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+            for available_coin in available_coins:
+                try:
+                    if (
+                        coin_to_symbol(available_coin, exchange, verbose=False)
+                        == target_symbol
+                    ):
+                        matches.add(available_coin)
+                except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                    continue
+        if len(matches) > 1:
+            raise ValueError(
+                f"suite identifier {raw!r} matches multiple prepared coins: "
+                f"{sorted(matches)}"
+            )
+        reconciled.append(next(iter(matches)) if matches else raw)
+    return list(dict.fromkeys(reconciled))
+
+
+def _reconcile_suite_coin_sources(
+    sources: Dict[str, str], coins: Sequence[str]
+) -> Dict[str, str]:
+    available_coins = set(coins)
+    reconciled = {}
+    for source_coin, exchange in sorted(sources.items()):
+        mapped = _reconcile_suite_identifiers_to_available(
+            [source_coin], available_coins, [exchange]
+        )[0]
+        target_coin = mapped if mapped in available_coins else source_coin
+        existing = reconciled.get(target_coin)
+        if existing is not None and existing != exchange:
+            raise ValueError(
+                f"suite coin_sources maps conflicting exchanges for {target_coin}: "
+                f"{existing} and {exchange}"
+            )
+        reconciled[target_coin] = exchange
+    return reconciled
+
+
+def _coalesce_master_coins(
+    coins: Sequence[str], sources: Dict[str, str], exchanges: Sequence[str]
+) -> list[str]:
+    """Use one dataset identity per resolved market, preferring forced-source keys."""
+    source_assignments = {}
+    for source_coin, exchange in sorted(sources.items()):
+        exchange = to_standard_exchange_name(str(exchange))
+        try:
+            source_symbol = coin_to_symbol(source_coin, exchange, verbose=False)
+        except UnknownMarketIdentifier:
+            continue
+        qualified_exchange, _ = split_exchange_qualified_market_identifier(source_coin)
+        if qualified_exchange is not None:
+            continue
+        existing = source_assignments.get(source_symbol)
+        if existing is not None and existing[1] != exchange:
+            raise ValueError(
+                "suite coin_sources maps equivalent identifiers "
+                f"{existing[0]!r} and {source_coin!r} to conflicting exchanges: "
+                f"{existing[1]} and {exchange}"
+            )
+        source_assignments[source_symbol] = (source_coin, exchange)
+
+    coalesced = set(str(coin) for coin in coins)
+    for source_coin, exchange in sorted(sources.items()):
+        try:
+            source_symbol = coin_to_symbol(source_coin, exchange, verbose=False)
+        except UnknownMarketIdentifier:
+            coalesced.add(source_coin)
+            continue
+        equivalent = set()
+        for coin in coalesced:
+            try:
+                if coin_to_symbol(coin, exchange, verbose=False) == source_symbol:
+                    equivalent.add(coin)
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+        coalesced.difference_update(equivalent)
+        coalesced.add(source_coin)
+
+    representatives = {}
+    for coin in sorted(coalesced):
+        resolved = []
+        for exchange in exchanges:
+            try:
+                resolved.append(
+                    (exchange, coin_to_symbol(coin, exchange, verbose=False))
+                )
+            except (MarketIdentifierExchangeMismatch, UnknownMarketIdentifier):
+                continue
+        identity = ("resolved", tuple(resolved)) if resolved else ("raw", coin)
+        representatives.setdefault(identity, coin)
+    return sorted(representatives.values())
+
+
+def validate_suite_side_coin_lists(
+    config: Dict[str, Any], exchanges: Sequence[str] = ()
+) -> None:
+    live = config.get("live", {}) if isinstance(config, dict) else {}
+    if not isinstance(live, dict):
+        return
+    for field in ("approved_coins", "ignored_coins"):
+        value = live.get(field)
+        if not isinstance(value, dict):
+            continue
+        long_coins = _normalized_coin_set(value.get("long", []), exchanges)
+        short_coins = _normalized_coin_set(value.get("short", []), exchanges)
+        if long_coins == short_coins:
+            continue
+        long_only = sorted(long_coins - short_coins)
+        short_only = sorted(short_coins - long_coins)
+        raise ValueError(
+            f"suite mode does not support asymmetric live.{field}; "
+            f"long_only={long_only} short_only={short_only}. "
+            f"Make live.{field}.long and live.{field}.short identical for suite runs."
+        )
+
+
+def _coerce_exchange_list(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    raise ValueError("scenario exchanges must be a string or list of strings")
+
+
+def _coerce_coin_source_dict(value: Any) -> Optional[Dict[str, str]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("scenario coin_sources must be a mapping of coin -> exchange")
+    normalized: Dict[str, str] = {}
+    raw_keys: Dict[str, str] = {}
+    for coin, exchange in value.items():
+        if exchange is None:
+            continue
+        coin_key = normalize_backtest_coin(coin)
+        if not coin_key:
+            continue
+        exchange_value = str(exchange)
+        existing = normalized.get(coin_key)
+        if existing is not None and existing != exchange_value:
+            raise ValueError(
+                "scenario coin_sources maps conflicting exchanges for "
+                f"{coin_key}: {raw_keys.get(coin_key, coin_key)}->{existing} and {coin}->{exchange_value}"
+            )
+        normalized[coin_key] = exchange_value
+        raw_keys.setdefault(coin_key, str(coin))
+    return normalized or None
+
+
+def _normalize_coin_list(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    coins_raw = _flatten_coin_list(value)
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for entry in coins_raw:
+        coin = normalize_backtest_coin(entry)
+        if not coin or coin in seen:
+            continue
+        seen.add(coin)
+        normalized.append(coin)
+    return normalized
+
+
+def resolve_coin_sources(
+    base_sources: Optional[Dict[str, str]],
+    overrides: Optional[Dict[str, str]],
+) -> Dict[str, str]:
+    resolved = dict(base_sources or {})
+    if overrides:
+        resolved.update(overrides)
+    return resolved
+
+
+def _collect_union(
+    values: Iterable[Optional[List[str]]], fallback: List[str]
+) -> List[str]:
+    union: set[str] = set(fallback)
+    for val in values:
+        if not val:
+            continue
+        union.update(val)
+    return sorted(union)
+
+
+def _collect_date_window(
+    base_start: str,
+    base_end: str,
+    scenarios: Sequence[SuiteScenario],
+) -> Tuple[str, str]:
+    start_dates = [base_start]
+    end_dates = [base_end]
+    for scenario in scenarios:
+        if scenario.start_date:
+            start_dates.append(scenario.start_date)
+        if scenario.end_date:
+            end_dates.append(scenario.end_date)
+    return min(start_dates), max(end_dates)
+
+
+def _scenario_date_window(
+    base_start: str,
+    base_end: str,
+    scenario: SuiteScenario,
+) -> Tuple[str, str]:
+    return scenario.start_date or base_start, scenario.end_date or base_end
+
+
+def _merge_scenario_windows(
+    base_start: str,
+    base_end: str,
+    scenarios: Sequence[SuiteScenario],
+) -> DatasetWindow:
+    if not scenarios:
+        return DatasetWindow(str(base_start), str(base_end), ("<base>",))
+    starts: List[str] = []
+    ends: List[str] = []
+    labels: List[str] = []
+    for scenario in scenarios:
+        start, end = _scenario_date_window(base_start, base_end, scenario)
+        starts.append(str(start))
+        ends.append(str(end))
+        labels.append(scenario.label)
+    return DatasetWindow(min(starts), max(ends), tuple(labels))
+
+
+def _derive_dataset_windows(
+    base_config: Dict[str, Any],
+    exchanges: Sequence[str],
+    scenarios: Optional[Sequence[SuiteScenario]],
+    *,
+    needed_individual_exchanges: Optional[set[str]] = None,
+) -> Dict[str, DatasetWindow]:
+    base_start = str(require_config_value(base_config, "backtest.start_date"))
+    base_end = str(require_config_value(base_config, "backtest.end_date"))
+    scenario_list = list(scenarios or [])
+    if not scenario_list:
+        base_window = DatasetWindow(base_start, base_end, ("<base>",))
+        windows = {"combined": base_window} if len(exchanges) > 1 else {}
+        for exchange in exchanges:
+            windows.setdefault(str(exchange), base_window)
+        return windows
+
+    exchange_set = {str(exchange) for exchange in exchanges}
+    use_combined = len(exchange_set) > 1
+    windows: Dict[str, DatasetWindow] = {}
+
+    if use_combined:
+        combined_scenarios: List[SuiteScenario] = []
+        individual_scenarios: Dict[str, List[SuiteScenario]] = {
+            str(exchange): [] for exchange in (needed_individual_exchanges or set())
+        }
+        for scenario in scenario_list:
+            scenario_exchanges = set(scenario.exchanges or exchanges)
+            if scenario_exchanges == exchange_set:
+                combined_scenarios.append(scenario)
+                continue
+            for exchange in scenario_exchanges:
+                exchange_name = str(exchange)
+                if exchange_name in individual_scenarios:
+                    individual_scenarios[exchange_name].append(scenario)
+        windows["combined"] = _merge_scenario_windows(
+            base_start,
+            base_end,
+            combined_scenarios or scenario_list,
+        )
+        for exchange, exchange_scenarios in individual_scenarios.items():
+            windows[exchange] = _merge_scenario_windows(
+                base_start,
+                base_end,
+                exchange_scenarios or scenario_list,
+            )
+    else:
+        for exchange in exchanges:
+            exchange_name = str(exchange)
+            exchange_scenarios = [
+                scenario
+                for scenario in scenario_list
+                if exchange_name in set(scenario.exchanges or exchanges)
+            ]
+            windows[exchange_name] = _merge_scenario_windows(
+                base_start,
+                base_end,
+                exchange_scenarios or scenario_list,
+            )
+    return windows
+
+
+def _config_for_dataset_window(
+    base_config: Dict[str, Any],
+    window: DatasetWindow,
+) -> Dict[str, Any]:
+    cfg = deepcopy(base_config)
+    cfg.setdefault("backtest", {})
+    cfg["backtest"]["start_date"] = window.start_date
+    cfg["backtest"]["end_date"] = window.end_date
+    return cfg
+
+
+def _config_for_dataset_coins(
+    base_config: Dict[str, Any],
+    scenarios: Sequence[SuiteScenario],
+) -> Dict[str, Any]:
+    """Restrict a preload to the coins its assigned scenarios can use."""
+
+    if not scenarios or any(scenario.coins is None for scenario in scenarios):
+        return base_config
+    required_coins = sorted(
+        {coin for scenario in scenarios for coin in (scenario.coins or [])}
+    )
+    if not required_coins:
+        return base_config
+    cfg = deepcopy(base_config)
+    approved_coins = cfg.setdefault("live", {}).get("approved_coins")
+    if isinstance(approved_coins, dict):
+        cfg["live"]["approved_coins"]["long"] = list(required_coins)
+        cfg["live"]["approved_coins"]["short"] = list(required_coins)
+    else:
+        cfg["live"]["approved_coins"] = list(required_coins)
+    return cfg
+
+
+def _log_dataset_window(dataset_label: str, window: DatasetWindow) -> None:
+    logging.info(
+        "[suite] dataset window %s start=%s end=%s scenarios=%s",
+        dataset_label,
+        window.start_date,
+        window.end_date,
+        ",".join(window.scenario_labels),
+    )
+
+
+def build_scenarios(
+    suite_cfg: Dict[str, Any],
+    base_exchanges: Optional[List[str]] = None,
+) -> Tuple[List[SuiteScenario], Dict[str, Any]]:
+    """Build list of SuiteScenario objects from suite config.
+
+    In the new flattened structure:
+    - Scenarios without explicit 'exchanges' inherit from suite_cfg['exchanges'] or base_exchanges
+    - Single exchange in scenario = use that exchange's data
+    - Multiple exchanges in scenario = best-per-coin combination
+
+    Args:
+        suite_cfg: Suite configuration dict with 'scenarios' and 'reducer'
+        base_exchanges: Default exchanges to inherit when scenario doesn't specify
+
+    Returns:
+        Tuple of (scenarios list, reducer config dict)
+    """
+    scenarios_cfg = suite_cfg.get("scenarios") or []
+    if not scenarios_cfg:
+        raise ValueError(
+            "config.backtest.scenarios must contain at least one scenario."
+        )
+
+    default_exchanges = suite_cfg.get("exchanges") or base_exchanges or []
+
+    scenarios: List[SuiteScenario] = []
+    for idx, raw in enumerate(scenarios_cfg, 1):
+        scenario_path = f"config.backtest.scenarios[{idx - 1}]"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{scenario_path} must be a mapping.")
+        unknown_keys = sorted(set(raw) - _SCENARIO_KEYS)
+        if unknown_keys:
+            allowed = ", ".join(sorted(_SCENARIO_KEYS))
+            raise ValueError(
+                f"{scenario_path} contains unknown key(s): {', '.join(unknown_keys)}. "
+                f"Allowed keys: {allowed}."
+            )
+        exchanges_value = raw.get("exchanges")
+        coin_sources_value = raw.get("coin_sources")
+
+        # Resolve exchanges: scenario-specific or inherit from defaults
+        if exchanges_value:
+            exchanges_list = _coerce_exchange_list(exchanges_value)
+        elif default_exchanges:
+            exchanges_list = list(default_exchanges)
+        else:
+            exchanges_list = None
+
+        coin_source_map = (
+            _coerce_coin_source_dict(coin_sources_value) if coin_sources_value else None
+        )
+        overrides = raw.get("overrides")
+        if overrides is not None and not isinstance(overrides, dict):
+            raise ValueError(
+                f"Scenario overrides for '{raw.get('label')}' must be a mapping"
+            )
+        overrides = _normalize_scenario_overrides(overrides)
+        scenario_coins = (
+            _normalize_coin_list(raw.get("coins"))
+            if raw.get("coins") is not None
+            else None
+        )
+        scenario_ignored = (
+            _normalize_coin_list(raw.get("ignored_coins"))
+            if raw.get("ignored_coins") is not None
+            else None
+        )
+        scenarios.append(
+            SuiteScenario(
+                label=_normalize_scenario_label(raw.get("label"), idx),
+                start_date=raw.get("start_date"),
+                end_date=raw.get("end_date"),
+                coins=scenario_coins,
+                ignored_coins=scenario_ignored,
+                exchanges=exchanges_list,
+                coin_sources=coin_source_map,
+                overrides=overrides or None,
+            )
+        )
+
+    label_counts: Dict[str, int] = {}
+    for scenario in scenarios:
+        label_counts[scenario.label] = label_counts.get(scenario.label, 0) + 1
+    duplicate_labels = sorted(
+        label for label, count in label_counts.items() if count > 1
+    )
+    if duplicate_labels:
+        raise ValueError(
+            "config.backtest.scenarios labels must be unique; duplicate label(s): "
+            + ", ".join(duplicate_labels)
+        )
+
+    reducer_cfg = deepcopy(suite_cfg.get("reducer", {"default": "mean"}))
+    components = [safe_component(scenario.label).casefold() for scenario in scenarios]
+    if len(components) != len(set(components)):
+        raise ValueError("Scenario labels collide as filesystem directory names")
+    return scenarios, reducer_cfg
+
+
+def collect_suite_coin_sources(
+    config: Dict[str, Any],
+    scenarios: Sequence[SuiteScenario],
+) -> Dict[str, str]:
+    """
+    Merge baseline coin_sources with any scenario overrides.
+
+    The merged mapping is shared across the suite so all scenarios consume a
+    consistent view of the underlying exchange assignment.  Conflicting
+    requests raise immediately to avoid silently running scenarios with
+    mismatched data.
+    """
+
+    base_sources = deepcopy(config.get("backtest", {}).get("coin_sources") or {})
+    merged: Dict[str, str] = {
+        str(coin): str(exchange)
+        for coin, exchange in base_sources.items()
+        if exchange is not None
+    }
+    for scenario in scenarios:
+        if not scenario.coin_sources:
+            continue
+        for coin, exchange in scenario.coin_sources.items():
+            if exchange is None:
+                continue
+            coin_key = str(coin)
+            exchange_value = str(exchange)
+            existing = merged.get(coin_key)
+            if existing and existing != exchange_value:
+                raise ValueError(
+                    f"Scenario '{scenario.label}' forces {coin_key} to exchange "
+                    f"{exchange_value}, but another scenario already forces {coin_key} "
+                    f"to {existing}. Please align coin_sources across the suite."
+                )
+            merged[coin_key] = exchange_value
+    return merged
+
+
+def filter_coins_by_exchange_assignment(
+    coins: Sequence[str],
+    allowed_exchanges: Optional[Sequence[str]],
+    coin_exchange_map: Dict[str, str],
+    *,
+    default_exchange: str,
+) -> Tuple[List[str], List[str]]:
+    """
+    Split the provided coins into those whose assigned exchange is allowed and
+    those that should be skipped.
+    """
+
+    allowed_set = {str(ex) for ex in allowed_exchanges} if allowed_exchanges else None
+    selected: List[str] = []
+    skipped: List[str] = []
+    for coin in coins:
+        assigned_exchange = coin_exchange_map.get(coin, default_exchange)
+        if allowed_set and assigned_exchange not in allowed_set:
+            skipped.append(coin)
+            continue
+        selected.append(coin)
+    return selected, skipped
+
+
+# --------------------------------------------------------------------------- #
+# Dataset preparation
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ExchangeDataset:
+    exchange: str
+    coins: List[str]
+    coin_index: Dict[str, int]
+    coin_exchange: Dict[str, str]
+    available_exchanges: List[str]
+    hlcvs: np.ndarray
+    mss: Dict[str, Any]
+    btc_usd_prices: np.ndarray
+    timestamps: Optional[np.ndarray]
+    cache_dir: str
+    hlcvs_spec: Optional[SharedArraySpec] = None
+    btc_spec: Optional[SharedArraySpec] = None
+
+
+def _determine_needed_individual_exchanges(
+    scenarios: List["SuiteScenario"],
+    base_exchanges: List[str],
+) -> Set[str]:
+    """
+    Analyze scenarios to determine which individual exchange datasets are needed.
+
+    Returns a set of exchange names that need individual datasets (for scenarios
+    that restrict to a subset of exchanges). Empty set means only combined is needed.
+    """
+    base_set = set(base_exchanges)
+    needed: Set[str] = set()
+
+    for scenario in scenarios:
+        if scenario.exchanges:
+            scenario_set = set(scenario.exchanges)
+            # If scenario uses a strict subset, we need individual datasets for those exchanges
+            if scenario_set and scenario_set != base_set:
+                needed.update(scenario_set)
+
+    return needed
+
+
+def _apply_candle_aggregation(
+    hlcvs,
+    timestamps,
+    btc_usd_prices,
+    mss,
+    interval,
+    *,
+    preserve_internal_nan_gaps: bool = False,
+):
+    """Aggregate candles and update mss metadata. Returns (hlcvs, timestamps, btc_usd_prices)."""
+    n_before = hlcvs.shape[0]
+    hlcvs, timestamps, btc_usd_prices, offset_bars = align_and_aggregate_hlcvs(
+        hlcvs,
+        timestamps,
+        btc_usd_prices,
+        int(interval),
+        preserve_internal_nan_gaps=preserve_internal_nan_gaps,
+    )
+    logging.debug(
+        "[suite] aggregated %dm candles: %d bars -> %d bars (trimmed %d for alignment)",
+        interval,
+        n_before,
+        hlcvs.shape[0],
+        offset_bars,
+    )
+    meta = mss.setdefault("__meta__", {})
+    meta["data_interval_minutes"] = int(interval)
+    meta["candle_interval_offset_bars"] = int(offset_bars)
+    return hlcvs, timestamps, btc_usd_prices
+
+
+async def prepare_master_datasets(
+    base_config: Dict[str, Any],
+    exchanges: List[str],
+    shared_array_manager=None,
+    *,
+    needed_individual_exchanges: Optional[Set[str]] = None,
+    candle_interval_minutes: int = 1,
+    scenarios: Optional[Sequence[SuiteScenario]] = None,
+    allow_internal_nan_gaps: bool = False,
+) -> Dict[str, ExchangeDataset]:
+    from backtest import prepare_hlcvs_mss
+
+    datasets: Dict[str, ExchangeDataset] = {}
+
+    async def _prepare_dataset(config, exchange):
+        kwargs = {"allow_internal_nan_gaps": True} if allow_internal_nan_gaps else {}
+        return await prepare_hlcvs_mss(config, exchange, **kwargs)
+
+    dataset_windows = _derive_dataset_windows(
+        base_config,
+        exchanges,
+        scenarios,
+        needed_individual_exchanges=needed_individual_exchanges,
+    )
+
+    def _build_dataset(
+        exchange_label: str,
+        exchange_name: str,
+        coins: List[str],
+        hlcvs: np.ndarray,
+        mss: Dict[str, Any],
+        cache_dir: str,
+        btc_usd_prices: np.ndarray,
+        timestamps: Optional[np.ndarray],
+        source_exchanges: Optional[Iterable[str]] = None,
+    ) -> ExchangeDataset:
+        coin_index = {coin: idx for idx, coin in enumerate(coins)}
+        coin_exchange = {
+            coin: str(mss.get(coin, {}).get("exchange", exchange_name))
+            for coin in coins
+        }
+        available_exchanges = sorted(
+            {str(exchange) for exchange in source_exchanges}
+            if source_exchanges is not None
+            else set(coin_exchange.values())
+        ) or [exchange_name]
+        timestamps_array = (
+            None
+            if timestamps is None
+            else np.array(timestamps, dtype=np.int64, copy=True, order="C")
+        )
+        hlcvs_spec = None
+        btc_spec = None
+        if shared_array_manager is None:
+            hlcvs_array = np.array(hlcvs, dtype=np.float64, copy=True, order="C")
+            btc_array = np.array(btc_usd_prices, dtype=np.float64, copy=True, order="C")
+        else:
+            # The materialized arrays are already float64 and contiguous in the normal
+            # suite path. Copy them directly into SharedMemory instead of first making
+            # another full-size process-local array.
+            hlcvs_spec, hlcvs_array = shared_array_manager.create_from(
+                np.ascontiguousarray(hlcvs, dtype=np.float64)
+            )
+            btc_spec, btc_array = shared_array_manager.create_from(
+                np.ascontiguousarray(btc_usd_prices, dtype=np.float64)
+            )
+        release_materialized_payload(hlcvs)
+        return ExchangeDataset(
+            exchange=exchange_label,
+            coins=coins,
+            coin_index=coin_index,
+            coin_exchange=coin_exchange,
+            available_exchanges=available_exchanges,
+            hlcvs=hlcvs_array,
+            mss=mss,
+            btc_usd_prices=btc_array,
+            timestamps=timestamps_array,
+            cache_dir=str(cache_dir),
+            hlcvs_spec=hlcvs_spec,
+            btc_spec=btc_spec,
+        )
+
+    # Data strategy:
+    # - Single exchange = use that exchange's data only
+    # - Multiple exchanges = prepare combined (best-per-coin) dataset
+    # - If any scenario restricts to a subset of exchanges, also prepare
+    #   individual datasets for those exchanges (determined by caller)
+    use_combined = len(exchanges) > 1
+
+    if use_combined:
+        exchange_set = {str(exchange) for exchange in exchanges}
+        combined_scenarios = [
+            scenario
+            for scenario in (scenarios or [])
+            if set(scenario.exchanges or exchanges) == exchange_set
+        ]
+        individual_scenarios = {
+            str(exchange): [
+                scenario
+                for scenario in (scenarios or [])
+                if set(scenario.exchanges or exchanges) != exchange_set
+                and str(exchange) in set(scenario.exchanges or exchanges)
+            ]
+            for exchange in (needed_individual_exchanges or set())
+        }
+        # Prepare combined (best-per-coin) dataset
+        combined_window = dataset_windows["combined"]
+        _log_dataset_window("combined", combined_window)
+        combined_config = _config_for_dataset_window(base_config, combined_window)
+        combined_config = _config_for_dataset_coins(
+            combined_config,
+            combined_scenarios or list(scenarios or []),
+        )
+        (
+            coins,
+            hlcvs,
+            mss,
+            _store_path,
+            cache_dir,
+            btc_usd_prices,
+            timestamps,
+        ) = await _prepare_dataset(combined_config, "combined")
+        prepared_hlcvs = hlcvs
+        if candle_interval_minutes > 1:
+            hlcvs, timestamps, btc_usd_prices = _apply_candle_aggregation(
+                hlcvs,
+                timestamps,
+                btc_usd_prices,
+                mss,
+                candle_interval_minutes,
+                preserve_internal_nan_gaps=allow_internal_nan_gaps,
+            )
+            release_materialized_payload(prepared_hlcvs)
+        datasets["combined"] = _build_dataset(
+            "combined",
+            "combined",
+            coins,
+            hlcvs,
+            mss,
+            cache_dir,
+            btc_usd_prices,
+            timestamps,
+            source_exchanges=require_config_value(
+                combined_config, "backtest.exchanges"
+            ),
+        )
+        # Free original arrays after copying to SharedMemory (can save ~5GB+ RAM)
+        del hlcvs, btc_usd_prices
+
+        # Only prepare individual exchange datasets if scenarios need them
+        if needed_individual_exchanges:
+            for exchange in exchanges:
+                if exchange not in needed_individual_exchanges:
+                    continue
+                logging.info(
+                    "Preparing individual %s dataset for single-exchange scenarios",
+                    exchange,
+                )
+                exchange_window = dataset_windows.get(exchange)
+                if exchange_window is None:
+                    exchange_window = DatasetWindow(
+                        str(require_config_value(base_config, "backtest.start_date")),
+                        str(require_config_value(base_config, "backtest.end_date")),
+                        ("<base>",),
+                    )
+                _log_dataset_window(exchange, exchange_window)
+                exchange_config = _config_for_dataset_window(
+                    base_config, exchange_window
+                )
+                exchange_config = _config_for_dataset_coins(
+                    exchange_config,
+                    individual_scenarios.get(str(exchange), []),
+                )
+                (
+                    ex_coins,
+                    ex_hlcvs,
+                    ex_mss,
+                    _ex_store_path,
+                    ex_cache_dir,
+                    ex_btc_usd_prices,
+                    ex_timestamps,
+                ) = await _prepare_dataset(exchange_config, exchange)
+                prepared_ex_hlcvs = ex_hlcvs
+                if candle_interval_minutes > 1:
+                    ex_hlcvs, ex_timestamps, ex_btc_usd_prices = (
+                        _apply_candle_aggregation(
+                            ex_hlcvs,
+                            ex_timestamps,
+                            ex_btc_usd_prices,
+                            ex_mss,
+                            candle_interval_minutes,
+                            preserve_internal_nan_gaps=allow_internal_nan_gaps,
+                        )
+                    )
+                    release_materialized_payload(prepared_ex_hlcvs)
+                datasets[exchange] = _build_dataset(
+                    exchange,
+                    exchange,
+                    ex_coins,
+                    ex_hlcvs,
+                    ex_mss,
+                    ex_cache_dir,
+                    ex_btc_usd_prices,
+                    ex_timestamps,
+                )
+                # Free original arrays after copying to SharedMemory
+                del ex_hlcvs, ex_btc_usd_prices
+    else:
+        for exchange in exchanges:
+            exchange_scenarios = [
+                scenario
+                for scenario in (scenarios or [])
+                if str(exchange) in set(scenario.exchanges or exchanges)
+            ]
+            exchange_window = dataset_windows.get(exchange)
+            if exchange_window is None:
+                exchange_window = DatasetWindow(
+                    str(require_config_value(base_config, "backtest.start_date")),
+                    str(require_config_value(base_config, "backtest.end_date")),
+                    ("<base>",),
+                )
+            _log_dataset_window(exchange, exchange_window)
+            exchange_config = _config_for_dataset_window(base_config, exchange_window)
+            exchange_config = _config_for_dataset_coins(
+                exchange_config,
+                exchange_scenarios,
+            )
+            (
+                coins,
+                hlcvs,
+                mss,
+                _store_path,
+                cache_dir,
+                btc_usd_prices,
+                timestamps,
+            ) = await _prepare_dataset(exchange_config, exchange)
+            prepared_hlcvs = hlcvs
+            if candle_interval_minutes > 1:
+                hlcvs, timestamps, btc_usd_prices = _apply_candle_aggregation(
+                    hlcvs,
+                    timestamps,
+                    btc_usd_prices,
+                    mss,
+                    candle_interval_minutes,
+                    preserve_internal_nan_gaps=allow_internal_nan_gaps,
+                )
+                release_materialized_payload(prepared_hlcvs)
+            datasets[exchange] = _build_dataset(
+                exchange,
+                exchange,
+                coins,
+                hlcvs,
+                mss,
+                cache_dir,
+                btc_usd_prices,
+                timestamps,
+            )
+            # Free original arrays after copying to SharedMemory
+            del hlcvs, btc_usd_prices
+    return datasets
+
+
+# --------------------------------------------------------------------------- #
+# Scenario execution
+# --------------------------------------------------------------------------- #
+
+
+def apply_scenario_overrides(config, overrides, tracker=None):
+    """Apply and validate normalized scenario policy without market-data selection.
+
+    Mutates config, matching apply_scenario's existing configuration stage.
+    """
+    if tracker is None:
+        tracker = ConfigTransformTracker()
+    if overrides:
+        from config.hsl import validate_override_paths
+
+        validate_override_paths(config, overrides)
+        for dotted_path, value in overrides.items():
+            if not isinstance(dotted_path, str):
+                raise ValueError("Scenario override keys must be dotted strings")
+            _apply_override(config, dotted_path, deepcopy(value), tracker)
+
+    from config.hsl import normalize_hsl
+    from config.schema import get_template_config
+
+    normalize_hsl(config, get_template_config(), verbose=False)
+
+
+def apply_scenario(
+    base_config: Dict[str, Any],
+    scenario: SuiteScenario,
+    master_coins: List[str],
+    master_ignored: List[str],
+    available_exchanges: Iterable[str],
+    available_coins: set[str],
+    base_coin_sources: Optional[Dict[str, str]] = None,
+    *,
+    base_coins: Optional[List[str]] = None,
+    base_ignored: Optional[List[str]] = None,
+    quiet: bool = False,
+) -> Tuple[Dict[str, Any], List[str]]:
+    cfg = deepcopy(base_config)
+    tracker = ConfigTransformTracker()
+    bot_section = cfg.setdefault("bot", {})
+    if not isinstance(bot_section, dict):
+        raise TypeError(f"config.bot must be a dict; got {type(bot_section).__name__}")
+    for pside in ("long", "short"):
+        canonicalize_shared_bot_side(
+            bot_section.get(pside),
+            path_prefix=("bot", pside),
+            tracker=tracker,
+            seed_missing_groups=False,
+        )
+    backtest_section = cfg.setdefault("backtest", {})
+    live_section = cfg.setdefault("live", {})
+    validate_suite_side_coin_lists(cfg, backtest_section.get("exchanges", []))
+
+    new_start = scenario.start_date or backtest_section.get("start_date")
+    if new_start != backtest_section.get("start_date"):
+        tracker.update(
+            ["backtest", "start_date"], backtest_section.get("start_date"), new_start
+        )
+        backtest_section["start_date"] = new_start
+
+    new_end = scenario.end_date or backtest_section.get("end_date")
+    if new_end != backtest_section.get("end_date"):
+        tracker.update(
+            ["backtest", "end_date"], backtest_section.get("end_date"), new_end
+        )
+        backtest_section["end_date"] = new_end
+
+    default_coins = base_coins if base_coins is not None else master_coins
+    default_ignored = base_ignored if base_ignored is not None else master_ignored
+    scenario_coins = (
+        list(scenario.coins) if scenario.coins is not None else list(default_coins)
+    )
+    scenario_ignored = (
+        list(scenario.ignored_coins)
+        if scenario.ignored_coins is not None
+        else list(default_ignored)
+    )
+    available_exchange_list = list(available_exchanges)
+    scenario_exchanges = (
+        list(scenario.exchanges) if scenario.exchanges else available_exchange_list
+    )
+    scenario_coins = _reconcile_suite_identifiers_to_available(
+        scenario_coins, available_coins, scenario_exchanges
+    )
+    scenario_ignored = _reconcile_suite_identifiers_to_available(
+        scenario_ignored, available_coins, scenario_exchanges
+    )
+
+    filtered_coins = [coin for coin in scenario_coins if coin in available_coins]
+    missing = sorted(set(scenario_coins) - set(filtered_coins))
+    if missing and not quiet:
+        logging.warning(
+            "Scenario %s: skipping %d coin(s) missing in dataset: %s",
+            scenario.label,
+            len(missing),
+            ",".join(missing),
+        )
+    if not filtered_coins:
+        raise ValueError(f"Scenario {scenario.label} has no usable coins.")
+    filtered_coins = sorted(dict.fromkeys(filtered_coins))
+
+    filtered_ignored = [coin for coin in scenario_ignored if coin in available_coins]
+    filtered_ignored = sorted(dict.fromkeys(filtered_ignored))
+
+    if scenario_exchanges != backtest_section.get("exchanges"):
+        tracker.update(
+            ["backtest", "exchanges"],
+            backtest_section.get("exchanges"),
+            scenario_exchanges,
+        )
+        backtest_section["exchanges"] = scenario_exchanges
+    backtest_section.setdefault("coins", {})
+    backtest_section.setdefault("cache_dir", {})
+    live_section.setdefault("approved_coins", {})
+    live_section.setdefault("ignored_coins", {})
+
+    for exchange in scenario_exchanges:
+        current = backtest_section["coins"].get(exchange)
+        if current != filtered_coins:
+            tracker.update(
+                ["backtest", "coins", exchange],
+                deepcopy(current),
+                list(filtered_coins),
+            )
+        backtest_section["coins"][exchange] = list(filtered_coins)
+
+    if isinstance(live_section["approved_coins"], dict):
+        for side in ("long", "short"):
+            current = live_section["approved_coins"].get(side, [])
+            if current != filtered_coins:
+                tracker.update(
+                    ["live", "approved_coins", side],
+                    deepcopy(current),
+                    list(filtered_coins),
+                )
+            live_section["approved_coins"][side] = list(filtered_coins)
+    else:
+        current = live_section.get("approved_coins")
+        if current != filtered_coins:
+            tracker.update(
+                ["live", "approved_coins"], deepcopy(current), list(filtered_coins)
+            )
+        live_section["approved_coins"] = list(filtered_coins)
+
+    if isinstance(live_section["ignored_coins"], dict):
+        for side in ("long", "short"):
+            current = live_section["ignored_coins"].get(side, [])
+            if current != filtered_ignored:
+                tracker.update(
+                    ["live", "ignored_coins", side],
+                    deepcopy(current),
+                    list(filtered_ignored),
+                )
+            live_section["ignored_coins"][side] = list(filtered_ignored)
+    else:
+        current = live_section.get("ignored_coins")
+        if current != filtered_ignored:
+            tracker.update(
+                ["live", "ignored_coins"], deepcopy(current), list(filtered_ignored)
+            )
+        live_section["ignored_coins"] = list(filtered_ignored)
+
+    resolved_sources = resolve_coin_sources(
+        base_coin_sources or {},
+        scenario.coin_sources,
+    )
+    resolved_sources = _reconcile_suite_coin_sources(resolved_sources, filtered_coins)
+    if resolved_sources != backtest_section.get("coin_sources"):
+        tracker.update(
+            ["backtest", "coin_sources"],
+            deepcopy(backtest_section.get("coin_sources")),
+            deepcopy(resolved_sources),
+        )
+        backtest_section["coin_sources"] = resolved_sources
+
+    apply_scenario_overrides(cfg, scenario.overrides, tracker)
+
+    if tracker.summary() and not quiet:
+        details = tracker.merge_details({"scenario": scenario.label})
+        record_transform(cfg, "apply_scenario", details)
+
+    return cfg, filtered_coins
+
+
+def _normalize_coins_by_exchange(coin_exchange: Dict[str, str]) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[str]] = {}
+    for coin, exchange in coin_exchange.items():
+        grouped.setdefault(str(exchange), []).append(str(coin))
+    return {ex: sorted(coins) for ex, coins in sorted(grouped.items())}
+
+
+def _compute_effective_coin_exchange(
+    scenario: SuiteScenario,
+    scenario_coins: List[str],
+    datasets: Dict[str, "ExchangeDataset"],
+    available_exchanges: List[str],
+) -> Dict[str, str]:
+    """Return effective coin->exchange assignment for a scenario."""
+    has_combined = "combined" in datasets
+    raw_scenario_exchanges = set(scenario.exchanges) if scenario.exchanges else None
+    actual_exchanges_set = {ex for ex in available_exchanges if ex != "combined"}
+
+    if raw_scenario_exchanges:
+        scenario_exchanges = raw_scenario_exchanges & actual_exchanges_set
+        if not scenario_exchanges:
+            scenario_exchanges = actual_exchanges_set
+    else:
+        scenario_exchanges = actual_exchanges_set
+
+    use_combined = has_combined and scenario_exchanges == actual_exchanges_set
+    coin_exchange: Dict[str, str] = {}
+
+    if use_combined:
+        dataset = datasets["combined"]
+        allowed_exchanges = (
+            list(scenario.exchanges)
+            if scenario.exchanges
+            else list(dataset.available_exchanges)
+        )
+        selected_coins, _ = filter_coins_by_exchange_assignment(
+            scenario_coins,
+            allowed_exchanges,
+            dataset.coin_exchange,
+            default_exchange=dataset.exchange,
+        )
+        for coin in selected_coins:
+            coin_exchange[coin] = dataset.coin_exchange.get(coin, dataset.exchange)
+    else:
+        for key, dataset in datasets.items():
+            if key == "combined":
+                continue
+            if (
+                dataset.exchange not in scenario_exchanges
+                and key not in scenario_exchanges
+            ):
+                continue
+            coins_for_exchange = [
+                coin for coin in scenario_coins if coin in dataset.coin_index
+            ]
+            for coin in coins_for_exchange:
+                coin_exchange[coin] = dataset.coin_exchange.get(coin, dataset.exchange)
+    return coin_exchange
+
+
+def _build_scenario_signature(
+    scenario_config: Dict[str, Any],
+    coin_exchange: Dict[str, str],
+) -> str:
+    """Build a stable signature for scenario deduplication."""
+    payload = deepcopy(scenario_config)
+    # Ignore transform metadata; it differs per scenario but doesn't affect results.
+    payload.pop("_transform_log", None)
+    backtest_section = payload.setdefault("backtest", {})
+    coins_by_ex = _normalize_coins_by_exchange(coin_exchange)
+    backtest_section["coins"] = coins_by_ex
+    backtest_section["exchanges"] = sorted(coins_by_ex.keys())
+    # cache_dir paths are environment-specific and don't affect results
+    backtest_section["cache_dir"] = {}
+    serialized = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _apply_override(
+    config: Dict[str, Any],
+    dotted_path: str,
+    value: Any,
+    tracker: ConfigTransformTracker,
+) -> None:
+    resolved = require_existing_config_path(config, dotted_path)
+    parts = list(resolved)
+    target = config
+    for part in parts[:-1]:
+        target = target[part]
+    final_key = parts[-1]
+    previous = target.get(final_key)
+    if previous != value:
+        tracker.update(parts, deepcopy(previous), deepcopy(value))
+    target[final_key] = value
+
+
+async def run_backtest_scenario(
+    scenario: SuiteScenario,
+    base_config: Dict[str, Any],
+    datasets: Dict[str, ExchangeDataset],
+    master_coins: List[str],
+    master_ignored: List[str],
+    available_exchanges: List[str],
+    available_coins: set[str],
+    results_root: Optional[Path],
+    disable_plotting: bool,
+    base_coin_sources: Optional[Dict[str, str]] = None,
+    base_coins: Optional[List[str]] = None,
+    base_ignored: Optional[List[str]] = None,
+) -> ScenarioResult:
+    from backtest import (
+        BacktestPlotContext,
+        build_backtest_payload,
+        execute_backtest,
+        post_process,
+    )
+
+    scenario_config, scenario_coins = apply_scenario(
+        base_config,
+        scenario,
+        master_coins=master_coins,
+        master_ignored=master_ignored,
+        available_exchanges=available_exchanges,
+        available_coins=available_coins,
+        base_coin_sources=base_coin_sources,
+        base_coins=base_coins,
+        base_ignored=base_ignored,
+    )
+    scenario_config["disable_plotting"] = disable_plotting
+
+    per_exchange: Dict[str, Dict[str, Any]] = {}
+    start_ts = utc_ms()
+    scenario_dir = None
+    if results_root is not None:
+        scenario_dir = results_root / safe_component(scenario.label)
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine which dataset(s) to use based on scenario's exchange restriction
+    has_combined = "combined" in datasets
+    raw_scenario_exchanges = set(scenario.exchanges) if scenario.exchanges else None
+    # Compute actual exchanges (excluding "combined" which is a synthetic dataset label)
+    actual_exchanges_set = {ex for ex in available_exchanges if ex != "combined"}
+
+    # Filter scenario exchanges to only those actually available in the dataset
+    if raw_scenario_exchanges:
+        unavailable = raw_scenario_exchanges - actual_exchanges_set
+        if unavailable:
+            logging.debug(
+                "Scenario %s: exchanges %s not available in dataset, using %s",
+                scenario.label,
+                sorted(unavailable),
+                sorted(raw_scenario_exchanges & actual_exchanges_set)
+                or "all available",
+            )
+        scenario_exchanges = raw_scenario_exchanges & actual_exchanges_set
+        if not scenario_exchanges:
+            # If no overlap, fall back to all available exchanges
+            scenario_exchanges = actual_exchanges_set
+    else:
+        scenario_exchanges = actual_exchanges_set
+
+    # Use combined dataset when:
+    # 1. It exists, AND
+    # 2. Scenario uses all actual exchanges (not a strict subset)
+    use_combined = has_combined and scenario_exchanges == actual_exchanges_set
+
+    if use_combined:
+        dataset = datasets["combined"]
+        per_exchange = _run_combined_dataset(
+            dataset,
+            scenario,
+            scenario_config,
+            scenario_coins,
+            scenario_dir,
+            build_backtest_payload,
+            execute_backtest,
+            post_process,
+            BacktestPlotContext.from_payload,
+        )
+    else:
+        # Use per-exchange datasets for scenarios with exchange restrictions
+        # Filter datasets to only include those requested by the scenario
+        filtered_datasets = {
+            k: v
+            for k, v in datasets.items()
+            if k != "combined" and k in scenario_exchanges
+        }
+        if not filtered_datasets:
+            raise ValueError(
+                f"Scenario {scenario.label} requests exchanges {scenario_exchanges} "
+                f"but no matching datasets are available (have: {list(datasets.keys())})"
+            )
+        per_exchange = _run_multi_dataset(
+            filtered_datasets,
+            scenario,
+            scenario_config,
+            scenario_coins,
+            scenario_dir,
+            build_backtest_payload,
+            execute_backtest,
+            post_process,
+            BacktestPlotContext.from_payload,
+            available_exchanges,
+        )
+
+    if not per_exchange:
+        raise ValueError(f"Scenario {scenario.label} had no exchanges after filtering.")
+
+    from tools.iterative_backtester import combine_analyses
+
+    combined_metrics = combine_analyses(per_exchange)
+    elapsed = (utc_ms() - start_ts) / 1000.0
+    return ScenarioResult(
+        scenario=scenario,
+        per_exchange=per_exchange,
+        metrics=combined_metrics,
+        elapsed_seconds=elapsed,
+        output_path=scenario_dir,
+        started_at=utc_datetime(start_ts),
+        completed_at=utc_datetime(),
+    )
+
+
+def _run_combined_dataset(
+    dataset: ExchangeDataset,
+    scenario: SuiteScenario,
+    scenario_config: Dict[str, Any],
+    scenario_coins: List[str],
+    scenario_dir: Optional[Path],
+    build_payload_fn,
+    execute_backtest_fn,
+    post_process_fn,
+    plot_context_factory,
+) -> Dict[str, Dict[str, Any]]:
+    per_exchange: Dict[str, Dict[str, Any]] = {}
+
+    allowed_exchanges = (
+        list(scenario.exchanges)
+        if scenario.exchanges
+        else list(dataset.available_exchanges)
+    )
+    selected_coins, skipped_coins = filter_coins_by_exchange_assignment(
+        scenario_coins,
+        allowed_exchanges,
+        dataset.coin_exchange,
+        default_exchange=dataset.exchange,
+    )
+    if skipped_coins:
+        logging.warning(
+            "Scenario %s: skipping %d coin(s) outside allowed exchanges (%s): %s",
+            scenario.label,
+            len(skipped_coins),
+            ",".join(allowed_exchanges),
+            ",".join(skipped_coins[:10]),
+        )
+    if not selected_coins:
+        raise ValueError(
+            f"Scenario {scenario.label} has no coins after applying exchange filters."
+        )
+    scenario_config["backtest"]["coins"][dataset.exchange] = list(selected_coins)
+    scenario_config["backtest"]["cache_dir"][dataset.exchange] = dataset.cache_dir
+
+    (
+        hlcvs_slice,
+        btc_prices,
+        timestamps,
+        mss_slice,
+    ) = _prepare_dataset_subset(
+        dataset,
+        scenario_config,
+        selected_coins,
+        scenario.label,
+    )
+
+    payload = build_payload_fn(
+        hlcvs_slice,
+        mss_slice,
+        scenario_config,
+        dataset.exchange,
+        btc_prices,
+        timestamps,
+    )
+    fills, equities_array, analysis = execute_backtest_fn(payload, scenario_config)
+    per_exchange[dataset.exchange] = analysis
+    if scenario_dir is not None:
+        output_dir = scenario_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        post_process_fn(
+            scenario_config,
+            hlcvs_slice,
+            fills,
+            equities_array,
+            btc_prices,
+            analysis,
+            str(output_dir),
+            dataset.exchange,
+            label=scenario.label,
+            plot_context=plot_context_factory(payload),
+            output_directory=output_dir,
+        )
+    del fills
+    del equities_array
+    return per_exchange
+
+
+def _run_multi_dataset(
+    datasets: Dict[str, ExchangeDataset],
+    scenario: SuiteScenario,
+    scenario_config: Dict[str, Any],
+    scenario_coins: List[str],
+    scenario_dir: Optional[Path],
+    build_payload_fn,
+    execute_backtest_fn,
+    post_process_fn,
+    plot_context_factory,
+    available_exchanges: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    per_exchange: Dict[str, Dict[str, Any]] = {}
+    allowed_exchanges = set(scenario.exchanges or available_exchanges)
+    output_count = sum(
+        1
+        for dataset in datasets.values()
+        if (not allowed_exchanges or dataset.exchange in allowed_exchanges)
+        and any(coin in dataset.coin_index for coin in scenario_coins)
+    )
+    for exchange_key, dataset in datasets.items():
+        if allowed_exchanges and dataset.exchange not in allowed_exchanges:
+            continue
+        exchange_coins = [coin for coin in scenario_coins if coin in dataset.coin_index]
+        if not exchange_coins:
+            logging.warning(
+                "Scenario %s: no overlapping coins for exchange %s; skipping.",
+                scenario.label,
+                dataset.exchange,
+            )
+            continue
+        scenario_config["backtest"]["coins"][dataset.exchange] = exchange_coins
+        scenario_config["backtest"]["cache_dir"][dataset.exchange] = dataset.cache_dir
+
+        (
+            hlcvs_slice,
+            btc_prices,
+            timestamps,
+            mss_slice,
+        ) = _prepare_dataset_subset(
+            dataset,
+            scenario_config,
+            exchange_coins,
+            scenario.label,
+        )
+
+        payload = build_payload_fn(
+            hlcvs_slice,
+            mss_slice,
+            scenario_config,
+            dataset.exchange,
+            btc_prices,
+            timestamps,
+        )
+        fills, equities_array, analysis = execute_backtest_fn(payload, scenario_config)
+
+        per_exchange[exchange_key] = analysis
+        if scenario_dir is not None:
+            exchange_dir = (
+                scenario_dir / safe_component(dataset.exchange)
+                if output_count > 1
+                else scenario_dir
+            )
+            exchange_dir.mkdir(parents=True, exist_ok=True)
+            post_process_fn(
+                scenario_config,
+                hlcvs_slice,
+                fills,
+                equities_array,
+                btc_prices,
+                analysis,
+                str(exchange_dir),
+                dataset.exchange,
+                label=f"{scenario.label}/{dataset.exchange}",
+                output_directory=exchange_dir,
+                plot_context=plot_context_factory(payload),
+            )
+        del fills
+        del equities_array
+
+    return per_exchange
+
+
+def _normalize_date_to_ts(value: Any) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid date value: {value!r}")
+    trimmed = value.strip()
+    if trimmed in {"now", "today", ""}:
+        trimmed = format_end_date(trimmed)
+    return int(date_to_ts(trimmed))
+
+
+def _compute_slice_indices(
+    dataset: ExchangeDataset,
+    scenario_config: Dict[str, Any],
+    selected_coins: Sequence[str],
+    scenario_label: str,
+) -> Tuple[int, int, List[int]]:
+    """
+    Compute slice indices for lazy slicing from master dataset.
+    Returns (start_idx, end_idx, coin_indices) without creating actual array slices.
+    """
+    start_value = require_config_value(scenario_config, "backtest.start_date")
+    end_value = require_config_value(scenario_config, "backtest.end_date")
+    start_ts = _normalize_date_to_ts(str(start_value))
+    end_ts = _normalize_date_to_ts(str(end_value))
+    if end_ts <= start_ts:
+        raise ValueError(
+            f"Scenario {scenario_label} end_date must be after start_date (got {start_value} -> {end_value})"
+        )
+
+    warmup_minutes = max(0, int(compute_backtest_warmup_minutes(scenario_config)))
+    warmup_ms = warmup_minutes * 60_000
+    slice_start_ts = start_ts - warmup_ms
+    timestamps_arr = None
+    if dataset.timestamps is not None and len(dataset.timestamps) > 0:
+        timestamps_arr = np.asarray(dataset.timestamps, dtype=np.int64)
+    total_steps = dataset.hlcvs.shape[0]
+
+    if timestamps_arr is None:
+        start_idx = 0
+        end_idx = total_steps
+    else:
+        start_idx = int(np.searchsorted(timestamps_arr, slice_start_ts, side="left"))
+        end_idx = int(np.searchsorted(timestamps_arr, end_ts, side="right"))
+        start_idx = max(0, min(start_idx, total_steps))
+        end_idx = max(start_idx + 1, min(end_idx, total_steps))
+    if start_idx >= total_steps or end_idx <= start_idx:
+        raise ValueError(
+            f"Scenario {scenario_label} timeframe [{start_value}, {end_value}] is outside available data"
+        )
+
+    coin_indices = [dataset.coin_index[coin] for coin in selected_coins]
+    return start_idx, end_idx, coin_indices
+
+
+def _prepare_dataset_subset(
+    dataset: ExchangeDataset,
+    scenario_config: Dict[str, Any],
+    selected_coins: Sequence[str],
+    scenario_label: str,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+    start_value = require_config_value(scenario_config, "backtest.start_date")
+    end_value = require_config_value(scenario_config, "backtest.end_date")
+    start_ts = _normalize_date_to_ts(str(start_value))
+    end_ts = _normalize_date_to_ts(str(end_value))
+    if end_ts <= start_ts:
+        raise ValueError(
+            f"Scenario {scenario_label} end_date must be after start_date (got {start_value} -> {end_value})"
+        )
+
+    warmup_minutes = max(0, int(compute_backtest_warmup_minutes(scenario_config)))
+    warmup_ms = warmup_minutes * 60_000
+    slice_start_ts = start_ts - warmup_ms
+    timestamps_arr = None
+    if dataset.timestamps is not None and len(dataset.timestamps) > 0:
+        timestamps_arr = np.asarray(dataset.timestamps, dtype=np.int64)
+    total_steps = dataset.hlcvs.shape[0]
+
+    if timestamps_arr is None:
+        start_idx = 0
+        end_idx = total_steps
+    else:
+        start_idx = int(np.searchsorted(timestamps_arr, slice_start_ts, side="left"))
+        end_idx = int(np.searchsorted(timestamps_arr, end_ts, side="right"))
+        start_idx = max(0, min(start_idx, total_steps))
+        end_idx = max(start_idx + 1, min(end_idx, total_steps))
+    if start_idx >= total_steps or end_idx <= start_idx:
+        raise ValueError(
+            f"Scenario {scenario_label} timeframe [{start_value}, {end_value}] is outside available data"
+        )
+
+    hlcvs_window = dataset.hlcvs[start_idx:end_idx]
+    btc_window = dataset.btc_usd_prices[start_idx:end_idx]
+    ts_window = (
+        None
+        if timestamps_arr is None
+        else np.asarray(timestamps_arr[start_idx:end_idx], dtype=np.int64)
+    )
+
+    indices = [dataset.coin_index[coin] for coin in selected_coins]
+    hlcvs_slice = hlcvs_window[:, indices, :]
+
+    mss_slice: Dict[str, Any] = {
+        coin: deepcopy(dataset.mss.get(coin, {})) for coin in selected_coins
+    }
+    meta = deepcopy(dataset.mss.get("__meta__", {}))
+    minute_ms = 60_000
+    meta["requested_start_ts"] = int(start_ts)
+    meta["requested_start_date"] = ts_to_date(int(start_ts))
+    meta["requested_end_ts"] = int(end_ts)
+    meta["requested_end_date"] = ts_to_date(int(end_ts))
+    if ts_window is not None and len(ts_window):
+        meta["effective_start_ts"] = int(ts_window[0])
+        meta["effective_start_date"] = ts_to_date(int(ts_window[0]))
+        meta["effective_end_ts"] = int(ts_window[-1])
+        meta["effective_end_date"] = ts_to_date(int(ts_window[-1]))
+        warmup_provided = max(0, int(max(0, start_ts - int(ts_window[0])) // minute_ms))
+    else:
+        warmup_provided = warmup_minutes
+    meta["warmup_minutes_requested"] = warmup_minutes
+    meta["warmup_minutes_provided"] = warmup_provided
+    mss_slice["__meta__"] = meta
+
+    interval = int(meta.get("data_interval_minutes", 1) or 1)
+    offset_bars = int(meta.get("candle_interval_offset_bars", 0) or 0)
+    adjustment_1m = start_idx * interval + offset_bars
+    if adjustment_1m > 0:
+        for coin in selected_coins:
+            coin_meta = mss_slice.get(coin)
+            if not isinstance(coin_meta, dict):
+                continue
+            if "first_valid_index" in coin_meta:
+                coin_meta["first_valid_index"] = max(
+                    0, int(coin_meta.get("first_valid_index", 0)) - adjustment_1m
+                )
+            if "last_valid_index" in coin_meta:
+                coin_meta["last_valid_index"] = max(
+                    0, int(coin_meta.get("last_valid_index", 0)) - adjustment_1m
+                )
+        if offset_bars > 0:
+            meta["candle_interval_offset_bars"] = 0
+
+    warmup_map = compute_per_coin_warmup_minutes(scenario_config)
+    _recompute_index_metadata(mss_slice, hlcvs_slice, list(selected_coins), warmup_map)
+    return hlcvs_slice, btc_window, ts_window, mss_slice
+
+
+def _recompute_index_metadata(
+    mss: Dict[str, Any],
+    hlcvs: np.ndarray,
+    coins: Sequence[str],
+    warmup_map: Optional[Dict[str, int]],
+) -> None:
+    total_steps = hlcvs.shape[0]
+    interval = int(mss.get("__meta__", {}).get("data_interval_minutes", 1) or 1)
+    total_steps_1m = total_steps * interval
+    warmup_map = warmup_map or {}
+    default_warm = int(warmup_map.get("__default__", 0))
+    for idx, coin in enumerate(coins):
+        meta = mss.setdefault(coin, {})
+        first_idx = int(meta.get("first_valid_index", 0))
+        last_idx = int(meta.get("last_valid_index", total_steps_1m - 1))
+        first_idx = max(0, min(first_idx, total_steps_1m))
+        last_idx = max(0, min(last_idx, total_steps_1m - 1))
+        if first_idx >= total_steps_1m:
+            first_idx = total_steps_1m - 1
+        if last_idx < first_idx:
+            last_idx = first_idx
+        if "first_valid_index" not in meta or "last_valid_index" not in meta:
+            close_series = hlcvs[:, idx, 2]
+            finite = np.isfinite(close_series)
+            if finite.any():
+                valid_indices = np.where(finite)[0]
+                first_idx = int(valid_indices[0]) * interval
+                last_idx = int(valid_indices[-1]) * interval + (interval - 1)
+        meta["first_valid_index"] = first_idx
+        meta["last_valid_index"] = last_idx
+        if warmup_map:
+            warm_minutes = int(warmup_map.get(coin, default_warm))
+            meta["warmup_minutes_source"] = "history"
+        else:
+            cached_warm_minutes = meta.get("warmup_minutes")
+            warm_minutes = (
+                int(cached_warm_minutes) if cached_warm_minutes is not None else 0
+            )
+        meta["warmup_minutes"] = warm_minutes
+        if first_idx > last_idx:
+            trade_start_idx = first_idx
+        else:
+            trade_start_idx = min(last_idx, first_idx + warm_minutes)
+        meta["trade_start_index"] = trade_start_idx
+
+
+# --------------------------------------------------------------------------- #
+# Scenario reduction
+# --------------------------------------------------------------------------- #
+
+
+def reduce_metrics(
+    results: Sequence[ScenarioResult], reducer_cfg: Dict[str, Any]
+) -> Dict[str, Any]:
+    if not results:
+        return {"aggregated": {}, "stats": {}}
+    metrics_values: Dict[str, List[float]] = {}
+    for result in results:
+        stats = result.metrics.get("stats", {})
+        for metric, metric_stats in stats.items():
+            value = metric_stats.get("mean")
+            if value is None or not np.isfinite(value):
+                continue
+            metrics_values.setdefault(metric, []).append(float(value))
+
+    stats: Dict[str, Dict[str, float]] = {}
+    reduced: Dict[str, float] = {}
+    reducer_cfg = {canonicalize_metric_name(str(k)): v for k, v in reducer_cfg.items()}
+    default_mode = str(reducer_cfg.get("default", "mean")).lower()
+
+    for metric, values in metrics_values.items():
+        if not values:
+            continue
+        arr = np.asarray(values, dtype=float)
+        stats[metric] = {
+            "mean": float(np.mean(arr)),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+            "std": float(np.std(arr)),
+            "median": float(np.median(arr)),
+        }
+        canonical_metric = canonicalize_metric_name(metric)
+        mode = reducer_cfg.get(canonical_metric)
+        if mode is None and "_" in canonical_metric:
+            base = canonical_metric.rsplit("_", 1)[0]
+            mode = reducer_cfg.get(base)
+        mode = str(mode or default_mode).lower()
+        if mode == "mean":
+            reduced[metric] = stats[metric]["mean"]
+        elif mode == "max":
+            reduced[metric] = stats[metric]["max"]
+        elif mode == "min":
+            reduced[metric] = stats[metric]["min"]
+        elif mode == "std":
+            reduced[metric] = stats[metric]["std"]
+        elif mode == "median":
+            reduced[metric] = float(np.median(arr))
+        else:
+            raise ValueError(f"Unsupported reducer '{mode}' for metric '{metric}'.")
+    return {"aggregated": reduced, "stats": stats}
+
+
+def build_suite_metrics_payload(
+    results: Sequence[ScenarioResult], aggregate_summary: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Build the canonical suite metrics payload (aggregate + per-scenario) used by both
+    optimizer and backtester outputs.
+    """
+
+    scenario_metrics = {res.scenario.label: res.metrics for res in results}
+    return merge_suite_payload(
+        aggregate_summary.get("stats", {}),
+        aggregate_values=aggregate_summary.get("aggregated", {}),
+        scenario_metrics=scenario_metrics,
+    )
+
+
+def summarize_scenario_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a metrics dict containing only stats into a flat metric -> value map,
+    preferring the mean when available.
+    """
+
+    if not isinstance(metrics, dict):
+        return {}
+    stats = metrics.get("stats")
+    if not isinstance(stats, dict):
+        return deepcopy(metrics)
+    simplified: Dict[str, Any] = {}
+    for name, payload in stats.items():
+        if isinstance(payload, dict):
+            value = payload.get("mean")
+            if value is None:
+                for key in ("value", "max", "min"):
+                    if key in payload:
+                        value = payload[key]
+                        break
+            simplified[name] = value
+        else:
+            simplified[name] = payload
+    return simplified
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+
+
+def _suite_session_inputs(
+    scenarios,
+    base_config,
+    datasets,
+    master_coins,
+    master_ignored,
+    available_exchanges,
+    available_coins,
+    suite_coin_sources,
+    base_coins,
+    base_ignored,
+):
+    """Describe actual scenario slices without retaining copied market arrays."""
+    inputs, run_configs, coins, sources = [], [], set(), set()
+    actual = set(available_exchanges) - {"combined"}
+    for scenario in scenarios:
+        cfg, selected = apply_scenario(
+            base_config,
+            scenario,
+            master_coins=master_coins,
+            master_ignored=master_ignored,
+            available_exchanges=available_exchanges,
+            available_coins=available_coins,
+            base_coin_sources=suite_coin_sources,
+            base_coins=base_coins,
+            base_ignored=base_ignored,
+            quiet=True,
+        )
+        allowed = (set(scenario.exchanges) & actual) if scenario.exchanges else actual
+        allowed = allowed or actual
+        combined = "combined" in datasets and allowed == actual
+        candidates = (
+            {"combined": datasets["combined"]}
+            if combined
+            else {
+                key: dataset
+                for key, dataset in datasets.items()
+                if key != "combined" and dataset.exchange in allowed
+            }
+        )
+        data = {}
+        for key, dataset in candidates.items():
+            if combined:
+                subset, _ = filter_coins_by_exchange_assignment(
+                    selected,
+                    scenario.exchanges or dataset.available_exchanges,
+                    dataset.coin_exchange,
+                    default_exchange=dataset.exchange,
+                )
+            else:
+                subset = [coin for coin in selected if coin in dataset.coin_index]
+            if not subset:
+                continue
+            hlcvs, btc, timestamps, mss = _prepare_dataset_subset(
+                dataset, cfg, subset, scenario.label
+            )
+            data[key] = materialized_dataset_identity(
+                subset, hlcvs, btc, timestamps, mss
+            )
+            coins.update(subset)
+            sources.add(key)
+            del hlcvs, btc, timestamps, mss
+        if not data:
+            raise ValueError(f"Scenario {scenario.label} has no usable output datasets")
+        run_configs.append(cfg)
+        inputs.append(
+            {
+                "label": scenario.label,
+                "config": effective_setup_config(cfg),
+                "data": data,
+            }
+        )
+    return inputs, run_configs, sorted(coins), sorted(sources)
+
+
+@simulation_data_scope
+async def run_backtest_suite_async(
+    config: Dict[str, Any],
+    suite_cfg: Dict[str, Any],
+    *,
+    disable_plotting: bool,
+    suite_output_root: Optional[Path] = None,
+) -> SuiteSummary:
+    base_exchanges = require_config_value(config, "backtest.exchanges")
+
+    base_coins = _flatten_coin_list(require_live_value(config, "approved_coins"))
+    base_ignored = _flatten_coin_list(require_live_value(config, "ignored_coins"))
+
+    scenarios, reducer_cfg = build_scenarios(suite_cfg, base_exchanges=base_exchanges)
+
+    # Determine which individual exchange datasets are needed for single-exchange scenarios
+    needed_individual = _determine_needed_individual_exchanges(
+        scenarios, base_exchanges
+    )
+
+    # Expand exchanges_list to include scenario-required exchanges that aren't in base
+    exchanges_list = sorted(set(base_exchanges) | needed_individual)
+    added_exchanges = needed_individual - set(base_exchanges)
+    if added_exchanges:
+        logging.info(
+            "Expanded exchanges from %s to %s (added %s from scenario requirements)",
+            base_exchanges,
+            exchanges_list,
+            sorted(added_exchanges),
+        )
+
+    suite_coin_sources = collect_suite_coin_sources(config, scenarios)
+    identity_exchanges = sorted(set(exchanges_list) | set(suite_coin_sources.values()))
+    for exchange in identity_exchanges:
+        await load_markets(exchange, verbose=False)
+    await format_approved_ignored_coins(
+        config,
+        exchanges_list,
+        verbose=False,
+        prefer_backtest_coin_source_keys=True,
+    )
+    validate_suite_side_coin_lists(config, exchanges_list)
+
+    master_coins = _collect_union((s.coins for s in scenarios), base_coins)
+    master_coins = _coalesce_master_coins(
+        master_coins, suite_coin_sources, identity_exchanges
+    )
+    master_ignored = _collect_union((s.ignored_coins for s in scenarios), base_ignored)
+    await reject_cross_exchange_market_identifier_collisions(
+        [*master_coins, *master_ignored, *suite_coin_sources.keys()],
+        identity_exchanges,
+        verbose=False,
+    )
+
+    base_config = deepcopy(config)
+    base_config.setdefault("backtest", {})
+    base_config["backtest"]["coin_sources"] = suite_coin_sources
+    if isinstance(base_config["live"]["approved_coins"], dict):
+        base_config["live"]["approved_coins"]["long"] = list(master_coins)
+        base_config["live"]["approved_coins"]["short"] = list(master_coins)
+    else:
+        base_config["live"]["approved_coins"] = list(master_coins)
+    if isinstance(base_config["live"]["ignored_coins"], dict):
+        base_config["live"]["ignored_coins"]["long"] = list(master_ignored)
+        base_config["live"]["ignored_coins"]["short"] = list(master_ignored)
+    else:
+        base_config["live"]["ignored_coins"] = list(master_ignored)
+
+    candle_interval = int(
+        base_config.get("backtest", {}).get("candle_interval_minutes", 1) or 1
+    )
+    datasets = await prepare_master_datasets(
+        base_config,
+        exchanges_list,
+        needed_individual_exchanges=needed_individual,
+        candle_interval_minutes=candle_interval,
+        scenarios=scenarios,
+    )
+    available_coins: set[str] = set()
+    for dataset in datasets.values():
+        available_coins.update(dataset.coins)
+    if not available_coins:
+        raise ValueError("No coins available after preparing master datasets.")
+
+    if len(datasets) == 1 and "combined" in datasets:
+        dataset_available_exchanges = datasets["combined"].available_exchanges
+    else:
+        dataset_available_exchanges = [ds.exchange for ds in datasets.values()]
+
+    # Deduplicate scenarios that resolve to identical effective inputs.
+    seen_signatures: Dict[str, str] = {}
+    deduped: List[SuiteScenario] = []
+    for scenario in scenarios:
+        scenario_config_tmp, scenario_coins = apply_scenario(
+            base_config,
+            scenario,
+            master_coins=master_coins,
+            master_ignored=master_ignored,
+            available_exchanges=dataset_available_exchanges,
+            available_coins=available_coins,
+            base_coin_sources=suite_coin_sources,
+            base_coins=base_coins,
+            base_ignored=base_ignored,
+            quiet=True,
+        )
+        coin_exchange = _compute_effective_coin_exchange(
+            scenario, scenario_coins, datasets, dataset_available_exchanges
+        )
+        signature = _build_scenario_signature(scenario_config_tmp, coin_exchange)
+        if signature in seen_signatures:
+            logging.info(
+                "Skipping scenario %s (duplicate of %s)",
+                scenario.label,
+                seen_signatures[signature],
+            )
+            continue
+        seen_signatures[signature] = scenario.label
+        deduped.append(scenario)
+    if len(deduped) != len(scenarios):
+        logging.info("Scenario dedup: %d -> %d", len(scenarios), len(deduped))
+    scenarios = deduped
+
+    inputs, run_configs, run_coins, run_sources = _suite_session_inputs(
+        scenarios,
+        base_config,
+        datasets,
+        master_coins,
+        master_ignored,
+        dataset_available_exchanges,
+        available_coins,
+        suite_coin_sources,
+        base_coins,
+        base_ignored,
+    )
+    span, span_metadata = date_span(run_configs)
+    source = "combined" if len(run_sources) > 1 else run_sources[0]
+    setup = {
+        "version": 1,
+        "scenarios": inputs,
+        "reducer": reducer_cfg,
+        "implementation": evaluation_implementation_identity(),
+    }
+    if suite_output_root is None:
+        suite_dir, session_metadata = create_session_dir(
+            Path(require_config_value(config, "backtest.base_dir")) / "suite_runs",
+            coins=run_coins,
+            source=source,
+            span=span,
+            setup=setup,
+            scenarios=len(scenarios),
+            metadata={
+                "kind": "backtest_suite",
+                "coins": run_coins,
+                "data_sources": run_sources,
+                **span_metadata,
+            },
+        )
+    else:
+        # The embedding API may supply its own empty output root.
+        from session_artifacts import setup_hash
+        from uuid import uuid4
+
+        suite_dir = Path(suite_output_root)
+        suite_dir.mkdir(parents=True, exist_ok=True)
+        if any(suite_dir.iterdir()):
+            raise FileExistsError(f"Suite output root must be empty: {suite_dir}")
+        session_metadata = {
+            "layout_version": LAYOUT_VERSION,
+            "started_at": utc_datetime(),
+            "setup_sha256": setup_hash(setup),
+            "run_id": uuid4().hex,
+            "kind": "backtest_suite",
+            "setup": setup,
+            "coins": run_coins,
+            **span_metadata,
+        }
+        write_json(suite_dir / SESSION_MANIFEST, session_metadata)
+    suite_timestamp = session_metadata["started_at"]
+
+    logging.info("Starting backtest suite: %d scenario(s)", len(scenarios))
+    results: List[ScenarioResult] = []
+    for scenario in scenarios:
+        logging.info("Running scenario '%s'...", scenario.label)
+        result = await run_backtest_scenario(
+            scenario,
+            base_config,
+            datasets,
+            master_coins,
+            master_ignored,
+            dataset_available_exchanges,
+            available_coins,
+            suite_dir,
+            disable_plotting=disable_plotting,
+            base_coin_sources=suite_coin_sources,
+            base_coins=base_coins,
+            base_ignored=base_ignored,
+        )
+        results.append(result)
+        logging.info(
+            "Scenario %s finished in %.2fs with %d metrics.",
+            scenario.label,
+            result.elapsed_seconds,
+            len(result.metrics.get("stats", {})),
+        )
+
+    reduced_summary = reduce_metrics(results, reducer_cfg)
+    suite_metrics = build_suite_metrics_payload(results, reduced_summary)
+    # Persist a lean, canonical payload: shared schema + elapsed per scenario.
+    summary_payload = {
+        "layout_version": LAYOUT_VERSION,
+        "suite_id": suite_dir.name,
+        "setup_sha256": session_metadata["setup_sha256"],
+        "run_id": session_metadata["run_id"],
+        "meta": {
+            "scenarios": [res.scenario.label for res in results],
+            "timestamp": suite_timestamp,
+            "completed_at": utc_datetime(),
+        },
+        "suite_metrics": suite_metrics,
+        "per_scenario": {
+            res.scenario.label: {
+                "elapsed_seconds": res.elapsed_seconds,
+                "started_at": res.started_at,
+                "completed_at": res.completed_at,
+                "output_path": (
+                    res.output_path.relative_to(suite_dir).as_posix()
+                    if res.output_path
+                    else None
+                ),
+                "artifacts": (
+                    artifact_paths(res.output_path, suite_dir)
+                    if res.output_path
+                    else {}
+                ),
+            }
+            for res in results
+        },
+    }
+    (suite_dir / "suite_summary.json").write_text(json.dumps(summary_payload, indent=2))
+    saved_config = attach_result_metrics(
+        sanitize_prepared_config_for_dump(config), suite_metrics=suite_metrics
+    )
+    saved_config["backtest"].update(
+        suite_enabled=True,
+        exchanges=deepcopy(suite_cfg.get("exchanges") or base_exchanges),
+        scenarios=deepcopy(suite_cfg["scenarios"]),
+        reducer=deepcopy(reducer_cfg),
+    )
+    dump_config(saved_config, str(suite_dir / "config.json"))
+
+    return SuiteSummary(
+        suite_id=suite_dir.name,
+        scenarios=results,
+        aggregate=reduced_summary,
+        output_dir=suite_dir,
+        suite_metrics=suite_metrics,
+    )
+
+
+def run_backtest_suite_sync(
+    config_path: Path,
+    *,
+    suite_config_path: Optional[Path] = None,
+    disable_plotting: bool = False,
+) -> SuiteSummary:
+    configure_logging()
+    config_path_str = str(config_path)
+    if config_path_str in {"", "."}:
+        config_path_str = None
+    source, base_path, raw = load_input_config(config_path_str)
+    suite_override = None
+    if suite_config_path:
+        suite_override = load_suite_override_config(
+            suite_config_path, source_config=source, base_config_path=base_path
+        )
+    config = prepare_config(
+        source, base_config_path=base_path, raw_snapshot=raw, verbose=False
+    )
+    config = parse_overrides(config, verbose=False)
+
+    suite_cfg = extract_suite_config(config, suite_override)
+    if not suite_cfg.get("scenarios"):
+        raise ValueError("Suite configuration must define at least one scenario.")
+
+    return asyncio.run(
+        run_backtest_suite_async(
+            config,
+            suite_cfg,
+            disable_plotting=disable_plotting,
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Legacy compatibility shim
+# --------------------------------------------------------------------------- #
+
+
+def cli_entrypoint(config_path: str, suite_config_path: Optional[str] = None) -> None:
+    summary = run_backtest_suite_sync(
+        Path(config_path) if config_path else Path(),
+        suite_config_path=Path(suite_config_path) if suite_config_path else None,
+    )
+    logging.info(
+        "Suite %s completed | scenarios=%d | output=%s",
+        summary.suite_id,
+        len(summary.scenarios),
+        summary.output_dir,
+    )

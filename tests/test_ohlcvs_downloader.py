@@ -1,0 +1,322 @@
+import os
+import json
+import types
+import asyncio
+import numpy as np
+import pandas as pd
+import pytest
+
+import hlcv_preparation as hp
+import ohlcv_download
+import ohlcv_utils as ou
+import utils
+
+
+def test_to_ccxt_exchange_id(monkeypatch):
+    # Make ccxt.exchanges predictable
+    monkeypatch.setattr(
+        utils.ccxt,
+        "exchanges",
+        ["binance", "binanceusdm", "kucoin", "kucoinfutures", "bybit"],
+        raising=False,
+    )
+
+    assert utils.to_ccxt_exchange_id("binance") == "binanceusdm"
+    assert utils.to_ccxt_exchange_id("kucoin") == "kucoinfutures"
+    # Unchanged when no matching futures suffix exists
+    assert utils.to_ccxt_exchange_id("bybit") == "bybit"
+    # Already ccxt ID stays as-is
+    assert utils.to_ccxt_exchange_id("binanceusdm") == "binanceusdm"
+    # User-facing and cache/data names stay on the short exchange spelling.
+    assert utils.to_standard_exchange_name("binanceusdm") == "binance"
+    assert utils.to_standard_exchange_name("kucoinfutures") == "kucoin"
+
+
+def test_deduplicate_rows():
+    arr = np.array([[1.0, 2.0], [1.0, 2.0], [3.0, 4.0], [3.0, 4.0], [5.0, 6.0]])
+    out = ou.deduplicate_rows(arr)
+    assert out.shape == (3, 2)
+    assert (out[0] == np.array([1.0, 2.0])).all()
+    assert (out[1] == np.array([3.0, 4.0])).all()
+    assert (out[2] == np.array([5.0, 6.0])).all()
+
+
+def test_ensure_millis_seconds_to_ms():
+    df = pd.DataFrame(
+        {
+            "timestamp": [1_600_000_000],
+            "open": [1],
+            "high": [1],
+            "low": [1],
+            "close": [1],
+            "volume": [1],
+        }
+    )
+    out = ou.ensure_millis_df(df.copy())
+    assert out["timestamp"].iloc[0] == 1_600_000_000_000
+
+
+def test_ensure_millis_micros_to_ms():
+    df = pd.DataFrame(
+        {
+            "timestamp": [1_600_000_000_000_000],
+            "open": [1],
+            "high": [1],
+            "low": [1],
+            "close": [1],
+            "volume": [1],
+        }
+    )
+    out = ou.ensure_millis_df(df.copy())
+    assert out["timestamp"].iloc[0] == 1_600_000_000_000
+
+
+def test_ensure_millis_ms_unchanged():
+    df = pd.DataFrame(
+        {
+            "timestamp": [1_600_000_000_000],
+            "open": [1],
+            "high": [1],
+            "low": [1],
+            "close": [1],
+            "volume": [1],
+        }
+    )
+    out = ou.ensure_millis_df(df.copy())
+    assert out["timestamp"].iloc[0] == 1_600_000_000_000
+
+
+def _make_df_with_gap():
+    # timestamps: 0, 60000, 180000 (missing 120000)
+    ts = [0, 60_000, 180_000]
+    base = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [1.0, 2.0, 4.0],
+            "high": [1.5, 2.5, 4.5],
+            "low": [0.5, 1.5, 3.5],
+            "close": [1.1, 2.1, 4.1],
+            "volume": [10.0, 20.0, 40.0],
+        }
+    )
+    return base
+
+
+def test_fill_gaps_in_ohlcvs():
+    df = _make_df_with_gap()
+    filled = ou.fill_gaps_in_ohlcvs(df)
+    # Should now have 4 rows: 0, 60000, 120000, 180000
+    assert len(filled) == 4
+    assert filled["timestamp"].tolist() == [0, 60_000, 120_000, 180_000]
+    # The inserted row's O/H/L should be filled with previous close
+    assert filled.loc[2, "open"] == filled.loc[1, "close"]
+
+
+def test_attempt_gap_fix_ohlcvs_small_gap():
+    df = _make_df_with_gap()
+    fixed = ou.attempt_gap_fix_ohlcvs(df, symbol="TEST", verbose=False)
+    assert len(fixed) == 4
+    assert fixed["timestamp"].tolist() == [0, 60_000, 120_000, 180_000]
+
+
+def test_attempt_gap_fix_ohlcvs_raises_on_huge_gap():
+    # create a huge gap of 13 hours
+    gap_ms = 13 * 60 * 60 * 1000
+    df = pd.DataFrame(
+        {
+            "timestamp": [0, gap_ms],
+            "open": [1.0, 2.0],
+            "high": [1.0, 2.0],
+            "low": [1.0, 2.0],
+            "close": [1.0, 2.0],
+            "volume": [0.0, 0.0],
+        }
+    )
+    with pytest.raises(Exception):
+        ou.attempt_gap_fix_ohlcvs(df, symbol="HUGE", verbose=False)
+
+
+@pytest.mark.asyncio
+async def test_download_uses_backtest_materialization_path(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_format_approved_ignored_coins(config, exchanges, **_kwargs):
+        calls.append(("format", tuple(exchanges)))
+
+    async def fake_prepare_hlcvs_mss(config, exchange, *, force_refetch_gaps=False):
+        calls.append(("prepare", exchange, force_refetch_gaps))
+        return (
+            ["BTC"],
+            np.zeros((1, 1, 4), dtype=np.float64),
+            {"BTC": {}, "__meta__": {"candidate_report": []}},
+            str(tmp_path / "results" / exchange) + "/",
+            tmp_path / "caches" / "hlcvs_data" / f"{exchange}__abc",
+            np.ones(1, dtype=np.float64),
+            np.array([0], dtype=np.int64),
+        )
+
+    monkeypatch.setattr(ohlcv_download, "format_approved_ignored_coins", fake_format_approved_ignored_coins)
+    monkeypatch.setattr(ohlcv_download, "prepare_hlcvs_mss", fake_prepare_hlcvs_mss)
+
+    config = {
+        "backtest": {
+            "exchanges": ["binance", "bybit"],
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "gap_tolerance_ohlcvs_minutes": 120.0,
+        },
+        "live": {"approved_coins": {"long": ["BTC"], "short": []}},
+    }
+
+    await ohlcv_download.warm_ohlcv_caches(config, force_refetch_gaps=True)
+
+    assert calls == [("format", ("binance", "bybit")), ("prepare", "combined", True)]
+    assert config["backtest"]["coins"]["combined"] == ["BTC"]
+
+
+def test_dump_and_load_ohlcvs_roundtrip(tmp_path):
+    fp = tmp_path / "ohlcv.npy"
+    df = pd.DataFrame(
+        {
+            "timestamp": [0, 60_000, 120_000, 120_000],  # duplicate last row
+            "open": [1.0, 2.0, 3.0, 3.0],
+            "high": [1.0, 2.0, 3.0, 3.0],
+            "low": [1.0, 2.0, 3.0, 3.0],
+            "close": [1.0, 2.0, 3.0, 3.0],
+            "volume": [10.0, 20.0, 30.0, 30.0],
+        }
+    )
+    ou.dump_ohlcv_data(df, str(fp))
+    loaded = ou.load_ohlcv_data(str(fp))
+    # Deduplicated so should be 3 rows
+    assert loaded.shape[0] == 3
+    assert loaded["timestamp"].tolist() == [0, 60_000, 120_000]
+
+
+@pytest.mark.asyncio
+async def test_load_markets_fetch_and_cache(tmp_path, monkeypatch):
+    # Dummy exchange class to inject
+    class DummyCCXT:
+        def __init__(self, config=None):
+            self.options = {}
+
+        async def load_markets(self, reload=False, params=None):
+            return {"BTC/USDT:USDT": {"id": "BTCUSDT", "swap": True}}
+
+        async def close(self):
+            return
+
+    monkeypatch.setattr(
+        utils,
+        "load_ccxt_instance",
+        lambda exchange, enable_rate_limit=True: DummyCCXT(),
+        raising=True,
+    )
+
+    # Control time so cache-aging checks are predictable
+    monkeypatch.setattr(utils, "utc_ms", lambda: 1_000_000_000_000, raising=True)
+    # First call: force cache miss by reporting old mod time
+    monkeypatch.setattr(utils, "get_file_mod_ms", lambda p: 0, raising=True)
+
+    # Run inside temporary directory so "caches/..." is isolated
+    monkeypatch.chdir(tmp_path)
+
+    markets = await utils.load_markets("binance")
+    assert "BTC/USDT:USDT" in markets
+
+    # Ensure cache file exists (uses non-normalized exchange name for cache path)
+    cache_fp = tmp_path / "caches" / "binance" / "markets.json"
+    assert cache_fp.exists()
+
+    # Second call: make cache fresh to test cache path
+    monkeypatch.setattr(
+        utils, "get_file_mod_ms", lambda p: utils.utc_ms() - 1000, raising=True
+    )
+    markets2 = await utils.load_markets("binance")
+    assert markets2 == markets
+
+
+@pytest.mark.asyncio
+async def test_ohlcvmanager_load_markets_calls_set_markets(monkeypatch):
+    om = hp.HLCVManager("binance")
+
+    # Provide a stub cc with set_markets
+    class StubCC:
+        def __init__(self):
+            self.set_markets_called = False
+
+        def set_markets(self, markets):
+            self.set_markets_called = True
+
+    om.cc = StubCC()
+    om.load_cc = lambda: None
+
+    # Monkeypatch top-level load_markets to return a dummy dict
+    async def fake_load_markets(ex, verbose=False):
+        return {
+            "BTC/USDT:USDT": {
+                "swap": True,
+                "precision": {"price": 0.01, "amount": 0.001},
+                "limits": {"cost": {"min": 5.0}, "amount": {"min": 0.0}},
+                "maker": 0.0002,
+                "taker": 0.0005,
+                "contractSize": 1.0,
+            }
+        }
+
+    monkeypatch.setattr(hp, "load_markets", fake_load_markets, raising=True)
+
+    await om.load_markets()
+    assert isinstance(om.markets, dict)
+    assert om.cc.set_markets_called is True
+
+
+@pytest.mark.asyncio
+async def test_compute_exchange_volume_ratios_simple(monkeypatch):
+    # Build stub OMs for two exchanges
+    class StubOM:
+        def __init__(self, df):
+            self._df = df
+
+        def has_coin(self, coin):
+            return True
+
+        def update_date_range(self, start, end):
+            pass
+
+        async def get_ohlcvs(self, coin):
+            return self._df.copy()
+
+    # Day 0 in ms is 0.. so use two bars
+    df_a = pd.DataFrame(
+        {
+            "timestamp": [0, 60_000],
+            "open": [1, 1],
+            "high": [1, 1],
+            "low": [1, 1],
+            "close": [1, 1],
+            "volume": [10.0, 20.0],  # sum = 30
+        }
+    )
+    df_b = pd.DataFrame(
+        {
+            "timestamp": [0, 60_000],
+            "open": [1, 1],
+            "high": [1, 1],
+            "low": [1, 1],
+            "close": [1, 1],
+            "volume": [30.0, 30.0],  # sum = 60
+        }
+    )
+
+    om_dict = {"exA": StubOM(df_a), "exB": StubOM(df_b)}
+    ratios = await hp.compute_exchange_volume_ratios(
+        exchanges=["exA", "exB"],
+        coins=["BTC"],
+        start_date="1970-01-01",
+        end_date="1970-01-02",
+        om_dict=om_dict,
+    )
+    # Pair order follows (ex0, ex1) as constructed; exA < exB
+    assert ("exA", "exB") in ratios
+    assert ratios[("exA", "exB")] == pytest.approx(0.5)

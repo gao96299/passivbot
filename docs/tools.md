@@ -1,0 +1,946 @@
+# Tools
+
+Most tools below require the full install profile:
+
+```shell
+python3 -m pip install -e ".[full]"
+```
+
+## Pareto dashboard for optimizer runs
+
+`passivbot tool pareto-dash` scans one or more `optimize_results/` directories and launches a Plotly Dash UI with scatter plots, histograms, suite-aware metrics, and CSV export. Use the full install profile (`python3 -m pip install -e ".[full]"`) if those dashboard dependencies are not already installed.
+
+```shell
+passivbot tool pareto-dash --data-root optimize_results
+```
+
+Pass `--run optimize_results/<timestamp>/` to load a specific run or point it at the entire results directory to browse multiple runs at once.
+
+## Pareto single-candidate explorer
+
+`passivbot tool pareto` reads a Pareto directory of JSON members, optionally filters it with
+optimizer-style limit expressions, and selects one candidate using a named decision method.
+If you omit the path entirely, it defaults to the newest local `optimize_results/.../pareto`
+directory by lexicographic run-directory name, considering only runs whose `pareto/`
+subdirectory contains at least one `*.json` candidate. If you point it at an optimize run
+directory instead of the nested `pareto/` directory, it resolves that automatically.
+
+```shell
+passivbot tool pareto optimize_results/.../pareto
+passivbot tool pareto
+passivbot tool pareto optimize_results/.../pareto -m reference \
+  --target adg_strategy_eq=0.001 \
+  --target drawdown_worst_strategy_eq=0.25
+passivbot tool pareto optimize_results/.../pareto \
+  -l 'drawdown_worst_strategy_eq<=0.35' \
+  -l 'adg_strategy_eq>0.0' \
+  --save-selected configs/promoted_candidate.local.json
+passivbot tool pareto optimize_results/.../pareto \
+  -l 'drawdown_worst_strategy_eq<=0.35' \
+  -l 'adg_strategy_eq>0.0' \
+  --save-filtered optimize_results/filtered_pareto
+passivbot tool pareto -o sharpe_ratio_strategy_eq,adg_strategy_eq,strategy_eq_recovery_days_max \
+  -m ideal
+passivbot tool pareto optimize_results/... -m utility \
+  --weight adg_strategy_eq=4 \
+  --weight drawdown_worst_strategy_eq=2 \
+  --show-top 5
+passivbot tool pareto optimize_results/... --scenario opt_2025_to_present
+passivbot tool pareto --json
+```
+
+Available methods:
+
+- `knee` - balanced compromise point when you want a compromise selector instead of ideal-point distance
+- `reference` - closest to user-specified aspiration targets
+- `ideal` - closest to the observed ideal point on the current front; default method
+- `utility` - highest weighted normalized utility
+- `lexicographic` - strict objective priority order
+- `outranking` - simplified PROMETHEE-style pairwise net-flow ranking
+
+The explorer applies limits first, then ranks the retained candidates. It is intended for quickly
+promoting one config out of a large Pareto front without opening the dashboard. Its selection
+methods are practical decision heuristics for high-dimensional Passivbot fronts, not full formal
+multi-criteria decision-analysis implementations.
+
+For suite optimization results, `--scenario LABEL` projects every saved Pareto member onto that
+scenario's stored metric values, applies CLI limits in that scenario context, rebuilds a
+nondominated sub-front using the original `optimize.scoring` goals, and then runs the selected
+decision method. Suite artifacts store one mean value per scenario and metric, so explicit
+non-`mean` limit statistics are unavailable in this mode. The rebuilt front covers only members of
+the saved aggregate-suite Pareto front: candidates already discarded by the optimizer cannot be
+recovered, so it is not the complete scenario Pareto front across all evaluated candidates.
+
+`passivbot tool pareto-explorer` is a CLI alias for the same tool.
+
+The output also shows the retained front's ideal point: the best observed value for each active
+objective after any `--limit` filters are applied.
+
+Use `-s FILE` / `--save-selected FILE` to copy the selected member without reserializing it. Use
+`-f DIR` / `--save-filtered DIR` to copy every member retained immediately after limits and write
+a `selection.json` manifest. Without limits, the filtered export contains every loaded member.
+Scenario limits use the selected scenario's metrics; the export still represents the post-limit
+set before the scenario-specific nondominated front is rebuilt. The two save options are mutually
+exclusive.
+
+Destinations must not overlap the source Pareto directory and must not already exist. Writes are
+staged before installation. Concurrent destination mutation is outside the tool's contract.
+
+`-o` / `--objectives` is not limited to the original `optimize.scoring` list. You can also name
+other stored metrics such as `sharpe_ratio_strategy_eq` as long as the Pareto JSON
+members contain that metric and Passivbot knows whether higher or lower is better.
+
+## Pareto trade-off explorer
+
+`passivbot tool pareto-plot [PATH]` exports a standalone HTML explorer with all saved
+objective, aggregate/mean, and statistic metrics. Choose X/Y metrics or switch to X/Y/Z
+inside the page; no rerun, server, or internet connection is needed. Use the full install
+profile (`python3 -m pip install -e ".[full]"`).
+
+```bash
+# Omit PATH to use the latest populated optimizer Pareto front.
+passivbot tool pareto-plot --open
+passivbot tool pareto-plot optimize_results/.../pareto --open
+passivbot tool pareto-plot optimize_results/.../pareto --list-metrics
+# Optional positional metrics set the initial axes; the HTML still includes all metrics.
+passivbot tool pareto-plot optimize_results/... \
+  adg_strategy_eq strategy_eq_underwater_pct_mean sortino_ratio_strategy_eq \
+  --output plots/tradeoffs.html --open
+```
+
+A run directory or individual candidate JSON is also accepted. If PATH is omitted, the tool
+uses the lexicographically latest `optimize_results/<run>/pareto` containing candidates,
+relative to the current working directory, matching the other Pareto tools. Run names include
+timestamps; directory modification times do not affect selection. Empty and sidecar-only
+fronts are skipped; malformed candidate data still fails visibly. Missing candidates produce
+a clear error. Positional initial metrics follow an explicit PATH. Without positional
+metrics, the first two available metrics (scoring objectives first) are selected. Known metric aliases
+are accepted. Metric selectors group objectives, other metrics, and named statistics;
+`stats.<metric>.<stat>` identifies an explicit statistic, such as `stats.adg_strategy_eq.mean`.
+Saved objective values take precedence over aggregates, which take precedence over means.
+Canonical names take precedence over legacy aliases regardless of file ordering; conflicting
+aliases without a canonical value are rejected.
+Objectives can include penalties and legacy engine values are converted by the shared loader.
+Per-scenario values are not exported as separate metrics. No full configs are embedded.
+
+The highlighted **star is the chosen Pareto member closest to the theoretical ideal** on
+those selected axes. Distance is Euclidean with equal weights after normalizing each axis
+to the surviving, plottable candidates' range, matching the Pareto selector's unweighted
+`ideal` method. Constant axes (range at most `1e-15`) contribute zero distance; exact ties
+choose the first member in saved loading order. The chosen filename and values appear below
+the plot and on hover.
+
+An **open blue diamond shows the theoretical ideal**: the best visible value on each selected
+axis, using its higher/lower-is-better direction. Different candidates may provide each
+coordinate, so the diamond need not represent a real candidate. Both markers update when
+axes, directions, or limits change, and remain distinct when they coincide. Direction selectors use saved
+scoring goals or known metric goals; unknown directions, including standard deviations,
+require a choice before either marker appears. In 2D, maximization axes are reversed so better
+values always lie toward the lower-left. 3D axes use normal orientation.
+
+Limit cards offer inclusive floors and ceilings, a slider over the saved range, and an exact
+numeric input that also permits thresholds outside that range. Moving a slider or entering a
+number enables the limit; uncheck its box to disable it. **Add** creates a limit on any metric,
+including one not plotted. Enabled limits remain active when axes change. **Reset all limits**
+restores the unfiltered data. The ideal is recomputed from candidates surviving every enabled
+limit and having finite values on every selected axis. Counts report exclusions from limits
+and missing axis values separately. No survivors means neither marker is shown. Axis and color ranges
+stay fixed to the saved data during filtering, so changes remain visually comparable; zoom
+and the 3D camera are retained when only limits change.
+
+Hover for candidate filenames and raw values. Drag to zoom in 2D or rotate in 3D; the toolbar
+supports reset and PNG export. Color follows Y in 2D and Z in 3D. This shows saved members
+without recomputing a lower-dimensional Pareto front. Missing optional metrics are recorded
+as unavailable, never zero; missing required scoring objectives still fail through the shared
+loader. JSON sidecars without scoring metadata are ignored.
+
+Default plots go in `pareto_plots/` under the current working directory, named after the
+input: `optimize_results/<run>/pareto` or its run directory produces `pareto_plots/<run>.html`;
+a custom front directory uses its directory name, and a single JSON uses its filename stem.
+Both initial dimensions use the same filename because the HTML supports switching views.
+The generated directory is ignored by Git. `--output` overrides this location. Use `--force`
+to replace existing output and `--open` to launch a browser. Regenerate older HTML files to obtain the new controls. Exports contain filenames and all saved metric
+values, so keep plots made from private results private. Large fronts produce larger HTML files.
+
+## Pareto transformations / static plots
+
+`src/tools/pareto_transform.py` converts `all_results.bin` or individual Pareto JSON entries into CSV/JSON summaries for external analysis. The legacy `src/pareto_store.py` still produces quick matplotlib scatter plots if you prefer static images.
+
+```shell
+passivbot tool pareto-transform optimize_results/.../all_results.bin --out summary.csv
+python3 src/pareto_store.py optimize_results/.../pareto/
+```
+
+`passivbot tool pareto-analyze` inspects a Pareto front's config and metric distributions,
+including the strongest metric-to-metric correlations among the displayed metrics.
+`passivbot tool pareto-analysis` is an alias for the same command. `passivbot tool
+pareto-compress` selects a compact representative subset from a front, and
+`passivbot tool merge-paretos` merges Pareto fronts into starting configs.
+
+```shell
+passivbot tool pareto-analyze optimize_results/.../pareto
+passivbot tool pareto-compress optimize_results/.../pareto 8 --output-dir selected_pareto_8
+passivbot tool merge-paretos optimize_results/run_a/pareto optimize_results/run_b/pareto
+```
+
+## Optimizer starting-config preselection
+
+By default, `passivbot optimize -t/--start` accepts ordinary configs or Pareto artifacts, extracts
+their bot parameters, and re-evaluates every unique seed under the new run. Add
+`--filter-starting-configs` to filter metric-bearing Pareto artifacts before seed extraction using
+the optimizer's final effective limits, including config limits and CLI `--limits`, `--limit`, and
+`--clear-limits` changes:
+
+```shell
+passivbot optimize configs/examples/suite_example.json \
+  -t optimize_results/.../pareto \
+  --filter-starting-configs \
+  -l 'adg_strategy_eq>0.0' \
+  -l 'strategy_eq_recovery_days_max<100' \
+  -l '{"metric":"strategy_eq_recovery_days_max","penalize_if":"greater_than","reducer":"max","value":120}'
+```
+
+Optionally add `--compress-starting-configs N` (alias `--starting-configs-max N`) to retain at most
+`N` filtered candidates using the same `anchors-farthest` objective-anchor and diversity selection
+as `passivbot tool pareto-compress N`. Compression may also be used without filtering:
+
+```shell
+passivbot optimize configs/examples/suite_example.json \
+  -t optimize_results/.../pareto \
+  --filter-starting-configs \
+  --compress-starting-configs 60 \
+  -l 'drawdown_worst_strategy_eq<0.5 scenario=base'
+```
+
+Both options trust the metrics and objectives stored in the seed artifacts. Passivbot cannot prove
+that their coin universe, exchanges, date range, scenarios, or other backtest settings match the
+new optimization, so it logs a warning whenever metric-based preselection is enabled. This workflow
+is best suited to restarting a comparable optimization with stricter limits. When seeds come from
+different runs or ordinary configs, omit these options so every seed is evaluated before selection.
+Metric-based preselection fails instead of guessing when JSON seeds lack usable Pareto metrics, a
+configured limit metric cannot be resolved, stored artifacts are malformed, or filtering rejects
+every candidate. Survivors are still quantized, deduplicated, and re-evaluated normally by the new
+optimization.
+
+## Iterative backtester utilities
+
+`src/tools/iterative_backtester.py` and `iterative_history_plot.py` help replay slices of the backtester (or real fills) interactively so you can inspect order-by-order behaviour. Useful when tuning configs by hand.
+
+```shell
+passivbot tool iterative-backtester configs/your_config.json --auto-run
+passivbot tool iterative-backtester configs/examples/ema_anchor.json --auto-run \
+  --override backtest.start_date=2022-01-01 \
+  --override backtest.end_date=now \
+  --quit-after-run
+passivbot tool iterative-history-plot backtests/.../fills.csv
+```
+
+Iterative sessions use the [shared session naming format](backtesting.md#backtest-results)
+under `backtests/iterative/`. The setup fingerprint describes the initial configuration,
+scoring and loaded data. Individual iterations use `run_000001/`, `run_000002/`, etc.;
+their execution timestamp remains in `analysis.json` rather than another directory component.
+Changing dataset inputs starts a new session with an updated setup fingerprint; numbering restarts
+there, while all earlier session artifacts remain intact. Iteration directories are created
+exclusively to prevent accidental replacement.
+
+## Trailing parameter inspector
+
+`passivbot tool trailing-inspect` explains the effective `trailing_martingale` entry and close
+behavior. It is offline and read-only. Passing only a config path produces an overview for both
+sides across quiet, normal, and high example volatility plus 0%, 50%, and 90% usage of the
+effective exposure limit. Each row shows the threshold and retracement percentages, threshold
+price, nominal reversal-confirmation price, and Rust order-reference price from a readable 100.0
+average-position-price anchor. Use `--price-anchor` to change it.
+
+With a config, the overview labels each side as active or dormant and explains entry cooldown,
+simultaneous versus staged entry ladders, EMA gating, volatility/exposure sensitivity, recursive
+close sizing, and relevant portfolio/PnL risk paths. Without a config, only strategy defaults are
+loaded, so runtime paths are explicitly labeled as unknown. The descriptions are heuristics for
+intuition, not assessments of strategy quality.
+
+Without either a positional config path or `--config`, the command uses the Rust-owned strategy
+defaults. A positional config path or the legacy `--config` form loads canonical
+`bot.<side>.strategy.trailing_martingale` parameters. Individual flags override either source.
+Percent values use config ratios, so `0.01` means 1%.
+
+```shell
+passivbot tool trailing-inspect configs/examples/default_trailing_martingale_long.json
+passivbot tool trailing-inspect configs/examples/default_trailing_martingale_long.json \
+  --side long --price-anchor 250
+
+# Customize the overview grid (values are config ratios, not percentage numbers).
+passivbot tool trailing-inspect configs/examples/default_trailing_martingale_long.json \
+  --exposure-ratios 0,0.25,0.5,0.75,0.95 \
+  --volatility-scenarios quiet:0.001:0.0005,normal:0.005:0.0025,high:0.015:0.0075
+
+# Detailed single-scenario mode remains available.
+passivbot tool trailing-inspect \
+  --symbol COIN --side long \
+  --position-size 150 --position-price 20 \
+  --wallet-exposure 0.6 --effective-wallet-exposure-limit 0.9 \
+  --volatility-ema-1m 0.007 --volatility-ema-1h 0.0033
+
+passivbot tool trailing-inspect configs/examples/default_trailing_martingale_long.json \
+  --side long --position-price 20 \
+  --wallet-exposure 0.6 --effective-wallet-exposure-limit 0.9 \
+  --volatility-ema-1m 0.007 --volatility-ema-1h 0.0033 \
+  --entry-threshold-base-pct 0.02 --json
+```
+
+## Config cleanup and formatting
+
+`passivbot tool clean-config SRC DST` exports a clean config offline. The default `--mode full`
+uses the shared config normalization and schema cleaner: fill missing defaults, normalize supported
+V8 aliases, remove result metrics, helper metadata, unknown static fields and inactive strategy
+subtrees/bounds, then sort keys and write streamlined JSON. It accepts full or lean V8 configs and
+result envelopes containing a `config` object with `bot` and `live` sections. A missing bot side
+stays disabled. The command preserves authored date tokens such as `"now"`, approved/ignored coin
+lists and file references, sparse coin overrides, scenarios, reducers and optimizer runtime pins.
+It does not apply optimizer pins to bot values or flatten referenced override files.
+Relative `override_config_path` values are kept verbatim and resolve relative to the exported
+config's directory. Keep the output beside the input or update those references when relocating it.
+
+Modes:
+
+| Mode | Output |
+| --- | --- |
+| `full` (default) | All canonical sections, including backtest and optimize |
+| `live` | `config_version`, `bot`, `coin_overrides`, `live`, `logging`, `monitor` |
+| `backtest` | Backtest inputs and shared bot/live/logging sections; no optimize or monitor |
+| `optimize` | Optimizer and backtest inputs with shared bot/live/logging sections; no monitor |
+| `format` | Strict JSON formatting only; preserve every value, numeric spelling and duplicate object member |
+
+Cleanup validates selected sections using the shared loader before export; irrelevant sections are
+discarded before normalization. Only `format` accepts arbitrary JSON (including arrays and result
+documents) without requiring a config. Cleanup rejects duplicate object keys instead of silently
+choosing one. Dynamic schema areas such as scenarios and coin patches remain sparse. Full cleanup
+can change values through the same supported normalization/default rules as loading: inspect a new
+output before adopting it. Explicit strategy/HSL migrations remain separate: enabled pre-v8.6 HSL
+requires `migrate-hsl`, and V7 trailing-grid configs require `migrate-config-v7`. Cleanup does not
+authorize strategy migration or remove the need to re-backtest a migrated configuration.
+
+```shell
+# Default full cleanup to a separate file.
+passivbot tool clean-config configs/private/input.json configs/private/clean.json
+
+# Lean live export, preserving strategy and live policy.
+passivbot tool clean-config configs/private/input.json configs/private/live.json --mode live
+
+# Formatting only, without schema/default changes or metadata removal.
+passivbot tool clean-config input.json pretty.json --mode format
+passivbot tool clean-config input.json pretty.json --mode format --sort-keys --max-inline 100
+
+# Explicit in-place replacement (never the default).
+passivbot tool clean-config configs/private/input.json --in-place
+
+# Bulk: depth 1 (default) selects direct .json files; 2 includes one subdirectory level.
+# Keep relative paths and filenames under a separate destination tree.
+passivbot tool clean-config configs/private/raw configs/private/clean --max-depth 2
+passivbot tool clean-config configs/private/raw --in-place --max-depth 3 --mode format
+
+# Read-only preview; --check exits 1 if any source would change, 0 if already clean.
+passivbot tool clean-config configs/private/raw --dry-run --max-depth 2
+passivbot tool clean-config configs/private/raw --check --max-depth 2
+```
+
+`SRC DST` is required unless `--in-place`, `--dry-run` or `--check` is selected. Existing destinations
+are refused unless `--overwrite` is specified; even then a destination cannot alias a source file.
+Directory source/destination trees must be disjoint. Bulk discovery skips symlink files/directories.
+A directly selected source symlink can be cleaned in place, preserving the link and replacing its
+target. Directory depth must be at least 1; `--max_depth` is an alias for `--max-depth`.
+
+Single `.hjson` sources are parsed as HJSON; `--include-hjson` also selects them in bulk. Outputs
+retain their relative names/extensions and contain JSON, which is valid HJSON. Use `--input-format
+hjson` for HJSON stored in a `.json` file or `--input-format json` to force strict JSON. Format mode
+requires strict JSON. `--indent` and `--max-inline` control formatting; cleanup modes always sort
+keys while format mode sorts only with `--sort-keys`.
+
+The complete selected batch is parsed/normalized before any write. Validation failures leave all
+inputs and outputs untouched. Publication is atomic **per file**, preserving permissions and
+ownership of replaced files; new config files are private (owner read/write). A later filesystem
+failure can leave earlier files in a bulk run completed; the batch is not a directory transaction.
+The tool makes no network or authenticated exchange calls and starts no bot.
+
+`streamline-json` retains its existing in-place, recursively selected formatting interface for
+compatibility. Prefer `clean-config --mode format` for explicit output paths and bounded depth.
+The migration tools retain their own reports and explicit semantic choices; all cleanup modes use
+the shared config pipeline rather than adding a second migration implementation.
+
+## Historical data helpers
+
+- `passivbot download` – Pre-warm the v2 OHLCV store using the same config/date/exchange selection as backtesting.
+- `passivbot tool inspect-ohlcvs` – Inspect v2 OHLCV cache metadata and gaps.
+- `passivbot tool pad-historical-daily` – Ensures daily OHLCV shards are present for the downloader when new coins are added.
+- `passivbot tool verify-hlcvs-data` – Validates prepared HLCV datasets and coverage metadata before long optimizations/backtests.
+- `passivbot tool streamline-json` – Normalizes/compacts JSON configs (`passivbot tool streamline-json configs/examples/default_trailing_martingale_long.json`).
+- `passivbot tool cache-integrity-doctor` – Read-only local cache smoke report for missing roots, file counts/sizes, cache-family summaries, report-only warm-cache readiness evidence, v2 candle coverage/gap evidence with interior/boundary gap summaries, fill/HSL metadata evidence, and empty or corrupt JSON/NDJSON/NPY artifacts.
+- `passivbot tool candle-doctor` – Audits legacy `caches/ohlcv/...` shards for corruption, stale index entries, and legacy-format issues; add `--fix` to apply automatic repairs before importing into the v2 store.
+- `passivbot tool migrate-historical-data` – Converts legacy `historical_data/ohlcvs_<exchange>/...` shards into the current `caches/ohlcv/...` layout.
+
+## Crash finder
+
+`passivbot tool crash-finder` builds larger discovery candles from local v2 1m OHLCV data and
+scans them for severe crash and pump windows. The discovery timeframe is parameterized with `--timeframe`
+and defaults to `1h`; `4h` and `12h` are useful alternatives for slower market-wide moves. The
+scanner groups valid source rows once, while retaining their order inside each candle so a low
+before a later high is not misclassified as a crash.
+
+Full scans verify cache chunk checksums and write raw event/cluster CSVs plus
+`backtest.scenarios` suites. Use `--clusters-csv` only to regenerate suites cheaply when event
+discovery does not need to be repeated; this fast path cannot find crashes in newly downloaded
+candles.
+When a sibling `scanned_ranges.csv` is present, suite generation drops coins whose cached data range
+does not overlap the generated scenario date window. A targeted scenario is omitted if no coins
+remain, rather than inheriting the suite's base coin universe.
+
+```shell
+passivbot tool crash-finder \
+  --root caches/ohlcvs \
+  --exchange binance \
+  --exchange bybit \
+  --source-timeframe 1m \
+  --timeframe 1h \
+  --direction both \
+  --threshold -0.10 \
+  --pump-threshold 0.10 \
+  --pre-days 14 \
+  --post-days 60 \
+  --scenario-force-normal adverse \
+  --scenario-merge-overlaps \
+  --write-filtered-suites \
+  --output-dir crash_finder_results/$(date +%F)_crash_scenarios
+
+passivbot tool crash-finder \
+  --clusters-csv crash_finder_results/crash_clusters.csv \
+  --pre-days 14 \
+  --post-days 60 \
+  --scenario-force-normal both \
+  --scenario-merge-overlaps \
+  --write-filtered-suites \
+  --output-dir crash_finder_results/$(date +%F)_crash_scenarios
+```
+
+Useful suite controls:
+
+- `--direction down|up|both` chooses high-to-later-low crashes, low-to-later-high pumps, or both.
+  `--threshold` is the negative crash threshold and `--pump-threshold` is the positive pump
+  threshold, both expressed as log returns.
+- `--scenario-kind market-wide` keeps broad market crashes only.
+- `--scenario-kind coin-focused` keeps non-market-wide crashes, including isolated multi-coin
+  clusters such as a DEXE/M event.
+- `--scenario-kind single-coin` keeps strict one-coin crashes only.
+- `--write-filtered-suites` writes all three filtered suites alongside the main suite.
+- `--scenario-force-normal long|short|both` emits per-coin `forced_mode_* = "normal"` overrides
+  only for idiosyncratic non-market-wide crash coins. Market-wide scenario coins are not forced.
+  If a merged scenario would contain more than two forced coins, the tool splits it into repeated
+  scenario windows with at most two forced coins per scenario.
+- `--scenario-force-normal adverse` forces long normal/short manual for idiosyncratic crashes and
+  long manual/short normal for idiosyncratic pumps. For market-wide events it enables only the
+  adverse portfolio side: long for crashes and short for pumps.
+- `--scenario-merge-overlaps` merges scenarios whose generated date windows overlap, preserving
+  the earliest start, latest end, union of coins, and worst-severity label.
+
+See `docs/ai/runbooks/crash_discovery.md` for the complete discovery, download, generation, and
+validation workflow.
+
+## Fill Events Tooling
+
+`passivbot tool fill-events-dash` launches a Dash UI for inspecting cached fill-event history,
+PnL, symbol-level details, cache health, and CSV export.
+
+```shell
+passivbot tool fill-events-dash --users bybit_01
+```
+
+`passivbot tool fill-events-doctor` audits cached fill-event anomalies and optionally repairs them.
+
+```shell
+passivbot tool fill-events-doctor --exchange bybit --user bybit_01
+passivbot tool fill-events-doctor --exchange bybit --user bybit_01 --repair
+```
+
+## Monitor Tooling
+
+Monitor commands are documented in detail in [monitor.md](monitor.md). The CLI surface is:
+
+- `passivbot tool monitor-relay`
+- `passivbot tool monitor-web`
+- `passivbot tool monitor-tui`
+- `passivbot tool monitor-dev`
+- `passivbot tool live-config-preflight` emits a read-only offline JSON report for one live
+  config, summarizing identity hints, HSL settings, universe counts, forager slots/staleness,
+  cache-related live settings, cache root hints, and config-only cache readiness attention
+  signals without contacting exchanges or scanning local artifacts. Add
+  `--compare BASELINE_CONFIG.json` to include a bounded, read-only diff of risk-relevant
+  HSL, universe, forager, identity, cache-setting, and derived cache-readiness changes
+  between two local configs.
+- `passivbot tool hsl-startup-preview` emits a read-only offline JSON preview for one live
+  config plus optional local monitor events. It reports configured HSL settings and latest
+  scoped HSL observations when present, with expired or degraded captures explicitly
+  labeled stale/unavailable. Current drawdown, cooldown and startup panic-order prediction
+  remain unavailable: a saved observation does not prove current exchange state.
+- HSL performance probes use the current evaluator: see
+  `tests/hsl_live_benchmark.py`, `tests/hsl_backtest_benchmark.py`
+  and `tests/hsl_gpu_benchmark.py`. These deterministic offline probes
+  replace the retired legacy `hsl-replay-benchmark` tool.
+- `passivbot tool live-event-query` validates and queries local structured monitor event
+  segments. It is read-only and does not contact exchanges. Use `--event-type`,
+  `--level`, `--cycle-id`, ID filters, `--symbol`, `--pside`, `--tag`,
+  `--debug-profile`, `--data-eq`, and time-window filters to reconstruct
+  incident slices. Use `--exchange EXCHANGE` and
+  `--user USER` to focus one monitor account and prune unrelated monitor paths before
+  scanning; `--bot-id` remains available for event-envelope bot IDs. Directory scans
+  read `current.ndjson` by default; add `--include-rotated` for complete history
+  queries after monitor event rotation. For repeated recent-window queries over
+  large current monitor segments, `--event-tail-lines N` bounds parsing to the last N rows
+  from each event file; the default `0` keeps full event validation.
+- `passivbot tool live-smoke-report` summarizes local live monitor events and text logs for
+  operator smoke-test evidence. Use `--summary` for bounded event groups and log matches, or
+  `--brief` for top-level counters suitable for repeated VPS smoke loops. Use
+  `--section SECTION` one or more times to emit selected top-level smoke-report
+  sections plus common smoke metadata after the full/summary/brief projection is
+  selected, for example `--brief --section fill_refresh` or
+  `--section repository` for checkout metadata only.
+  Full, summary, and brief output include text-log scan bounds and bounded
+  text-log window counters so time-windowed smoke evidence shows the configured
+  file/tail/match limits plus how many log lines were considered, skipped
+  before/after the window, or dropped by the unparseable-line policy.
+  For repeated recent-window smoke checks over large current monitor segments,
+  `--event-tail-lines N` bounds monitor event parsing to the last N rows from
+  each event file; the default `0` keeps full monitor-event validation. Brief
+  output includes the structured event-window `enabled` flag plus the bounded
+  event-window counters.
+  Startup timing summaries include report-only budget projections from prior local p95
+  phase baselines when enough monitor evidence exists, and the summary/brief projections
+  surface bounded startup timing counters for repeated smoke loops.
+  Existing structured fill-refresh summaries are summarized as
+  `fill_refresh_health` in full/summary output and `fill_refresh` in brief output,
+  including status/error counts and whether a bot had failed refreshes that later
+  recovered inside the report window.
+  Existing structured EMA readiness degradation events are summarized as
+  `ema_readiness_health` in full/summary output and `ema_readiness` in brief output,
+  including latest candidate/unavailable counts and bounded reason/error group evidence.
+  Existing staged execution readiness degradations are summarized as
+  `staged_readiness_health` in full/summary output and `staged_readiness` in brief output,
+  including latest missing/invalid surface counts and bounded completed-candle mismatch evidence.
+  Existing structured execution/order-wave events are summarized as
+  `execution_health` in full/summary output and `execution` in brief output,
+  including create/cancel/confirmation outcome counters and bounded write/confirmation groups.
+  Existing structured cache events are summarized as `cache_health` in
+  full/summary output and `cache` in brief output, including warm-cache reuse,
+  cold-path, cache load, and cache flush counters without exposing raw cache
+  paths or payloads.
+  Existing structured shutdown events are also summarized as `shutdown_events`,
+  so recent Ctrl+C/restart behavior can be inspected from the same smoke output.
+  With `--supervisor-config`, the read-only process section compares configured
+  `passivbot live` commands to the local process table and reports matched, missing,
+  duplicate-command, and extra/orphan-like live processes. This does not prove tmux pane
+  ownership; the fields are command-match diagnostics intended to make stale process leftovers
+  obvious before any restart orchestration. Full, summary, and brief process output also
+  includes bounded current state counts, uninterruptible-sleep count, and CPU, memory, and RSS
+  totals/maxima/reporting counts from the same local process scan. These fields are observational;
+  missing platform fields remain null and do not change the smoke verdict. Shutdown orchestration
+  should follow an explicit
+  escalation ladder as policy only: graceful Ctrl+C/request stop, bounded wait, a second
+  graceful signal when warranted, SIGTERM, then SIGKILL. The smoke report never sends those
+  signals.
+- `passivbot tool live-process-report` runs the same bounded process-table and
+  optional supervisor-config checks without entering the smoke report's monitor-event or
+  text-log paths. It does not access credential stores, contact a network or exchange, control
+  processes, or write files. Use `--samples N --interval-s SECONDS` for bounded persistence and
+  recovery evidence; the existing maxima are enforced. The JSON `safety` object declares this
+  capability boundary, and the command exits nonzero when the process/config verdict has hard
+  failures. Use `--brief` for aggregate-only process/config/resource/state/sampling counters
+  without command, account, path, PID, or per-process rows.
+- `passivbot tool live-incident-bundle` writes a local `.tar.gz` evidence
+  bundle with monitor event reports, problem-event reports, smoke evidence,
+  redacted log excerpts, monitor snapshots, runtime metadata, and optional
+  bounded event segments. The returned report and manifest include a compact
+  smoke execution summary with only aggregate create/cancel/confirmation
+  counters. When invoked from outside the repository with an absolute monitor
+  path, the manifest infers git metadata from the monitor tree when possible.
+  Manifest git status is limited to tracked changes so local untracked configs
+  and monitor artifacts do not dominate the bundle metadata. It is read-only
+  and does not contact exchanges. Use
+  `--performance-report` to embed a bounded `performance_report.json` artifact
+  plus compact manifest summary using the bundle's time, bot/exchange/user,
+  debug-profile, rotated-file, tail-line, and per-bot file bounds. Use
+  `--performance-section SECTION` with `--performance-report` to keep only
+  selected top-level performance sections plus common performance metadata in
+  the embedded artifact and compact manifest summary. When
+  `--restart-smoke-plan` is also used, the same performance section filters are
+  passed into the embedded restart plan's planned failure bundle command. Use
+  `--smoke-section SECTION` one or more times to keep only selected top-level
+  sections from the embedded full `smoke_report.json` plus common smoke
+  metadata, for example `--smoke-section fill_refresh_health`. Use
+  `--restart-smoke-plan` with `--supervisor-config` to include a
+  `restart_smoke_plan.json` dry-run artifact in the bundle; the embedded plan
+  is generated by `live-restart-smoke-plan`, remains non-executing, and carries
+  planned smoke/config-preflight commands for follow-up review. The returned
+  report and manifest include the embedded restart plan's selected smoke and
+  performance sections plus the planned smoke and follow-up bundle command
+  summaries, process-signal safety, and execution-policy summaries as compact
+  provenance. They also include the restart plan's compact warning and issue
+  summaries, so malformed or partial restart plans are visible without
+  extracting `restart_smoke_plan.json`, plus the compact timeout-escalation
+  ladder summary. Its planned smoke command uses the restart planner's bounded
+  scan defaults rather than the incident bundle's event/log scan settings.
+- `passivbot tool live-restart-smoke-plan` emits a read-only dry-run restart
+  plan from a tmuxp-style supervisor config. The planned smoke command defaults
+  to a brief compact smoke command with `--event-tail-lines 2000` and
+  `--max-event-files-per-bot 2`, plus `--max-log-files 8`,
+  `--log-tail-lines 1200`, and `--max-log-matches 20`, for repeated operator
+  loops; use `--event-tail-lines 0`, `--max-event-files-per-bot 0`,
+  `--max-log-files 0`, `--log-tail-lines 0`, or `--max-log-matches 0` in the
+  planner to omit those explicit bounds from the generated smoke command. Use
+  `--summary-smoke-report` for bounded groups or `--full-smoke-report` for the
+  full smoke report. Use `--smoke-section SECTION` one or more times to add
+  focused `live-smoke-report --section` values to the planned smoke command and
+  matching `live-incident-bundle --smoke-section` values to the planned failure
+  evidence bundle. Use `--log-window-unparsed-policy drop` to make both planned
+  commands drop unparseable text-log lines without in-window timestamp context;
+  the default planned policy is `keep`.
+  The planner does not execute the restart, send signals,
+  invoke tmux, run SSH, pull git, start bots, contact exchanges, or load
+  credentials. The plan also includes a bounded `live-incident-bundle` command
+  for failure evidence, reusing the same event/log scan limits and disabling
+  event-segment copying by default. The planned failure bundle includes
+  `--performance-report` and `--restart-smoke-plan`, so the archive carries
+  bounded performance timing/readiness evidence plus the non-executing restart
+  plan that produced it. Use `--performance-section SECTION` one or more times
+  to add matching `live-incident-bundle --performance-section` values to the
+  planned failure bundle command; use `--incident-bundle-output PATH` to choose
+  the planned bundle path. The default planned bundle path is a
+  timestamped `/tmp/passivbot_incident_bundle_restart_smoke_<utc>.tar.gz`
+  path to avoid overwriting prior evidence. The pre-restart readiness phase also
+  includes one deduplicated `live-config-preflight` command for each configured
+  live config path found in the supervisor config, plus a skip count for any
+  configured live command whose config path could not be derived. Use
+  `--target-session-name SESSION` to append the exact local-only
+  `live-restart-target-report` gate to that phase. The planner defaults to
+  three samples five seconds apart; use `--target-samples N` (2-5) and
+  `--target-interval-s SECONDS` (greater than 0, at most 30) to change the
+  bounded stability window.
+  The command is only emitted, never run. Omitting the exact session keeps the
+  plan valid and explicitly marks the stable target gate unconfigured. Use
+  `--summary` when you only need the bot count, phase names, preflight commands,
+  target-preflight verdict requirement, smoke command, and incident-bundle
+  command without every per-bot phase detail.
+- `passivbot tool live-restart-target-report SUPERVISOR_CONFIG --session-name
+  SESSION` performs the local-only exact-target preflight required before any
+  future restart executor may signal a pane. It joins expected supervisor
+  window names with canonical tmux pane IDs and read-only pane metadata plus the
+  existing process/config verdict, proves ownership by requiring the matched bot
+  process PID or PPID to equal the pane PID, and fails on missing, duplicate, or
+  unconfigured panes and mismatched ownership in the exact confirmed session.
+  Other sessions such as `misc` are ignored. The report is bounded and never
+  signals, starts, or controls processes, contacts a network or exchange,
+  accesses credential stores, or writes files. Use `--samples N` with
+  `--interval-s SECONDS` to require the same pane ID, pane PID, matched bot PID,
+  and ownership proof across a bounded pre-action window; any hard-red sample
+  or identity change makes the report fail.
+  The sampled identity also includes an opaque SHA-256 fingerprint of the
+  complete parsed supervisor window/command/config contract, computed from
+  private canonical commands before public report redaction or truncation. The
+  report never emits the command content, and fails closed when the contract is
+  unavailable, malformed, or changes during the pre-action sample window.
+  Each resolved target also classifies whether the matched bot is a child of
+  the pane PID and therefore has a candidate relaunch path through that exact
+  pane after the bot exits. The report exposes the bounded relaunch method,
+  supervisor-config command source, and mandatory post-stop pane recheck, but
+  never emits the configured command or assumes the pane is ready before that
+  recheck. Direct pane-process targets remain valid ownership matches but are
+  explicitly relaunch-unready. The executor requires
+  `relaunch_ready_targets == resolved_targets` in addition to the hard-green
+  stable sampling verdict.
+- `passivbot tool live-restart-executor SUPERVISOR_CONFIG --session-name
+  SESSION --expected-repository-head COMMIT
+  --expected-rust-source-fingerprint SHA256
+  --expected-supervisor-fingerprint SHA256 --execute` gracefully
+  restarts only the exact local tmux targets proven by the same bounded target
+  contract. Before target sampling it requires the exact caller-confirmed
+  40-character Git commit, zero tracked changes while preserving untracked
+  artifacts, the expected fingerprint recorded by the repository-owned Rust
+  build verification, and a loaded Rust extension whose source stamp exactly
+  matches that fingerprint and the checked-out Rust build inputs. This explicit
+  fingerprint matters because the build inputs include the host-local ignored
+  `Cargo.lock`, so identical Git heads need not produce the same fingerprint.
+  Each runtime check rehashes those inputs after extension verification so an
+  ignored input cannot change inside the check unnoticed. It repeats that
+  runtime contract immediately before the first signal and before relaunch. It
+  also requires the caller-confirmed
+  full-command fingerprint, takes an immediate action snapshot, and sends one
+  Ctrl-C round to exact pane IDs. After a bounded exact-PID exit wait, it scans
+  for unexpected or duplicate live processes, verifies the complete session
+  pane set, parent PIDs, window identities, and shell-ready exited panes, then
+  immediately re-reads the runtime contract, private supervisor snapshot, and
+  process set before typing commands only into eligible panes. Final startup
+  and multi-sample target verification must retain the same fingerprint.
+  The executor does not SSH, pull code, contact exchanges directly, write files
+  directly, use broad process-pattern signals, or apply SIGTERM/SIGKILL. A
+  timeout or changed runtime/process/pane contract is reported as manual
+  recovery; targets that did exit may be relaunched only when every post-stop
+  check is still exact. The relaunched live bots resume their configured
+  exchange access and normal runtime file writes. Run the read-only target
+  report first, retain the Rust fingerprint from build verification, and pass
+  both exact fingerprints; command content is never emitted.
+- `passivbot tool live-repository-prepare --expected-current-head COMMIT
+  --expected-target-head COMMIT --expected-rust-source-fingerprint SHA256
+  --execute` prepares the local canonical checkout before target sampling or
+  restart execution. It runs only on tracked-clean `master` with no merge,
+  rebase, cherry-pick, revert, or bisect in progress; requires `origin` to be
+  the pinned public canonical HTTPS repository; fetches only `origin/master`;
+  requires the fetched commit to equal the caller-confirmed
+  target and descend from the caller-confirmed current head; and moves the
+  checkout only with a hook-disabled `git merge --ff-only`. It preserves
+  untracked files and
+  emits no remote URL, path, Git stderr, build output, or command content.
+  After the fast-forward it starts a fresh bounded Python child that rejects an
+  unexpected Rust source fingerprint before compiling, rebuilds only when the
+  repository helper reports the extension stale, and verifies the loaded
+  extension stamp plus a final source rehash. A build timeout targets only that
+  child process group. The tool does not SSH, access credentials or exchanges,
+  signal/start live bots, use force checkout/reset, or perform rollback. If
+  Rust preparation fails after a valid fast-forward, the report leaves the
+  checkout at the reviewed target but marks it not restart-ready; rerun after
+  correcting the build contract before invoking `live-restart-executor`.
+- `passivbot tool live-restart-smoke-evidence TARGET_REPORT_JSON
+  SMOKE_REPORT_JSON --expected-repository-head COMMIT
+  --expected-supervisor-fingerprint SHA256 --expected-targets N` evaluates two
+  already-generated full JSON reports against one bounded post-restart evidence
+  contract. It requires stable multi-sample exact targets, the caller-confirmed
+  private supervisor fingerprint, a clean exact repository head, bounded
+  monitor and text-log windows with no hard evidence, complete shutdown event
+  counts, and distinct startup timing coverage for the expected targets. The
+  event and text-log bounds are compared as exact validated epoch-millisecond
+  values and projected without count clamping. Both retained hard log matches
+  and contextless hard-looking matches suppressed by the opt-in drop policy
+  must be well-formed zeroes.
+  result is bounded and sanitized: it does not copy paths, commands, bot names,
+  symbols, log samples, or arbitrary input payloads. The command only reads the
+  two named local files; it does not run report producers, SSH, signal or start
+  processes, contact a network or exchange, load credentials, or write files.
+  Use `--compact` for single-line JSON. Exit status is zero only when every hard
+  gate passes; non-hard attention evidence remains visible without making the
+  verdict red.
+- `passivbot tool live-restart-smoke-collect SUPERVISOR_CONFIG MONITOR_ROOT
+  --session-name SESSION --expected-repository-head COMMIT
+  --expected-supervisor-fingerprint SHA256 --expected-targets N --since-ms MS
+  --until-ms MS` directly composes the existing exact target sampler, full
+  bounded-window smoke report, and sanitized evidence evaluator in memory. The
+  caller-confirmed head, private fingerprint, target count, and exact window are
+  never derived from the reports being checked. Managed rotated event filenames
+  provide interval boundaries so the
+  collector reads only overlapping segments plus explicit coverage evidence;
+  malformed names, missing predecessor coverage, more than eight selected
+  segments per bot, more than 128 selected segments total, or more than 128 MiB
+  of selected event data fail closed before event content scanning. Its output
+  includes only aggregate selection completeness/count/scan-byte evidence and
+  code-owned issue counts, never segment paths. Process
+  inspection is owned by the target report rather than
+  duplicated in smoke collection, and contextless log rows use the existing
+  drop policy whose dropped hard-looking count must remain zero. The command
+  emits no raw target or smoke report and writes no intermediate file. It may
+  run bounded local `tmux`, `ps`, and `git` inventory reads; it does not SSH,
+  pull/build, contact a network or exchange, access credentials, signal/start
+  processes, or perform force escalation. Use `--compact` for single-line JSON.
+- `passivbot tool live-restart-smoke-run SUPERVISOR_CONFIG MONITOR_ROOT
+  --session-name SESSION --expected-repository-head COMMIT
+  --expected-rust-source-fingerprint SHA256
+  --expected-supervisor-fingerprint SHA256 --expected-targets N --execute`
+  composes the existing exact-pane restart executor and bounded in-memory smoke
+  collector into one local operation. Before any signal it independently
+  requires a complete stable target sample with the exact caller-confirmed
+  target count and private supervisor-command fingerprint; the executor then
+  rechecks the clean repository head, Rust source and loaded-extension stamp,
+  supervisor contract, and exact pane/process identities at its own action
+  boundaries. A green restart must account for every expected target as stop
+  requested, exited, relaunch requested, relaunch succeeded, and stably
+  verified. The orchestrator then waits one bounded observation interval
+  (`--smoke-wait-s`, default 600 seconds, maximum 1,800) and evaluates the exact
+  restart-through-observation epoch-millisecond window. It performs no polling
+  retry loop and no automatic force escalation. A pre-action failure leaves
+  targets untouched; a post-action executor failure reports manual recovery;
+  and a red or unavailable smoke report leaves relaunched bots running while
+  returning `restart_completed_smoke_failed`. Output includes only aggregate
+  restart counts and the existing sanitized collector projection, never target
+  names, pane IDs, process IDs, commands, paths, fingerprints, or raw reports.
+  The tool does not SSH, pull/build, access credentials or exchanges directly,
+  use broad process-pattern signals, or write report files. The configured live
+  bots resume their normal exchange access and runtime file writes after
+  relaunch.
+- `passivbot tool live-performance-report` summarizes local live monitor event timings for
+  operator performance analysis. It is read-only and does not contact exchanges. Use
+  `--recent-minutes` for a time window, `--summary` for a bounded operator projection, and
+  `--bot EXCHANGE/USER`, `--exchange EXCHANGE`, or `--user USER` to focus one account or
+  exchange. Use `--section SECTION` one or more times to emit selected top-level report
+  sections plus common metadata, for example `--summary --section fill_refresh`; use
+  `--section all` for the default full output. The report includes
+  decision-boundary lag groups showing how far after the
+  whole-minute boundary cycles reached start, Rust planning, action planning, writes,
+  confirmations, and completion. It also includes an input-staleness section derived from
+  existing packet, snapshot, EMA, and Rust-call events, covering account packet age at
+  snapshot build plus snapshot/EMA age at the Rust call boundary when those events are present.
+  For `snapshot_to_rust`, the report uses exact event-envelope `cycle_id` matches when
+  available; for legacy/current `snapshot.built` events that only carry a planning snapshot
+  epoch in `data.cycle_id`, it uses the latest preceding snapshot in the same bot/restart scope
+  and exposes exact-vs-latest match counters.
+  Newer `snapshot.built` events also expose bounded surface-age and market-snapshot age
+  summaries, allowing the report to break down stale planning inputs without exposing market
+  prices.
+  The startup-readiness section summarizes latest per-bot startup phase timings and HSL
+  replay state from existing lifecycle/replay events. The `slowest_blockers` section ranks
+  non-diagnostic timing and staleness groups by observed duration so the largest trading-impact
+  delays are visible without scanning every timing group. Base timing groups and their
+  `operation_durations`/`slowest_blockers` projections include one bounded `latest_ids` mapping
+  of report-safe canonical event-envelope IDs when available (excluding per-action IDs),
+  allowing direct correlation with `live-event-query` without exposing free-form payloads.
+  The mapping uses the same legacy snapshot-ID normalization as `live-event-query` and
+  selects the latest sample by stable event position (`ts`, `seq`, path, and line).
+  The `operation_durations` section
+  collates startup, cycle, state-refresh, remote-call, risk activity, cache, decision-boundary,
+  input-staleness, fill-refresh, execution, and shutdown timing groups into one bounded table with operation
+  category, trading-impact, blocking-scope, and timing-kind counters. The `resource_pressure` section
+  summarizes whitelisted process and event-pipeline health fields from existing
+  `health.summary` events, including RSS, memory percent, file descriptors, load average,
+  event queue depth, dropped-event counters, and sink-error counters with count, latest,
+  min, mean, median, p95, and max values without exposing raw account or financial
+  payloads. The `shutdown_latency` section summarizes existing
+  lifecycle shutdown events, including per-stage cumulative elapsed time and final shutdown
+  duration, without copying shutdown error text. The `execution_timing` section derives
+  aggregate exchange-action latency groups from existing order-wave, order create/cancel,
+  and confirmation events with missing/unpaired counters, without exposing raw order payloads.
+  Event-pipeline health also attributes due monitor-retention work to fixed inventory,
+  age-unlink, and byte-cap-unlink totals/maxima with visited, candidate, and successful
+  deletion counts. These fields are diagnostic only and do not change retention policy or
+  report verdicts.
+  The `cache_warmup` section derives bounded warm-cache reuse, cold-path,
+  candle cache load, and candle cache flush summaries from existing cache events without
+  exposing raw cache paths or payloads. The `fill_refresh` section derives bounded
+  fill-cache refresh status, coverage, retry, count, and elapsed summaries from existing
+  `fills.refresh_summary` events without exposing raw error text, debug payloads, fill ids,
+  order ids, account values, or coverage payloads. The `forager_ema_readiness` section derives bounded
+  forager selection, forager feature-unavailable, EMA unavailable, and EMA fallback summaries
+  from existing events without exposing raw EMA error text, top-score payloads, account values,
+  or cache paths.
+
+## Exchange Helpers
+
+`passivbot tool fetch-balance` is a lightweight credential smoke test that loads one user from
+`api-keys.json`, instantiates the matching ccxt exchange, and prints the raw balance payload.
+
+```shell
+passivbot tool fetch-balance --user bybit_01
+```
+
+Ticker probes inspect CCXT ticker support and latency without placing orders:
+
+- `passivbot tool ticker-probe` checks ticker capability behavior for one exchange/user context.
+- `passivbot tool ticker-endpoint-probe` compares CCXT ticker endpoint latency across configured
+  users. When authenticated probes are enabled, its JSON includes an `account_critical_health`
+  summary for the read-only balance, positions, and open-orders endpoints required before live
+  exchange actions. Use `--account-only` for the lower-impact balance/positions/open-orders probe,
+  which still loads markets to resolve an open-orders fallback symbol, or `--skip-my-trades` to
+  omit the fill-history endpoint. When the first-symbol `fetch_my_trades` probe is enabled,
+  `fill_history_health` summarizes that sample's success, latency, trade count, newest timestamp,
+  page count, terminal pagination reason, and shape without emitting raw trade/order ids. The default
+  `--fill-history-pages=1` keeps the low-impact single-call behavior; raising it performs a bounded,
+  explicit pagination sample for coverage diagnostics. `rate_limit_health` estimates request pressure
+  from the calls the probe already made,
+  including public/private/concurrent call counts and CCXT `rateLimit` metadata; it is a planning
+  estimate, not proof of exchange-side rate-limit consumption. `endpoint_latency_health` groups
+  already-recorded endpoint attempts by endpoint, including open-orders fallback attempts and
+  fill-history pages, with success/failure counts and latency summaries. `exchange_surface_health`
+  adds exchange/user-level notes from those same outcomes, such as open-orders symbol fallback,
+  unsupported time sync, fill-history terminal pagination reason, and OHLCV tail shape, without
+  making additional exchange calls. The probe also includes
+  `time_sync_health` from read-only `fetch_time` clock-skew checks when the exchange supports it;
+  use `--skip-time-sync` to omit that call. When OHLCV probing is enabled,
+  `candle_freshness_health` summarizes the existing 1m candle tail results without making
+  additional exchange calls. Keep authenticated runs low-rate when a live bot is using the same
+  account.
+
+## Hyperliquid live probes
+
+These probes were added to investigate live Hyperliquid balance/state quirks, especially HIP-3
+stock perps. They are intended to be reused for future live diagnostics instead of creating new
+one-off scripts.
+
+- `passivbot tool hyperliquid-balance-probe` is read-only. It fetches one wallet balance and prints
+  a normalized summary.
+- `passivbot tool hyperliquid-abstraction-probe` is read-only. It inspects Hyperliquid account
+  abstraction mode and related metadata for one configured user.
+- `passivbot tool hyperliquid-order-margin-probe` is mutating. It places one tiny post-only order,
+  snapshots balance changes, then cancels it.
+- `passivbot tool hyperliquid-position-probe` is mutating. It can open/flatten a tiny position and
+  optionally place resting entry or reduce-only close orders to inspect live state transitions.
+
+The mutating probes require `--yes` and are intended for test wallets or deliberately tiny live
+positions only.
+
+```shell
+passivbot tool hyperliquid-balance-probe --user hyperliquid_01
+passivbot tool hyperliquid-order-margin-probe --user hyperliquid_01 --symbol BTC/USDC:USDC --yes
+passivbot tool hyperliquid-position-probe --user hyperliquid_01 --symbol XYZ-SP500/USDC:USDC --yes
+passivbot tool hyperliquid-position-probe --user hyperliquid_01 --symbol XYZ-SP500/USDC:USDC --flatten-only --yes
+```
+
+Recommended usage:
+
+- Start with `hyperliquid-balance-probe` to confirm the wallet and baseline balance fields.
+- Use `hyperliquid-order-margin-probe` to inspect how a single resting order changes
+  `accountValue`, `withdrawable`, and related fields.
+- Use `hyperliquid-position-probe` only when you need to inspect live position-margin behavior,
+  startup-state handling, or combined position-plus-order effects.
+
+## Repro and diagnostics helpers
+
+`src/repro_harness.py` replays a stored config or Pareto JSON through both the optimizer-evaluation path and the backtest path in one process, then compares the resulting metrics and Rust binary provenance.
+
+```shell
+PYTHONPATH=src python3 src/repro_harness.py optimize_results/.../pareto/<hash>.json --json
+```
+
+`src/tools/capture_optimize_memory.py` samples process-tree RSS, `/dev/shm`, and host memory state while an optimizer run is active.
+
+```shell
+PYTHONPATH=src python3 src/tools/capture_optimize_memory.py --wait --output tmp/optimize_memory.json
+```
+
+`src/analysis_visibility.py` is a reusable helper module for resolving `backtest.visible_metrics` against optimize scoring/limits so analysis views can consistently show only the requested metric surface.
+
+## VPS sync helpers
+
+`sync_tar.py` and `vpssync.sh` provide a simple tar-over-ssh/scp workflow for moving configs, logs, backtests, or optimize results between this repo and a VPS tree.
+
+```shell
+python3 sync_tar.py push optimize_results/2026-... vps3 /root/passivbot/optimize_results --remote-extract
+sh vpssync.sh pull vps3 "logs/20260318*"
+```
+
+The archive helper also supports symmetric `pull` and local `extract` modes, including wildcard remote matches.
+
+## Market-cap based approved coins
+
+`src/tools/generate_mcap_list.py` emits a JSON list of coins filtered by market cap and optionally by exchange availability.
+
+```shell
+passivbot tool generate-mcap-list -n 80 -m 200 -e binance,bybit -o configs/approved_coins_top80.json
+```
+
+## HSL configuration migration
+
+`passivbot tool migrate-hsl input.json output.json` prepares a separate HSL
+configuration without exchange access or deployment. It works with the live-only installation,
+including configs that select the GPU optimizer; migration does not load optimizer or GPU runtimes.
+To replace the input after full validation,
+use `passivbot tool migrate-hsl input.json --in-place --restart-policy long=always`, choosing
+restart policy for each required scope. `--in-place` and an output path are mutually exclusive.
+Replacement is atomic and preserves file ownership and permissions; validation or write failure leaves the
+input unchanged. No backup is created; retain a copy yourself if needed.
+File-backed coin overrides are validated
+and saved inline (including scenario-local patches), so moving the output cannot change their policy.
+Effective optimizer and scenario policies are validated as well as the base config. Explicit restart choices also
+update matching optimizer fixed overrides; retired or unmatched fixed selectors are rejected.
+See the [migration contract](configuration.md#hsl-configuration)
+for explicit restart choices, unified portfolio policy, and compatibility limits.

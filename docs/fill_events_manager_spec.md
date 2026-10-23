@@ -1,0 +1,486 @@
+# Fill Events Manager Specification
+
+**Status:** Historical design reference. The schema and exchange status tables below are not
+current runtime contracts. Use the [maintained fill-events contract](ai/features/fill_events_manager.md)
+for accounting, coverage, recovery, and current code references, and [Tools](tools.md) for diagnostics.
+**Module:** `src/fill_events_manager.py`
+**Goal:** Replace exchange-specific `fetch_pnls` functions with a unified `FillEventsManager`
+
+---
+
+## 1. Overview
+
+The `fill_events_manager.py` module provides a unified interface for fetching, caching, and querying historical fill events across all supported exchanges. It aims to replace the various `fetch_pnls` implementations scattered across `src/exchanges/*.py` with a single, well-tested, and consistent implementation.
+
+### Key Components
+
+| Component | Description |
+|-----------|-------------|
+| `FillEvent` | Canonical dataclass representing a single fill event |
+| `FillEventCache` | JSON-based cache storing fills split by UTC day |
+| `BaseFetcher` | Abstract interface for exchange-specific fetchers |
+| `FillEventsManager` | High-level orchestrator tying fetcher + cache together |
+
+---
+
+## 2. Canonical Fill Event Schema
+
+All fill events are normalized to this schema:
+
+```python
+@dataclass(frozen=True)
+class FillEvent:
+    id: str                    # Unique trade/fill ID from exchange
+    timestamp: int             # Unix timestamp in milliseconds
+    datetime: str              # ISO 8601 datetime string
+    symbol: str                # CCXT-format symbol (e.g., "BTC/USDT:USDT")
+    side: str                  # "buy" or "sell" (lowercase)
+    qty: float                 # Signed quantity (buy=+, sell=-)
+    price: float               # Execution price
+    pnl: float                 # Realized PnL for this fill
+    fees: Optional[Sequence]   # Fee structure (currency, cost)
+    pb_order_type: str         # Passivbot order type (e.g., "entry_grid_normal_long")
+    position_side: str         # "long" or "short" (lowercase)
+    client_order_id: str       # Client order ID (passivbot custom ID)
+    psize: float = 0.0         # Position size after this fill (computed)
+    pprice: float = 0.0        # Position VWAP after this fill (computed)
+    raw: List[Dict] = None      # Original exchange payloads (multiple sources)
+```
+
+> **Note**: The `raw` field is `List[Dict]` because many exchanges require multiple API calls to construct a single FillEvent. For example:
+> - One `fetch_my_trades` call for execution details
+> - One position history call for realized PnL
+> - One `fetch_order` call for clientOrderId
+>
+> Each raw payload should include a `source` key identifying its origin.
+
+### Required Fields
+
+All fields except `psize`, `pprice`, `fees`, and `raw` are required when constructing a `FillEvent`. The dataclass will raise `ValueError` if any required field is missing.
+
+### Sign Conventions
+
+| Field | Long Position | Short Position |
+|-------|---------------|----------------|
+| `qty` | Buy = +, Sell = - | Buy = +, Sell = - |
+| `position_side` | "long" | "short" |
+| `psize` | after fill, long side + signed | after fill, short side - signed |
+| `side` | "buy" opens, "sell" closes | "sell" opens, "buy" closes |
+
+---
+
+## 3. Exchange Fetcher Status
+
+### Implemented Fetchers (in `fill_events_manager.py`)
+
+| Exchange | Fetcher Class | Status | Notes |
+|----------|---------------|--------|-------|
+| Binance | `BinanceFetcher` | Working | Merges income + trades endpoints |
+| Bitget | `BitgetFetcher` | Working | Uses fill history + order detail enrichment |
+| Bybit | `BybitFetcher` | Working | Combines trades + positions history |
+| Hyperliquid | `HyperliquidFetcher` | Working | Uses fetch_my_trades with coalescing |
+| Gate.io | `GateioFetcher` | Working | Uses fetch_closed_orders |
+| KuCoin | `KucoinFetcher` | Working | Trades + positions history, local PnL computation |
+
+### Remaining Legacy Coverage
+
+| Exchange | Current Implementation | Priority | Notes |
+|----------|------------------------|----------|-------|
+| Defx | `exchanges/defx.py:fetch_pnls` | Low | Minimal implementation, TODO for time filters |
+
+---
+
+## 4. Current Test Coverage
+
+**Test files:**
+- `tests/test_fill_events_manager.py`
+- `tests/test_fill_events_hyperliquid_mapping.py`
+- `tests/test_fake_exchange.py`
+
+Current collected coverage for the fill-events stack is **76 tests** across those files.
+
+### Covered Scenarios
+
+| Category | Coverage |
+|----------|----------|
+| FillEvent construction/validation | Yes |
+| FillEventCache round-trip | Yes |
+| BitgetFetcher pagination & enrichment | Yes |
+| BinanceFetcher income/trade merging | Yes |
+| BybitFetcher PnL distribution | Yes |
+| HyperliquidFetcher coalescing | Yes |
+| OKXFetcher pagination/detail-cache behavior | Yes |
+| GateioFetcher normalization | Yes |
+| KucoinFetcher pnl matching helpers | Yes |
+| Manager refresh/refresh_latest/refresh_range | Yes |
+| Gap detection | Yes |
+| Detail cache usage | Yes |
+
+### Not Yet Covered
+
+- Live integration tests
+- Error recovery scenarios
+- Rate limit handling edge cases
+
+---
+
+## 5. Architecture
+
+### Data Flow
+
+```
+Exchange API
+     |
+     v
+[ExchangeFetcher]  -- normalize --> List[Dict]
+     |
+     v
+[FillEventsManager.refresh()]
+     |
+     +-- ensure_qty_signage() --> fix +/- signs
+     +-- FillEvent.from_dict() --> validate & wrap
+     +-- annotate_positions_inplace() --> compute psize/pprice
+     |
+     v
+[FillEventCache]  -- save_days() --> {date}.json files
+     |
+     v
+[Query APIs]  --> get_events(), get_pnl_sum(), etc.
+```
+
+### Cache Structure
+
+```
+caches/fill_events/{exchange}/{user}/
+  2024-12-28.json
+  2024-12-29.json
+  2024-12-30.json
+  ...
+```
+
+Each JSON file contains an array of `FillEvent.to_dict()` payloads for that UTC day.
+
+---
+
+## 6. CLI Usage
+
+The module includes a CLI for manual cache refresh:
+
+```bash
+python src/fill_events_manager.py \
+  --user myaccount \
+  --config configs/myconfig.json \
+  --start 2024-12-01 \
+  --end 2024-12-31 \
+  --log-level debug
+```
+
+---
+
+## 7. Integration Points
+
+### Current Integration
+
+- `src/passivbot.py` uses `FillEventsManager` directly for live fill/PnL tracking, cache loading,
+  doctor runs, and realized-PnL-derived risk inputs.
+- `fill_events_manager.py` still exposes a direct CLI for manual cache refresh/debugging.
+- `passivbot tool fill-events-doctor` provides cache anomaly scanning/repair against persisted
+  fill-event history.
+
+### Planned Integration
+
+- Retire remaining legacy Defx-specific `fetch_pnls` handling if that exchange remains supported.
+- Expand targeted tests around recovery/rate-limit behavior rather than adding a second caching path.
+
+---
+
+## 8. Next Steps
+
+1. Add `DefxFetcher` if Defx support is still intended to be first-class.
+2. Add more targeted tests for retry ceilings, transient exchange failures, and doctor edge cases.
+3. Continue collapsing remaining legacy `fetch_pnls` callers into the manager-backed cache path.
+
+---
+
+## 9. Exchange-Specific Notes
+
+### Binance
+- Income endpoint provides PnL without qty/price
+- Trade endpoint provides qty/price without PnL
+- Must merge by trade ID
+- 7-day pagination windows
+
+### Bitget
+- Requires order detail lookup for `clientOid`
+- Rate limit: ~120 detail calls/minute
+- Concurrent detail fetching (configurable)
+
+### Bybit
+- Trades don't include PnL directly
+- Positions history provides per-order PnL
+- Must distribute PnL proportionally across fills
+
+### Hyperliquid
+- Same-timestamp fills must be coalesced
+- Direction field determines position side
+- `closedPnl` in info object
+
+### Gate.io
+- Uses `fetch_closed_orders` not trades
+- `pnl` and `pnl_margin` fields
+- Offset-based pagination
+
+### KuCoin
+- No direct PnL on trades
+- Must use positions history + local computation
+- Time-window-based pagination (24h chunks)
+
+### OKX
+- PnL in `fillPnl` field of info
+- Position side in `posSide` field
+- Uses `OkxFetcher` in `fill_events_manager.py`
+- Covered by focused OKX fetcher tests in `tests/test_fill_events_manager.py`
+
+### Defx (TODO)
+- Basic `fetch_my_trades` with `pnl` in info
+- Position side inferred from pnl being zero
+
+---
+
+## 10. Design Decisions (Resolved)
+
+### 10.1 Singleton vs Instance-per-Bot
+
+**Decision:** Use **instance-per-bot** approach (non-singleton).
+
+| Aspect | Singleton | Instance-per-Bot |
+|--------|-----------|------------------|
+| Cache coordination | Single cache dir, centralized | Separate cache per user |
+| Rate limiting | Shared client state | Connector/client-owned |
+| Lifecycle | Complex global state | Tied to bot lifecycle |
+| Testing | Harder (global state) | Easier (isolated instances) |
+| Memory | Shared across bots | Slightly more per bot |
+| Corruption risk | Higher (concurrent writes) | Lower (isolated) |
+
+**Rationale:** Instance-per-bot aligns with passivbot's stateless design principles. Rate limiting
+stays with the connector and its exchange client, where every request and endpoint contract is
+visible (see 10.4).
+
+### 10.2 Position Flip Handling
+
+**Decision:** Unpack position flips into **two separate FillEvents** with identical timestamps.
+
+**Example:** Current position is 4@4.15 (long), bot fills sell order of -5, resulting position is -1@4.16 (short).
+
+This single exchange fill becomes two FillEvents:
+```python
+[
+    FillEvent(
+        side="sell", qty=-4, position_side="long",
+        pnl=0.04, timestamp=1234, # Close long
+    ),
+    FillEvent(
+        side="sell", qty=-1, position_side="short",
+        pnl=0.0, timestamp=1234,  # Open short
+    ),
+]
+```
+
+**Rationale:** Clean position accounting, PnL attribution is clear, analysis tools can treat each position side independently.
+
+### 10.3 Raw Field Storage
+
+**Decision:** Yes, store raw payloads. Use `List[Dict]` format.
+
+**Format:**
+```python
+raw = [
+    {"source": "fetch_my_trades", "data": {...}},
+    {"source": "position_history", "data": {...}},
+    {"source": "fetch_order", "data": {...}},
+]
+```
+
+**Rationale:** Essential for debugging exchange integration issues. Cache size cost is acceptable given the value for troubleshooting.
+
+### 10.4 Rate Limit Coordination
+
+**Decision:** Keep rate-limit ownership at the exchange client and the connector code which issues
+the requests.
+
+**Approach:**
+1. CCXT clients use their built-in rate limiter.
+2. Connectors add endpoint-specific spacing, bounded concurrency, and retry backoff where the
+   exchange contract requires them.
+3. A future cross-process coordinator is justified only if every relevant request is routed through
+   it and the shared limit key (IP, account, endpoint, or venue) is known.
+
+**Rationale:** A temp-file coordinator was instantiated by every manager but was never called before
+or after any request. It therefore created filesystem state and an injection seam without providing
+rate-limit protection. Keeping policy at the actual request boundary makes the protection testable
+and avoids a second, disconnected model of exchange limits.
+
+---
+
+## 11. Cache Coverage And Failed Ranges
+
+Fill timestamps are irregular. Time between two fills is therefore not evidence
+of missing history and must not trigger a speculative refetch. Coverage comes
+from successful traversal of the exchange endpoint over the requested interval,
+including a successful response containing no fills.
+
+Only an actual failed bounded fetch creates an unproven range:
+
+```python
+class KnownGap(TypedDict):
+    start_ts: int           # Gap start timestamp (ms)
+    end_ts: int             # Gap end timestamp (ms)
+    retry_count: int        # Diagnostic fetch-attempt count
+    reason: str             # fetch_failed
+    added_at: int           # When gap was first detected
+```
+
+The execution loop owns retry timing. Failed ranges remain retryable under that
+bounded backoff regardless of prior attempt count; the fill manager does not
+create a second terminal retry state. A successful bounded fetch clears the
+range even when it returns no fills. Legacy `confirmed_legitimate` metadata
+remains readable but is no longer produced.
+
+### Gap Metadata Storage
+
+Add `metadata.json` to cache directory:
+```json
+{
+  "last_refresh_ms": 1705400000000,
+  "oldest_event_ts": 1705000000000,
+  "newest_event_ts": 1705399999000,
+  "known_gaps": [
+    {
+      "start_ts": 1705200000000,
+      "end_ts": 1705250000000,
+      "retry_count": 3,
+      "reason": "fetch_failed",
+      "added_at": 1705300000000
+    }
+  ]
+}
+```
+
+---
+
+## 12. Incremental Disk Flushing
+
+### Problem
+
+Initial cache building for 30 days can take 10+ minutes. If interrupted, all progress is lost.
+
+### Solution: Flush Per Completed Day
+
+```python
+async def fetch_and_cache(self, start_ms: int, end_ms: int):
+    current_day = _day_start(start_ms)
+    while current_day < end_ms:
+        day_events = await self._fetch_day(current_day)
+        if day_events:
+            self.cache.save_day(current_day, day_events)  # Atomic write
+            self._update_metadata(current_day)
+        current_day += DAY_MS
+```
+
+### Atomic Write Pattern
+
+1. Write to `{date}.json.tmp`
+2. Rename to `{date}.json` (atomic on most filesystems)
+3. Update `metadata.json`
+
+### Benefits
+
+- No data loss on interruption
+- Restart resumes from last complete day
+- Minimal repeated work
+- Progress visible via day files
+
+---
+
+## 13. Dashboard Tool Enhancements
+
+### Current Features (`src/tools/fill_events_dash.py`)
+
+- Multi-account view
+- Date range filtering
+- Cumulative PnL chart
+- Daily PnL chart
+- Top symbols by PnL
+- Fees breakdown
+- Fill events table
+
+### Planned Enhancements
+
+1. **Candlestick overlay:** Plot fills on price charts
+   - Blue dots for buys, red dots for sells
+   - Optional fetch of candlestick data for selected symbols
+
+2. **Cache health panel:**
+   - Show known gaps with confidence levels
+   - Fetch progress indicator
+   - Retry status for suspicious gaps
+
+3. **Gap visualization:**
+   - Timeline showing coverage periods
+   - Highlight suspicious vs confirmed gaps
+
+4. **Position replay:**
+   - Reconstruct position history from fills
+   - Show psize/pprice over time
+
+5. **Export functionality:**
+   - CSV/JSON export of filtered data
+
+6. **Debugging aids:**
+   - Show raw payloads for selected events
+   - Validate field consistency
+   - Check for duplicate IDs
+
+---
+
+## 14. Exchanges on Hold
+
+| Exchange | Status | Reason |
+|----------|--------|--------|
+| Defx | Paused | Not fully supported yet |
+| Paradex | Pending | Awaiting testing before implementation |
+
+---
+
+## Appendix A: Legacy `fetch_pnls` Locations
+
+| File | Line | Function |
+|------|------|----------|
+| `exchanges/binance.py` | 238 | `fetch_pnls` |
+| `exchanges/bybit.py` | 198, 318 | `fetch_pnls_sub`, `fetch_pnls` |
+| `exchanges/bitget.py` | 300 | `fetch_pnls` |
+| `exchanges/okx.py` | 229 | `fetch_pnls` |
+| `exchanges/hyperliquid.py` | 232 | `fetch_pnls` |
+| `exchanges/gateio.py` | 233 | `fetch_pnls` |
+| `exchanges/kucoin.py` | 408 | `fetch_pnls` |
+| `exchanges/defx.py` | 194 | `fetch_pnls` |
+
+---
+
+## Appendix B: Test Command
+
+```bash
+python -m pytest tests/test_fill_events*.py -v
+```
+
+---
+
+## Changelog
+
+| Date | Change |
+|------|--------|
+| 2026-08-11 | Replaced the unintegrated temp-file rate-limit plan with connector/client ownership |
+| 2025-01-16 | Resolved open questions: singleton, position flip, raw field, rate limiting |
+| 2025-01-16 | Added sections 11-13: Cache self-healing, incremental flushing, dashboard enhancements |
+| 2025-01-16 | Updated `raw` field type from `Dict` to `List[Dict]` |
+| 2025-01-16 | Added section 14: Exchanges on hold (Defx, Paradex) |

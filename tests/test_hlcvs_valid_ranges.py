@@ -1,0 +1,208 @@
+import json
+import logging
+import sys
+import types
+
+import numpy as np
+
+sys.modules.setdefault("passivbot_rust", types.SimpleNamespace())
+
+from backtest import ensure_valid_index_metadata, warn_hlcv_valid_range_coverage
+from warmup_utils import compute_per_coin_warmup_minutes
+
+
+def test_ensure_valid_index_metadata_infers_ranges_for_each_coin():
+    hlcvs = np.full((6, 2, 4), np.nan, dtype=np.float64)
+
+    # coin 0 valid at indices 1..3
+    hlcvs[1:4, 0, 0:3] = [[2.0, 1.0, 1.5], [2.2, 1.1, 1.6], [2.1, 1.05, 1.55]]
+    hlcvs[1:4, 0, 3] = [10.0, 11.0, 12.0]
+
+    # coin 1 valid at indices 0..4 (last index remains NaN)
+    for i in range(5):
+        hlcvs[i, 1, 0:3] = [4.0 + i * 0.1, 3.0 + i * 0.1, 3.5 + i * 0.1]
+        hlcvs[i, 1, 3] = 5.0 + i
+
+    coins = ["coin0", "coin1"]
+    mss = {coin: {} for coin in coins}
+
+    ensure_valid_index_metadata(mss, hlcvs, coins)
+
+    assert mss["coin0"]["first_valid_index"] == 1
+    assert mss["coin0"]["last_valid_index"] == 3
+    assert mss["coin0"].get("warmup_minutes", 0) == 0
+    assert mss["coin0"].get("trade_start_index", 1) == 1
+
+    assert mss["coin1"]["first_valid_index"] == 0
+    assert mss["coin1"]["last_valid_index"] == 4
+    assert mss["coin1"].get("trade_start_index", 0) == 0
+
+
+def test_ensure_valid_index_metadata_preserves_existing_values():
+    hlcvs = np.zeros((3, 1, 4), dtype=np.float64)
+    coins = ["coinX"]
+    mss = {"coinX": {"first_valid_index": 2, "last_valid_index": 2}}
+
+    ensure_valid_index_metadata(mss, hlcvs, coins)
+
+    # values should remain unchanged
+    assert mss["coinX"]["first_valid_index"] == 2
+    assert mss["coinX"]["last_valid_index"] == 2
+    assert mss["coinX"].get("trade_start_index") == 2
+
+
+def test_ensure_valid_index_metadata_handles_all_nan_coin():
+    hlcvs = np.full((5, 1, 4), np.nan, dtype=np.float64)
+    coins = ["coin_nan"]
+    mss = {"coin_nan": {}}
+
+    ensure_valid_index_metadata(mss, hlcvs, coins)
+
+    no_valid_first = mss["coin_nan"]["first_valid_index"]
+    assert no_valid_first == hlcvs.shape[0]
+    assert mss["coin_nan"]["last_valid_index"] == hlcvs.shape[0]
+    assert mss["coin_nan"].get("trade_start_index", no_valid_first) == no_valid_first
+
+
+def test_ensure_valid_index_metadata_applies_warmup_map():
+    hlcvs = np.full((10, 1, 4), np.nan, dtype=np.float64)
+    hlcvs[2:8, 0, 0:3] = 1.0
+    coins = ["coinwarm"]
+    mss = {"coinwarm": {}}
+    ensure_valid_index_metadata(mss, hlcvs, coins, {"coinwarm": 3})
+    assert mss["coinwarm"]["first_valid_index"] == 2
+    assert mss["coinwarm"]["warmup_minutes"] == 3
+    assert mss["coinwarm"]["trade_start_index"] == 5
+
+
+def test_ensure_valid_index_metadata_default_warmup_fallback():
+    hlcvs = np.full((8, 1, 4), np.nan, dtype=np.float64)
+    hlcvs[1:5, 0, 0:3] = 2.0
+    coins = ["fallback"]
+    mss = {"fallback": {}}
+    ensure_valid_index_metadata(mss, hlcvs, coins, {"__default__": 4})
+    assert mss["fallback"]["first_valid_index"] == 1
+    assert mss["fallback"]["warmup_minutes"] == 4
+    assert mss["fallback"]["trade_start_index"] == 4
+
+
+def test_ensure_valid_index_metadata_warmup_map_overrides_cached_warmup():
+    hlcvs = np.zeros((12, 1, 4), dtype=np.float64)
+    coins = ["coinwarm"]
+    mss = {"coinwarm": {"first_valid_index": 2, "last_valid_index": 10, "warmup_minutes": 9}}
+    ensure_valid_index_metadata(mss, hlcvs, coins, {"coinwarm": 3})
+    assert mss["coinwarm"]["warmup_minutes"] == 3
+    assert mss["coinwarm"]["trade_start_index"] == 5
+
+
+def test_warn_hlcv_valid_range_coverage_reports_trailing_gap(caplog):
+    config = {"backtest": {"start_date": "2024-01-01", "end_date": "2024-01-02"}}
+    timestamps = np.array([1704067200000 + i * 60_000 for i in range(1441)], dtype=np.int64)
+    mss = {"TON": {"first_valid_index": 0, "last_valid_index": 1438}}
+
+    caplog.set_level(logging.WARNING)
+    warn_hlcv_valid_range_coverage(config, ["TON"], mss, timestamps)
+
+    assert "TON valid data ends before requested end" in caplog.text
+    assert "missing_minutes=2" in caplog.text
+
+
+def test_warn_hlcv_valid_range_coverage_reports_outside_range(caplog):
+    config = {"backtest": {"start_date": "2024-01-02", "end_date": "2024-01-03"}}
+    timestamps = np.array([1704067200000 + i * 60_000 for i in range(5)], dtype=np.int64)
+    mss = {"OLD": {"first_valid_index": 0, "last_valid_index": 4}}
+
+    caplog.set_level(logging.WARNING)
+    warn_hlcv_valid_range_coverage(config, ["OLD"], mss, timestamps)
+
+    assert "OLD valid data range" in caplog.text
+    assert "entirely outside requested range" in caplog.text
+
+
+def test_compute_per_coin_warmup_minutes_handles_overrides():
+    config = {
+        "live": {"warmup_ratio": 0.1, "max_warmup_minutes": 0.0},
+        "bot": {
+            "long": {"ema_span_0": 50},
+            "short": {},
+        },
+        "coin_overrides": {
+            "ALTC": {
+                "bot": {
+                    "long": {"ema_span_0": 200},
+                }
+            }
+        },
+    }
+    result = compute_per_coin_warmup_minutes(config)
+    assert result["__default__"] == 5
+    assert result["ALTC"] == 20
+
+
+def test_warn_hlcv_valid_range_coverage_reports_interior_loss(caplog):
+    """When interior gaps split a coin's history and the shorter real segment
+    is excluded from the tradable window, the loss must be surfaced."""
+    config = {"backtest": {"start_date": "2024-01-01", "end_date": "2024-01-02"}}
+    timestamps = np.array([1704067200000 + i * 60_000 for i in range(1441)], dtype=np.int64)
+    mss = {
+        "SPLIT": {
+            # Longest contiguous run: 1000 minutes; 340 real minutes excluded.
+            "first_valid_index": 0,
+            "last_valid_index": 999,
+            "coverage_valid_rows": 1340,
+            "coverage_internal_gap_count": 1,
+            "coverage_internal_gap_minutes": 100,
+        }
+    }
+
+    caplog.set_level(logging.WARNING)
+    warn_hlcv_valid_range_coverage(config, ["SPLIT"], mss, timestamps)
+
+    assert "SPLIT: 340 minutes of real data are excluded" in caplog.text
+    assert "interior gaps split the history (1 gap(s), 100 missing minutes)" in caplog.text
+
+
+def test_warn_hlcv_valid_range_coverage_interior_loss_below_threshold_silent(caplog):
+    config = {"backtest": {"start_date": "2024-01-01", "end_date": "2024-01-02"}}
+    timestamps = np.array([1704067200000 + i * 60_000 for i in range(1441)], dtype=np.int64)
+    mss = {
+        "TINY": {
+            "first_valid_index": 0,
+            "last_valid_index": 1440,
+            "coverage_valid_rows": 1441 + 0,  # nothing excluded
+        },
+        "SMALL": {
+            "first_valid_index": 0,
+            "last_valid_index": 1430,
+            "coverage_valid_rows": 1440,  # 9 excluded, below 60-minute threshold
+        },
+    }
+
+    caplog.set_level(logging.WARNING)
+    warn_hlcv_valid_range_coverage(config, ["TINY", "SMALL"], mss, timestamps)
+
+    assert "excluded from the backtest" not in caplog.text
+
+
+def test_warn_hlcv_valid_range_coverage_reports_synthetic_share(caplog):
+    """xyz stock-perps coins get an INFO note with the synthetic-candle share
+    instead of the interior-loss warning (synthetic gaps are tradable there
+    by design; see docs/stock_perps.md)."""
+    config = {"backtest": {"start_date": "2024-01-01", "end_date": "2024-01-02"}}
+    timestamps = np.array([1704067200000 + i * 60_000 for i in range(1441)], dtype=np.int64)
+    mss = {
+        "xyz:TSLA": {
+            "first_valid_index": 0,
+            "last_valid_index": 1440,
+            "coverage_valid_rows": 400,
+            "synthetic_gap_fill_count": 1041,
+            "synthetic_gap_fill_tradable": True,
+        }
+    }
+
+    caplog.set_level(logging.INFO)
+    warn_hlcv_valid_range_coverage(config, ["xyz:TSLA"], mss, timestamps)
+
+    assert "xyz:TSLA: 1041 of 1441 tradable minutes" in caplog.text
+    assert "synthetic flat" in caplog.text
+    assert "excluded from the backtest" not in caplog.text

@@ -1,0 +1,106 @@
+# Config Workflow
+
+This is the recommended way to work with Passivbot configs on the current config system.
+
+## Source Of Truth
+
+- The canonical hardcoded defaults live in `src/config/schema.py`.
+- The example config `configs/examples/default_trailing_martingale_long.json` provides the maintained default strategy profile.
+- New configs use top-level `config_version: "v8.6.0"`. Supported v8.0.0–v8.5.0 configs migrate
+  on load; review warnings and the normalized result rather than manually relabeling an old file.
+  Config-schema versions are separate from [package versions and release tags](releases.md).
+  V7 and pre-v8 configs require explicit migration.
+- The legacy `pb_multi` root shape, identified by fields such as `TWE_long`, `TWE_short`, and `universal_live_config`, is not a supported V8 input or migration format. Residual flavor-detection and formatter code is stale internal compatibility code and must not be treated as an end-to-end or live-trading support contract. Start from a canonical V8 config; for a normalized V7 trailing-grid config, use the explicit migration helper below.
+- V7 trailing-grid configs can be converted explicitly with `passivbot tool migrate-config-v7 input_v7.json output_v8_trailing_grid_v7.json`. Clean migrations write deprecated compatibility strategy kind `trailing_grid_v7`; if the report contains manual-review or dropped unsupported fields, the command returns nonzero and does not write output unless `--allow-manual-review-output` is passed. The tool always writes a sibling JSON migration report and validates canonical output before writing the config. Follow [Migrating v7 trailing-grid configs to v8](v7_to_v8_migration.md) for the report, backtest comparison, and review workflow. New optimization work should use the canonical `trailing_martingale` strategy unless you intentionally need v7 behavior.
+- If you run `passivbot live`, `passivbot backtest`, or `passivbot optimize` without a config path, Passivbot starts from the in-code defaults in `src/config/schema.py`.
+
+## Recommended Workflow
+
+1. Copy `configs/examples/default_trailing_martingale_long.json` to a new file under
+   `configs/private/`, which is ignored by Git.
+2. Edit that new file for your account, market universe, and strategy changes.
+3. Use `passivbot backtest` first.
+4. Use `passivbot optimize` if you want to tune parameters or compare alternatives.
+5. Use `passivbot live` only after the config has been tested.
+6. Expect live runs to write a timestamped log file under `logs/` by default unless you set `logging.persist_to_file = false`, and to refresh `logs/{user}.log` as a stable alias to the current run. Without Windows symlink privileges, the stable path is a text pointer which Passivbot's monitor tooling follows automatically.
+
+Example:
+
+```bash
+mkdir -p configs/private
+cp configs/examples/default_trailing_martingale_long.json configs/private/my_config.json
+passivbot backtest configs/private/my_config.json -s BTC -sd 2025 --suite n
+passivbot optimize configs/private/my_config.json -s BTC -sd 2025 -c 4 --suite n
+passivbot live configs/private/my_config.json
+```
+
+## Best Practices
+
+Use `passivbot tool clean-config input.json output.json` to produce a full schema-aligned config,
+or add `--mode live` for a lean live export. Formatting only is available with `--mode format`.
+Inputs stay untouched by default; replacement requires `--in-place`. See
+[Config cleanup and formatting](tools.md#config-cleanup-and-formatting) for bulk depth, HJSON,
+dry-run/check modes and migration boundaries.
+
+- Keep one normal JSON or HJSON config per strategy/account instead of relying on many CLI overrides.
+- Use CLI overrides for temporary experiments, not as your main configuration workflow.
+- Treat `bot`, `live`, `backtest`, and `optimize` as one config file with command-specific sections.
+- Keep shared execution/risk settings in `live`. Backtests inherit `market_orders_allowed`, `market_order_near_touch_threshold`, `pnls_max_lookback_days`, `fee_pct_fallback`, and `fee_pct_sanity_abs_max` directly from `live`; these fields are not accepted under `backtest`.
+- `live.pnls_max_lookback_days` uses one shared contract across live and backtest: `0` = minimal lookback at that path's native sampling resolution, positive numbers = that many rolling days, and `"all"` = full available history.
+- Keep new configs on the canonical schema. Do not author new configs using deprecated field names.
+- Do not paste old flat v7 trailing-grid fields into a v8 config. Run the migration helper so the fields land under `bot.<side>.strategy.trailing_grid_v7`.
+- Use `coin_overrides` for per-coin exceptions instead of cloning whole configs for minor differences.
+- Leave `logging.persist_to_file = true` for normal live operations so each bot run has a durable logfile under `logs/` and Passivbot's monitor tooling can follow the stable `logs/{user}.log` alias or Windows pointer.
+
+## What The Default Profile Is
+
+The default profile mirrored by `configs/examples/default_trailing_martingale_long.json` is:
+
+- trailing martingale style configuration
+- long enabled with `bot.long.risk.n_positions = 7`
+- short disabled with `bot.short.risk.total_wallet_exposure_limit = 0`
+- `bot.long.risk.total_wallet_exposure_limit = 1.5`
+- HSL present in config but disabled with `bot.{long,short}.hsl.enabled = false`
+- HSL signal mode set to per-coin slots with `live.hsl_signal_mode = "coin"`
+- approved-coin universe seeded to the current 41-coin default list
+- optimizer backend defaulting to `pymoo`
+
+## When To Omit A Config Path
+
+Omitting `config_path` is useful for:
+
+- fast smoke tests
+- CLI exploration
+- generating a config mentally from the canonical defaults
+
+It is usually better to pass an explicit config file for normal backtest, optimize, and live workflows, because:
+
+- your exact settings are easier to reproduce
+- diffs are easier to review
+- you avoid depending on future default changes
+
+## Command Examples
+
+Backtest from the canonical default:
+
+```bash
+passivbot backtest -s BTC -sd 2025 --suite n
+```
+
+Optimize from the canonical default:
+
+```bash
+passivbot optimize -s BTC -sd 2025 -c 4 --suite n
+```
+
+Live from an explicit config:
+
+```bash
+passivbot live configs/private/my_config.json
+```
+
+## Related Docs
+
+- [Configuration](configuration.md)
+- [Optimizing](optimizing.md)
+- [Backtesting](backtesting.md)

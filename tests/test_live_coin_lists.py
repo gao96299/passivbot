@@ -1,0 +1,987 @@
+import logging
+
+import pytest
+import passivbot as passivbot_module
+
+from live.event_bus import EventTypes, ListEventSink, LiveEventPipeline, ReasonCodes
+from passivbot import Passivbot
+from utils import AmbiguousMarketIdentifier, UnknownMarketIdentifier
+
+
+@pytest.mark.asyncio
+async def test_update_first_timestamps_scopes_discovery_to_live_exchange(monkeypatch):
+    captured = {}
+
+    async def fake_get_first_timestamps(symbols, exchange=None, exchanges=None):
+        captured["symbols"] = list(symbols)
+        captured["exchange"] = exchange
+        captured["exchanges"] = exchanges
+        return {symbol: 1710115200000 for symbol in symbols}
+
+    monkeypatch.setattr(
+        passivbot_module,
+        "get_first_timestamps_unified",
+        fake_get_first_timestamps,
+    )
+    symbol = "EDGE/USDT:USDT"
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "kucoin"
+    bot.approved_coins_minus_ignored_coins = {"long": {symbol}, "short": set()}
+    bot.markets_dict = {symbol: {}}
+    bot.coin_to_symbol = lambda value, verbose=False: value
+
+    await bot.update_first_timestamps()
+
+    assert captured == {
+        "symbols": [symbol],
+        "exchange": "kucoin",
+        "exchanges": None,
+    }
+    assert bot.first_timestamps[symbol] == 1710115200000
+
+
+@pytest.mark.asyncio
+async def test_update_first_timestamps_uses_fake_harness_ohlcv(monkeypatch):
+    async def unexpected_discovery(*_args, **_kwargs):
+        pytest.fail("fake inception must not route through CCXT discovery")
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_ohlcv(self, symbol, timeframe="1m", since=None):
+            self.calls.append((symbol, timeframe, since))
+            return [[1700000000000, 1.0, 1.0, 1.0, 1.0, 1.0]]
+
+    monkeypatch.setattr(
+        passivbot_module,
+        "get_first_timestamps_unified",
+        unexpected_discovery,
+    )
+    symbol = "FAKE/USDT:USDT"
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "fake"
+    bot.cca = FakeClient()
+    bot.approved_coins_minus_ignored_coins = {"long": {symbol}, "short": set()}
+    bot.markets_dict = {symbol: {}}
+    bot.coin_to_symbol = lambda value, verbose=False: value
+
+    await bot.update_first_timestamps()
+
+    assert bot.cca.calls == [(symbol, "1m", 1)]
+    assert bot.first_timestamps[symbol] == 1700000000000
+
+
+def _make_mode_override_bot(auto_gs=True):
+    disapproved_symbol = "DOGE/USDT:USDT"
+    approved_symbol = "BTC/USDT:USDT"
+    bot = Passivbot.__new__(Passivbot)
+    bot.positions = {
+        disapproved_symbol: {
+            "long": {"size": 0.0, "price": 0.0},
+            "short": {"size": 0.0, "price": 0.0},
+        }
+    }
+    bot.open_orders = {}
+    bot.coin_overrides = {}
+    bot.approved_coins_minus_ignored_coins = {
+        "long": {approved_symbol},
+        "short": set(),
+    }
+    bot.ignored_coins = {"long": {disapproved_symbol}, "short": set()}
+    bot.markets_dict = {
+        disapproved_symbol: {"active": True},
+        approved_symbol: {"active": True},
+    }
+    bot.ineligible_symbols = {}
+    bot._runtime_forced_modes = {"long": {}, "short": {}}
+    bot._equity_hard_stop_enabled = lambda pside: False
+    bot.config_get = lambda path, symbol=None: ""
+    bot.is_old_enough = lambda pside, symbol: True
+    bot.PB_mode_stop = {
+        "long": "graceful_stop" if auto_gs else "manual",
+        "short": "graceful_stop" if auto_gs else "manual",
+    }
+    return bot, disapproved_symbol, approved_symbol
+
+
+def test_disapproved_coin_retained_flat_position_gets_graceful_stop_override():
+    bot, disapproved_symbol, approved_symbol = _make_mode_override_bot()
+
+    universe = bot._build_live_symbol_universe()
+    assert disapproved_symbol in universe
+    assert disapproved_symbol not in bot.approved_coins_minus_ignored_coins["long"]
+
+    overrides = bot._build_orchestrator_mode_overrides(universe)
+
+    assert overrides["long"][disapproved_symbol] == "graceful_stop"
+    assert overrides["short"][disapproved_symbol] == "graceful_stop"
+    assert overrides["long"][approved_symbol] is None
+    assert overrides["short"][approved_symbol] == "graceful_stop"
+
+
+@pytest.mark.parametrize(
+    "forced_mode", ["manual", "panic", "graceful_stop", "tp_only"]
+)
+def test_ignored_coin_preserves_entry_blocking_forced_modes(forced_mode):
+    bot, disapproved_symbol, _approved_symbol = _make_mode_override_bot()
+    bot.config_get = (
+        lambda path, symbol=None: forced_mode
+        if path == ["live", "forced_mode_long"] and symbol == disapproved_symbol
+        else ""
+    )
+
+    assert bot._orchestrator_mode_override("long", disapproved_symbol) == forced_mode
+
+
+def test_ignored_coin_overrides_forced_normal_to_graceful_stop():
+    bot, disapproved_symbol, _approved_symbol = _make_mode_override_bot()
+    bot.config_get = (
+        lambda path, symbol=None: "normal"
+        if path == ["live", "forced_mode_long"] and symbol == disapproved_symbol
+        else ""
+    )
+
+    assert (
+        bot._orchestrator_mode_override("long", disapproved_symbol)
+        == "graceful_stop"
+    )
+
+
+def test_disapproved_coin_uses_manual_mode_when_auto_gs_is_disabled():
+    bot, disapproved_symbol, _approved_symbol = _make_mode_override_bot(auto_gs=False)
+
+    assert bot._orchestrator_mode_override("long", disapproved_symbol) == "manual"
+
+
+def test_retained_order_and_position_do_not_expand_forager_eligibility():
+    bot, _disapproved_symbol, approved_symbol = _make_mode_override_bot()
+    retained_order_symbol = "ETH/USDT:USDT"
+    held_symbol = "UNI/USDT:USDT"
+    bot.positions = {
+        held_symbol: {
+            "long": {"size": 1.0, "price": 1.0},
+            "short": {"size": 0.0, "price": 0.0},
+        }
+    }
+    bot.open_orders = {retained_order_symbol: [{"symbol": retained_order_symbol}]}
+    bot.approved_coins_minus_ignored_coins = {
+        "long": {approved_symbol},
+        "short": {approved_symbol},
+    }
+    bot.ignored_coins = {"long": set(), "short": set()}
+    bot.markets_dict.update(
+        {
+            retained_order_symbol: {"active": True},
+            held_symbol: {"active": True},
+        }
+    )
+
+    universe = bot._build_live_symbol_universe()
+    overrides = bot._build_orchestrator_mode_overrides(universe)
+
+    assert universe == [approved_symbol, retained_order_symbol, held_symbol]
+    for pside in ("long", "short"):
+        assert overrides[pside][approved_symbol] is None
+        assert overrides[pside][retained_order_symbol] == "graceful_stop"
+        assert overrides[pside][held_symbol] == "graceful_stop"
+
+
+@pytest.mark.parametrize("eligible_available", [True, False])
+def test_add_to_coins_lists_skips_symbols_not_in_eligible_markets(
+    caplog, eligible_available
+):
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    eligible_symbol = "AAA/USDT:USDT"
+    skipped_symbols = {f"ZZ{index:02d}/USDT:USDT" for index in range(14)}
+    bot.markets_dict = {eligible_symbol: {"swap": True}}
+    bot.eligible_symbols = {eligible_symbol} if eligible_available else set()
+    if not eligible_available:
+        skipped_symbols.add(eligible_symbol)
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    structured = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(structured_sinks=[structured])
+
+    def fake_coin_to_symbol(self, coin, verbose=True):
+        return eligible_symbol if coin == "AAA" else f"{coin}/USDT:USDT"
+
+    bot.coin_to_symbol = fake_coin_to_symbol.__get__(bot, Passivbot)
+
+    with caplog.at_level(logging.INFO):
+        bot.add_to_coins_lists(
+            {
+                "long": ["AAA", *[f"ZZ{index:02d}" for index in range(14)]],
+                "short": [],
+            },
+            "approved_coins",
+            log_psides={"long"},
+        )
+        bot.add_to_coins_lists(
+            {
+                "long": ["AAA", *[f"ZZ{index:02d}" for index in range(14)]],
+                "short": [],
+            },
+            "approved_coins",
+            log_psides={"long"},
+        )
+
+    assert bot.approved_coins["long"] == (
+        {eligible_symbol} if eligible_available else set()
+    )
+    assert bot.approved_coins["short"] == set()
+    warnings = [
+        rec.message for rec in caplog.records if "skipping unsupported markets" in rec.message.lower()
+    ]
+    assert len(warnings) == 1
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.CONFIG_MARKET_COMPATIBILITY
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert event.reason_code == ReasonCodes.CONFIG_MARKET_UNSUPPORTED
+    assert event.status == "degraded"
+    assert event.pside == "long"
+    assert event.data == {
+        "list_kind": "approved_coins",
+        "skipped_count": len(skipped_symbols),
+        "skipped_symbols": sorted(skipped_symbols)[:12],
+        "skipped_symbols_truncated": True,
+        "reason_counts": {ReasonCodes.CONFIG_MARKET_UNSUPPORTED: len(skipped_symbols)},
+        "reason_samples": [
+            {
+                "reason_code": ReasonCodes.CONFIG_MARKET_UNSUPPORTED,
+                "count": len(skipped_symbols),
+                "symbols": sorted(skipped_symbols)[:12],
+                "symbols_truncated": True,
+            }
+        ],
+    }
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_add_to_coins_lists_ignores_market_compatibility_emission_failure(caplog):
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    bot.eligible_symbols = {"AAA/USDT:USDT"}
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    bot.coin_to_symbol = lambda coin, verbose=True: f"{coin}/USDT:USDT"
+
+    def fail_emit(*_args, **_kwargs):
+        raise RuntimeError("event sink unavailable")
+
+    bot._emit_live_event = fail_emit
+
+    with caplog.at_level(logging.INFO):
+        bot.add_to_coins_lists(
+            {"long": ["AAA", "BBB"], "short": []},
+            "approved_coins",
+            log_psides={"long"},
+        )
+
+    assert bot.approved_coins["long"] == {"AAA/USDT:USDT"}
+    assert any(
+        "skipping unsupported markets" in record.message.lower()
+        for record in caplog.records
+    )
+
+    structured = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(structured_sinks=[structured])
+    bot._emit_live_event = Passivbot._emit_live_event.__get__(bot, Passivbot)
+    bot.add_to_coins_lists(
+        {"long": ["AAA", "BBB"], "short": []},
+        "approved_coins",
+        log_psides={"long"},
+    )
+
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.CONFIG_MARKET_COMPATIBILITY
+    ]
+    assert len(events) == 1
+    assert len(
+        [
+            record
+            for record in caplog.records
+            if "skipping unsupported markets" in record.message.lower()
+        ]
+    ) == 1
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_add_to_coins_lists_market_compatibility_preserves_pside_provenance():
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    bot.eligible_symbols = {"AAA/USDT:USDT"}
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    structured = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(structured_sinks=[structured])
+    bot.coin_to_symbol = lambda coin, verbose=True: f"{coin}/USDT:USDT"
+
+    bot.add_to_coins_lists(
+        {"long": ["BBB"], "short": ["CCC"]},
+        "approved_coins",
+        log_psides={"long", "short"},
+    )
+
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.CONFIG_MARKET_COMPATIBILITY
+    ]
+    assert len(events) == 2
+    assert {event.pside for event in events} == {"long", "short"}
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_add_to_coins_lists_equal_sides_emit_queryable_per_side_events(caplog):
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    bot.eligible_symbols = {"AAA/USDT:USDT"}
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    structured = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(structured_sinks=[structured])
+    bot.coin_to_symbol = lambda coin, verbose=True: f"{coin}/USDT:USDT"
+
+    with caplog.at_level(logging.INFO):
+        bot.add_to_coins_lists(
+            {"long": ["BBB"], "short": ["BBB"]},
+            "approved_coins",
+            log_psides={"long", "short"},
+        )
+
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.CONFIG_MARKET_COMPATIBILITY
+    ]
+    assert len(events) == 2
+    assert {event.pside for event in events} == {"long", "short"}
+    assert len(
+        [
+            record
+            for record in caplog.records
+            if "skipping unsupported markets" in record.message.lower()
+        ]
+    ) == 1
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_add_to_coins_lists_market_compatibility_sanitizes_durable_symbols():
+    long_coin = "X" * 10_000
+    secret_coin = "api_key=secret"
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    bot.eligible_symbols = {"AAA/USDT:USDT"}
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    structured = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(structured_sinks=[structured])
+    bot.coin_to_symbol = lambda coin, verbose=True: f"{coin}/USDT:USDT"
+
+    bot.add_to_coins_lists(
+        {"long": [long_coin, secret_coin], "short": []},
+        "approved_coins",
+        log_psides={"long"},
+    )
+
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    event = next(
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.CONFIG_MARKET_COMPATIBILITY
+    )
+    rendered = str(event.data)
+    assert "secret" not in rendered
+    assert "[redacted]" in rendered
+    assert all(len(symbol) <= 175 for symbol in event.data["skipped_symbols"])
+    assert all(
+        len(symbol) <= 175
+        for sample in event.data["reason_samples"]
+        for symbol in sample["symbols"]
+    )
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_add_to_coins_lists_unsupported_ignored_market_is_not_degraded():
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    bot.eligible_symbols = {"AAA/USDT:USDT"}
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    structured = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(structured_sinks=[structured])
+    bot.coin_to_symbol = lambda coin, verbose=True: f"{coin}/USDT:USDT"
+
+    bot.add_to_coins_lists(
+        {"long": ["BBB"], "short": []},
+        "ignored_coins",
+        log_psides={"long"},
+    )
+
+    assert bot.ignored_coins["long"] == set()
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.CONFIG_MARKET_COMPATIBILITY
+    ]
+    assert len(events) == 1
+    assert events[0].status == "skipped"
+    assert events[0].pside == "long"
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+@pytest.mark.parametrize(
+    ("exchange", "expected_reason"),
+    [
+        ("bitget", ReasonCodes.CONFIG_STOCK_PERP_WRONG_EXCHANGE),
+        ("hyperliquid", ReasonCodes.CONFIG_STOCK_PERP_UNAVAILABLE_MARKET),
+    ],
+)
+def test_add_to_coins_lists_classifies_skipped_stock_perps(exchange, expected_reason):
+    stock_symbol = "xyz:TSLA/USDC:USDC"
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = exchange
+    bot.eligible_symbols = {"BTC/USDT:USDT"}
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    structured = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(structured_sinks=[structured])
+    bot.coin_to_symbol = lambda coin, verbose=True: stock_symbol
+
+    bot.add_to_coins_lists(
+        {"long": ["xyz:TSLA"], "short": []},
+        "approved_coins",
+        log_psides={"long"},
+    )
+
+    assert bot.approved_coins["long"] == set()
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.CONFIG_MARKET_COMPATIBILITY
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert event.reason_code == expected_reason
+    assert event.data["reason_counts"] == {expected_reason: 1}
+    assert event.data["reason_samples"] == [
+        {
+            "reason_code": expected_reason,
+            "count": 1,
+            "symbols": [stock_symbol],
+            "symbols_truncated": False,
+        }
+    ]
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_refresh_approved_ignored_coin_lists_supports_explicit_all_per_side():
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    bot.eligible_symbols = {"AAA/USDT:USDT", "BBB/USDT:USDT"}
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+    bot._disabled_psides_logged = set()
+    bot._unsupported_coin_warnings = set()
+    bot.config = {
+        "_coins_sources": {
+            "approved_coins": {"long": ["AAA"], "short": "all"},
+            "ignored_coins": {"long": [], "short": []},
+        },
+        "live": {},
+    }
+
+    def fake_coin_to_symbol(self, coin, verbose=True):
+        mapping = {"AAA": "AAA/USDT:USDT", "BBB": "BBB/USDT:USDT"}
+        return mapping.get(coin, f"{coin}/USDT:USDT")
+
+    bot.coin_to_symbol = fake_coin_to_symbol.__get__(bot, Passivbot)
+    bot.is_pside_enabled = lambda pside: True
+    bot.live_value = lambda key: bot.config["live"][key]
+    bot._filter_approved_symbols = lambda pside, symbols: symbols
+
+    bot.refresh_approved_ignored_coins_lists()
+
+    assert bot.approved_coins["long"] == {"AAA/USDT:USDT"}
+    assert bot.approved_coins["short"] == {"AAA/USDT:USDT", "BBB/USDT:USDT"}
+    assert bot.approved_coins_minus_ignored_coins["short"] == {"AAA/USDT:USDT", "BBB/USDT:USDT"}
+
+
+def test_refresh_approved_ignored_coin_lists_supports_migrated_global_all():
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    bot.eligible_symbols = {"AAA/USDT:USDT", "BBB/USDT:USDT"}
+    bot.approved_coins = {"long": set(), "short": set()}
+    bot.ignored_coins = {"long": set(), "short": set()}
+    bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+    bot._disabled_psides_logged = set()
+    bot._unsupported_coin_warnings = set()
+    bot.config = {
+        "_coins_sources": {
+            "approved_coins": "all",
+            "ignored_coins": {"long": [], "short": []},
+        },
+        "live": {},
+    }
+
+    def fake_coin_to_symbol(self, coin, verbose=True):
+        mapping = {"AAA": "AAA/USDT:USDT", "BBB": "BBB/USDT:USDT"}
+        return mapping.get(coin, f"{coin}/USDT:USDT")
+
+    bot.coin_to_symbol = fake_coin_to_symbol.__get__(bot, Passivbot)
+    bot.is_pside_enabled = lambda pside: True
+    bot.live_value = lambda key: bot.config["live"][key]
+    bot._filter_approved_symbols = lambda pside, symbols: symbols
+
+    bot.refresh_approved_ignored_coins_lists()
+
+    assert bot.approved_coins["long"] == {"AAA/USDT:USDT", "BBB/USDT:USDT"}
+    assert bot.approved_coins["short"] == {"AAA/USDT:USDT", "BBB/USDT:USDT"}
+
+
+@pytest.mark.parametrize(
+    "error_cls", [AmbiguousMarketIdentifier, UnknownMarketIdentifier]
+)
+def test_refresh_market_resolution_error_skips_affected_identifier(
+    error_cls, caplog
+):
+    bot = _make_eligibility_event_bot()
+    bot.approved_coins_minus_ignored_coins = {
+        "long": {"STALE/USDT:USDT"},
+        "short": {"STALE/USDT:USDT"},
+    }
+
+    def fail_closed(_coin, verbose=True):
+        raise error_cls("unresolvable test market")
+
+    bot.coin_to_symbol = fail_closed
+
+    with caplog.at_level(logging.ERROR):
+        bot.refresh_approved_ignored_coins_lists()
+
+    assert bot.approved_coins == {"long": set(), "short": set()}
+    assert bot.approved_coins_minus_ignored_coins == {
+        "long": set(),
+        "short": set(),
+    }
+    assert any(
+        "action=skip_identifier" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_refresh_market_resolution_error_retains_other_valid_markets(caplog):
+    bot = _make_eligibility_event_bot()
+    bot.config["_coins_sources"]["approved_coins"] = {
+        "long": ["BTC", "OLDUSDT"],
+        "short": ["BTC", "OLDUSDT"],
+    }
+    bot.config["_coins_sources"]["ignored_coins"] = {"long": [], "short": []}
+    bot.eligible_symbols.add("BTC/USDT:USDT")
+
+    def resolve(coin, verbose=True):
+        if coin == "BTC":
+            return "BTC/USDT:USDT"
+        raise UnknownMarketIdentifier("unresolvable test market")
+
+    bot.coin_to_symbol = resolve
+
+    with caplog.at_level(logging.ERROR):
+        bot.refresh_approved_ignored_coins_lists()
+
+    assert bot.approved_coins == {
+        "long": {"BTC/USDT:USDT"},
+        "short": {"BTC/USDT:USDT"},
+    }
+    assert bot.approved_coins_minus_ignored_coins == bot.approved_coins
+    assert any(
+        "action=skip_identifier" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_refresh_ignored_resolution_error_retains_prior_restriction(caplog):
+    bot = _make_eligibility_event_bot()
+    bot.config["_coins_sources"]["approved_coins"] = {
+        "long": ["BTC", "ETH"],
+        "short": ["BTC", "ETH"],
+    }
+    bot.config["_coins_sources"]["ignored_coins"] = {
+        "long": ["OLDUSDT"],
+        "short": ["OLDUSDT"],
+    }
+    bot.eligible_symbols.update({"BTC/USDT:USDT", "ETH/USDT:USDT"})
+    bot.ignored_coins = {
+        "long": {"BTC/USDT:USDT"},
+        "short": {"ETH/USDT:USDT"},
+    }
+    bot._coin_list_identifier_symbols = {
+        "ignored_coins": {
+            "long": {"OLDUSDT": "BTC/USDT:USDT"},
+            "short": {"OLDUSDT": "ETH/USDT:USDT"},
+        }
+    }
+
+    def resolve(coin, verbose=True):
+        if coin in {"BTC", "ETH"}:
+            return f"{coin}/USDT:USDT"
+        raise AmbiguousMarketIdentifier("ambiguous ignored test market")
+
+    bot.coin_to_symbol = resolve
+
+    with caplog.at_level(logging.ERROR):
+        bot.refresh_approved_ignored_coins_lists()
+
+    assert bot.ignored_coins == {
+        "long": {"BTC/USDT:USDT"},
+        "short": {"ETH/USDT:USDT"},
+    }
+    assert bot.approved_coins_minus_ignored_coins == {
+        "long": {"ETH/USDT:USDT"},
+        "short": {"BTC/USDT:USDT"},
+    }
+    assert any(
+        "list_kind=ignored_coins" in record.getMessage()
+        and "action=skip_identifier" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_refresh_ignored_resolution_error_does_not_restore_unrelated_removals(caplog):
+    bot = _make_eligibility_event_bot()
+    bot.config["_coins_sources"]["approved_coins"] = {
+        "long": ["BTC", "DOGE", "ETH"],
+        "short": ["BTC", "DOGE", "ETH"],
+    }
+    bot.config["_coins_sources"]["ignored_coins"] = {
+        "long": ["ETH", "DOGE"],
+        "short": ["ETH", "DOGE"],
+    }
+    bot.eligible_symbols.update(
+        {"BTC/USDT:USDT", "DOGE/USDT:USDT", "ETH/USDT:USDT"}
+    )
+    bot.ignored_coins = {
+        "long": {"BTC/USDT:USDT", "DOGE/USDT:USDT"},
+        "short": {"BTC/USDT:USDT", "DOGE/USDT:USDT"},
+    }
+    bot._coin_list_identifier_symbols = {
+        "ignored_coins": {
+            "long": {
+                "BTC": "BTC/USDT:USDT",
+                "DOGE": "DOGE/USDT:USDT",
+            },
+            "short": {
+                "BTC": "BTC/USDT:USDT",
+                "DOGE": "DOGE/USDT:USDT",
+            },
+        }
+    }
+
+    def resolve(coin, verbose=True):
+        if coin == "DOGE":
+            raise AmbiguousMarketIdentifier("ambiguous ignored test market")
+        return f"{coin}/USDT:USDT"
+
+    bot.coin_to_symbol = resolve
+
+    with caplog.at_level(logging.ERROR):
+        bot.refresh_approved_ignored_coins_lists()
+
+    expected = {"DOGE/USDT:USDT", "ETH/USDT:USDT"}
+    assert bot.ignored_coins == {"long": expected, "short": expected}
+    assert "BTC/USDT:USDT" not in bot.ignored_coins["long"]
+
+
+def _make_eligibility_event_bot():
+    bot = Passivbot.__new__(Passivbot)
+    bot.exchange = "bitget"
+    bot.user = "bitget_01"
+    bot.bot_id = "bot_1"
+    bot.eligible_symbols = {
+        f"A{index:02d}/USDT:USDT" for index in range(14)
+    } | {"SHORT/USDT:USDT", "IGNORED/USDT:USDT"}
+    bot.approved_coins = {
+        "long": {"OLD/USDT:USDT"},
+        "short": {"OLD_SHORT/USDT:USDT"},
+    }
+    bot.ignored_coins = {
+        "long": {"OLD_IGNORED/USDT:USDT"},
+        "short": set(),
+    }
+    bot.approved_coins_minus_ignored_coins = {"long": set(), "short": set()}
+    bot._disabled_psides_logged = set()
+    bot._unsupported_coin_warnings = set()
+    bot._last_coin_symbol_warning_counts = {
+        "symbol_to_coin_fallbacks": 0,
+        "coin_to_symbol_fallbacks": 0,
+    }
+    bot.config = {
+        "_coins_sources": {
+            "approved_coins": {
+                "long": [f"A{index:02d}" for index in range(14)],
+                "short": ["SHORT"],
+            },
+            "ignored_coins": {"long": ["IGNORED"], "short": []},
+        },
+        "live": {},
+    }
+    bot.coin_to_symbol = lambda coin, verbose=True: f"{coin}/USDT:USDT"
+    bot.is_pside_enabled = lambda _pside: True
+    bot.live_value = lambda key: bot.config["live"][key]
+    bot._filter_approved_symbols = lambda _pside, symbols: symbols
+    return bot
+
+
+def test_refresh_approved_ignored_coin_lists_emits_bounded_aggregate_events(caplog):
+    bot = _make_eligibility_event_bot()
+    structured = ListEventSink()
+    monitor = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(
+        structured_sinks=[structured], monitor_sinks=[monitor]
+    )
+
+    with caplog.at_level(logging.INFO):
+        bot.refresh_approved_ignored_coins_lists()
+
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.FORAGER_ELIGIBILITY_CHANGED
+    ]
+    assert len(events) == 4
+    assert monitor.events == events
+    assert all(
+        event.reason_code == ReasonCodes.FORAGER_ELIGIBILITY_MEMBERSHIP_CHANGED
+        for event in events
+    )
+    assert all(
+        set(event.data) == {"source", "list_kind", "operation", "changes"}
+        for event in events
+    )
+    assert all(event.data["source"] == "config_sources" for event in events)
+
+    approved_added = next(
+        event
+        for event in events
+        if event.data["list_kind"] == "approved_coins"
+        and event.data["operation"] == "added"
+    )
+    assert approved_added.data["changes"] == [
+        {
+            "pside": "long",
+            "count": 14,
+            "symbols": [f"A{index:02d}/USDT:USDT" for index in range(12)],
+        },
+        {"pside": "short", "count": 1, "symbols": ["SHORT/USDT:USDT"]},
+    ]
+    assert all(
+        change["symbols"] == sorted(change["symbols"])
+        and len(change["symbols"]) <= 12
+        for event in events
+        for change in event.data["changes"]
+    )
+    fallback_messages = [
+        record.message for record in caplog.records if record.message.startswith("[forager]")
+    ]
+    assert len(fallback_messages) == 4
+    assert all(len(message) <= 240 for message in fallback_messages)
+    assert all("omitted=" in message for message in fallback_messages)
+    assert all("A03" not in message for message in fallback_messages)
+
+    bot.refresh_approved_ignored_coins_lists()
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    assert len(
+        [
+            event
+            for event in structured.events
+            if event.event_type == EventTypes.FORAGER_ELIGIBILITY_CHANGED
+        ]
+    ) == 4
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_refresh_approved_ignored_coin_lists_labels_live_value_source():
+    bot = _make_eligibility_event_bot()
+    bot.config = {
+        "_coins_sources": {},
+        "live": {
+            "approved_coins": {
+                "long": [f"A{index:02d}" for index in range(14)],
+                "short": ["SHORT"],
+            },
+            "ignored_coins": {"long": ["IGNORED"], "short": []},
+        },
+    }
+    structured = ListEventSink()
+    bot._live_event_pipeline = LiveEventPipeline(structured_sinks=[structured])
+
+    bot.refresh_approved_ignored_coins_lists()
+
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.FORAGER_ELIGIBILITY_CHANGED
+    ]
+    assert len(events) == 4
+    assert all(event.data["source"] == "live_value" for event in events)
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_refresh_approved_ignored_coin_lists_ignores_event_emission_failure(caplog):
+    bot = _make_eligibility_event_bot()
+
+    def fail_emit(*_args, **_kwargs):
+        raise RuntimeError("event sink unavailable")
+
+    bot._emit_live_event = fail_emit
+
+    with caplog.at_level(logging.INFO):
+        bot.refresh_approved_ignored_coins_lists()
+
+    assert bot.approved_coins["long"] == {
+        f"A{index:02d}/USDT:USDT" for index in range(14)
+    }
+    assert bot.approved_coins["short"] == {"SHORT/USDT:USDT"}
+    assert bot.ignored_coins == {"long": {"IGNORED/USDT:USDT"}, "short": set()}
+    fallback_messages = [
+        record.message for record in caplog.records if record.message.startswith("[forager]")
+    ]
+    assert len(fallback_messages) == 4
+    assert all(len(message) <= 240 for message in fallback_messages)
+
+
+def test_refresh_approved_ignored_coin_lists_structured_console_owns_normal_output(caplog):
+    bot = _make_eligibility_event_bot()
+    structured = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    bot.live_event_console_enabled = True
+    bot._live_event_pipeline = LiveEventPipeline(
+        structured_sinks=[structured], console_sink=console, text_sink=text
+    )
+
+    with caplog.at_level(logging.INFO):
+        bot.refresh_approved_ignored_coins_lists()
+
+    assert bot._live_event_pipeline.flush(timeout=2.0) is True
+    events = [
+        event
+        for event in structured.events
+        if event.event_type == EventTypes.FORAGER_ELIGIBILITY_CHANGED
+    ]
+    assert len(events) == 4
+    assert console.events == events
+    assert text.events == events
+    assert not [
+        record for record in caplog.records if record.message.startswith("[forager]")
+    ]
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_refresh_approved_ignored_coin_lists_does_not_restore_legacy_output_on_event_failure(
+    caplog,
+):
+    bot = _make_eligibility_event_bot()
+    bot.live_event_console_enabled = True
+    bot._live_event_pipeline = LiveEventPipeline(console_sink=ListEventSink())
+
+    def fail_emit(*_args, **_kwargs):
+        raise RuntimeError("event sink unavailable")
+
+    bot._emit_live_event = fail_emit
+
+    with caplog.at_level(logging.INFO):
+        bot.refresh_approved_ignored_coins_lists()
+
+    assert bot.approved_coins["long"] == {
+        f"A{index:02d}/USDT:USDT" for index in range(14)
+    }
+    assert bot.ignored_coins == {"long": {"IGNORED/USDT:USDT"}, "short": set()}
+    assert not [
+        record for record in caplog.records if record.message.startswith("[forager]")
+    ]
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_refresh_approved_ignored_coin_lists_redacts_outer_failure_and_returns(
+    caplog, capsys
+):
+    bot = _make_eligibility_event_bot()
+    filter_calls = []
+    fallback_summary_called = False
+    hostile_error = type(
+        "ApiTokenCredentialsError",
+        (Exception,),
+        {},
+    )(
+        "hostile-message https://coin-list.invalid/refresh?api_key=operator-secret&token=token-123"
+    )
+
+    def fail_filter(pside, symbols):
+        filter_calls.append((pside, set(symbols)))
+        raise hostile_error
+
+    def record_fallback_summary():
+        nonlocal fallback_summary_called
+        fallback_summary_called = True
+
+    bot._filter_approved_symbols = fail_filter
+    bot._log_coin_symbol_fallback_summary = record_fallback_summary
+
+    with caplog.at_level(logging.ERROR):
+        result = bot.refresh_approved_ignored_coins_lists()
+
+    diagnostic = next(
+        record.getMessage()
+        for record in caplog.records
+        if "approved/ignored coin refresh failed" in record.getMessage()
+    )
+    captured = capsys.readouterr()
+    output = "\n".join((caplog.text, captured.out, captured.err))
+
+    assert result is None
+    assert filter_calls == [
+        (
+            "long",
+            {f"A{index:02d}/USDT:USDT" for index in range(14)},
+        )
+    ]
+    assert fallback_summary_called is False
+    assert bot.approved_coins["long"] == {
+        f"A{index:02d}/USDT:USDT" for index in range(14)
+    }
+    assert bot.ignored_coins == {"long": {"IGNORED/USDT:USDT"}, "short": set()}
+    assert bot.approved_coins_minus_ignored_coins == {}
+    assert diagnostic == (
+        "[forager] approved/ignored coin refresh failed | "
+        "error_type=Exception action=return_from_coin_list_refresh"
+    )
+    assert captured.out == ""
+    assert captured.err == ""
+    for unsafe_value in (
+        "hostile-message",
+        "ApiTokenCredentialsError",
+        "https://coin-list.invalid",
+        "api_key",
+        "operator-secret",
+        "token-123",
+        "Traceback",
+    ):
+        assert unsafe_value not in output

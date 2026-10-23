@@ -1,0 +1,107 @@
+# Development And Validation Commands
+
+Use from repo root unless noted.
+
+Commands are grouped by authority tier. Local tests, local fake-live scenarios, and backtests with
+already cached data are offline. Downloads and public probes contact unauthenticated network
+endpoints. Live commands and account probes may use credentials and require explicit approval under
+`AGENTS.md`.
+
+## Setup
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python3 -m pip install -e .              # live-only
+# or: python3 -m pip install -e ".[full]"
+# or: python3 -m pip install -e ".[dev]"
+```
+
+## Tests
+
+```bash
+pytest
+pytest tests/test_specific.py
+pytest tests/test_specific.py::test_name
+```
+
+## Live Bot (Explicit Approval Required)
+
+```bash
+passivbot live -u {account_name}
+passivbot live path/to/config.json --log-level {warning|info|debug|trace|0-3}
+```
+
+Do not use these as smoke-test commands. They may load private keys, configure an account, and
+create or cancel orders.
+
+## Offline Fake-Live Harness
+
+```bash
+PYTHONPATH=src python src/tools/run_fake_live.py \
+  configs/examples/fake_live_hsl.json \
+  scenarios/fake_live/hsl_long_red_restart.hjson \
+  --user fake_hsl_restart_test
+pytest tests/test_run_fake_live.py -m fake_live
+```
+
+The `fake` exchange uses only local scenario state. Do not describe authenticated testnet, demo,
+sandbox, or paper-trading sessions as this offline fake-live tier.
+
+## Backtest
+
+```bash
+passivbot backtest path/to/config.json
+passivbot backtest --suite
+```
+
+## Optimize
+
+```bash
+passivbot optimize path/to/config.json
+passivbot optimize --suite
+passivbot optimize path/to/config.json -t path/to/anchor_configs -ft long.forager,long.risk
+```
+
+When `-ft/--fine-tune-params` and `-t/--start` are used together, the start configs are
+fine-tune anchors: non-tuned optimizer-bound bot params are fixed from the selected anchor and
+only the fine-tune selectors are optimized. Runtime policy from the base config still wins, and
+seed/anchor values outside `optimize.bounds` are clamped with aggregated source/key logging.
+
+CPU optimizers exact-evaluate every deduplicated `--start` config. The GPU backend defaults to
+`optimize.gpu.seed_bootstrap.mode=auto`: it exact-evaluates pools of at most 128 seeds and
+proxy-screens larger pools before capped exact validation. Use `mode=exact` only when the startup
+cost of exact-evaluating the complete pool is intentional. GPU bootstrap exact work is additional
+to `optimize.iters`.
+
+## Rust
+
+```bash
+cd passivbot-rust && maturin develop --release && cd ..
+cd passivbot-rust && cargo test --no-default-features && cd ..
+cd passivbot-rust && cargo check --tests && cd ..
+```
+
+## Useful Tools
+
+```bash
+passivbot tool pareto optimize_results/.../pareto
+passivbot tool pareto optimize_results/.../pareto -s configs/promoted_candidate.local.json
+passivbot tool pareto optimize_results/.../pareto -l 'adg_strategy_eq>0.0' -f optimize_results/filtered_pareto
+passivbot tool pareto-compress optimize_results/.../pareto 8 --output-dir selected_pareto_8
+passivbot tool pareto-dash --data-root optimize_results
+passivbot tool verify-hlcvs-data
+passivbot tool ohlcvs-doctor --repair-catalog
+passivbot tool streamline-json configs/examples/default_trailing_martingale_long.json
+passivbot tool clean-config configs/private/input.json configs/private/clean.json
+passivbot tool clean-config configs/private/input.json configs/private/live.json --mode live
+passivbot tool clean-config configs/private/raw --dry-run --max-depth 2
+passivbot tool compose-coin-overrides path/to/single_coins path/to/composed.json
+passivbot tool migrate-config-v7 config_v7.json config_v8.json
+passivbot tool compare-backtests path/to/v7/result path/to/v8/result
+```
+
+## High-Signal Gotcha
+
+If Rust changes seem ignored, follow `rust_extension.md` to verify the loaded artifact and source
+stamp before debugging behavior.

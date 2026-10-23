@@ -1,0 +1,4549 @@
+from collections.abc import Mapping
+import json
+import logging
+import queue
+import re
+import threading
+import time
+
+import pytest
+
+import live.event_bus as live_event_bus_module
+import live.event_emitters as live_event_emitters
+from live.event_bus import (
+    DEFAULT_ROUTES,
+    EventRoute,
+    EventTags,
+    EventTypes,
+    LIVE_EVENT_BUDGET_METADATA_KEY,
+    LIVE_EVENT_DEBUG_PROFILES,
+    LIVE_EVENT_MAX_DATA_BYTES,
+    LIVE_EVENT_MAX_DATA_DEPTH,
+    LIVE_EVENT_MAX_LIST_ITEMS,
+    LIVE_EVENT_MAX_MAPPING_INSPECTIONS,
+    LIVE_EVENT_MAX_MAPPING_KEYS,
+    LIVE_EVENT_MAX_STRING_CHARS,
+    ListEventSink,
+    LiveEvent,
+    LiveEventContext,
+    LiveEventPipeline,
+    MonitorEventSink,
+    REDACTED,
+    ReasonCodes,
+    authoritative_reason_code,
+    format_console_event,
+    format_ema_fallback_console,
+    format_ema_unavailable_console,
+    format_forager_eligibility_console,
+    format_market_snapshot_diagnostic_console,
+    format_memory_snapshot_console,
+    format_state_refresh_timing_console,
+    live_event_debug_profile_enabled,
+    normalize_live_event_console_enabled,
+    normalize_live_event_debug_profiles,
+    normalize_event_type,
+    payload_hash,
+    payload_hash_raw,
+    redact_payload,
+    resolve_live_event_console_enabled,
+    sink_failed_reason_code,
+    startup_phase_readiness_contract,
+    startup_timing_phase,
+)
+from live.events import DiagnosticEvent, run_diagnostic_step
+from monitor_publisher import MonitorPublisher
+
+
+def _make_monitor_publisher(tmp_path, **overrides):
+    params = {
+        "exchange": "bybit",
+        "user": "user01",
+        "root_dir": str(tmp_path),
+        "snapshot_interval_seconds": 1.0,
+        "checkpoint_interval_minutes": 10.0,
+        "event_rotation_mb": 128.0,
+        "event_rotation_minutes": 60.0,
+        "retain_days": 7.0,
+        "max_total_bytes": 1_000_000,
+        "compress_rotated_segments": False,
+        "retain_price_ticks": True,
+        "retain_candles": True,
+        "retain_fills": True,
+        "price_tick_min_interval_ms": 500,
+        "emit_completed_candles": True,
+        "include_raw_fill_payloads": False,
+    }
+    params.update(overrides)
+    return MonitorPublisher(**params)
+
+
+def _registry_values(registry: type) -> list[str]:
+    return [
+        value
+        for name, value in vars(registry).items()
+        if name.isupper() and isinstance(value, str)
+    ]
+
+
+def test_live_event_tag_registry_values_are_unique_and_query_safe():
+    values = _registry_values(EventTags)
+
+    assert EventTags.REMOTE_CALL == "remote_call"
+    assert EventTags.CANDLE == "candle"
+    assert EventTags.EMA == "ema"
+    assert len(values) == len(set(values))
+    assert all(re.fullmatch(r"[a-z][a-z0-9_]*", value) for value in values)
+
+
+def test_market_compatibility_event_type_is_stable():
+    assert EventTypes.CONFIG_MARKET_COMPATIBILITY == "config.market_compatibility"
+
+
+def test_market_snapshot_diagnostic_console_projection_is_bounded_and_excludes_messages():
+    rendered = format_market_snapshot_diagnostic_console(
+        context="C" * 1_000,
+        error_type="E" * 1_000,
+        status="S" * 1_000,
+        reason_code="R" * 1_000,
+        cycle_id="Y" * 1_000,
+    )
+    longest_prefix = "2026-07-15T23:45:40Z WARNING  [hyperliquid] "
+
+    assert len(longest_prefix + rendered) <= 240
+    assert "C" * 65 not in rendered
+    assert "E" * 25 not in rendered
+    assert "Y" * 33 not in rendered
+
+
+def test_market_snapshot_diagnostic_emitter_reports_actual_emission_success():
+    class Bot:
+        live_event_debug_profiles = ()
+
+        def _current_live_event_cycle_id(self):
+            return "cy_1"
+
+        def _emit_live_event(self, *_args, **_kwargs):
+            return None
+
+    bot = Bot()
+    kwargs = {
+        "context": "upnl diagnostics",
+        "error": RuntimeError("market snapshot unavailable"),
+    }
+
+    assert live_event_emitters.emit_market_snapshot_diagnostic_skipped_event(
+        bot, **kwargs
+    ) is False
+
+    bot._emit_live_event = lambda *_args, **_kwargs: LiveEvent("test.event")
+    assert live_event_emitters.emit_market_snapshot_diagnostic_skipped_event(
+        bot, **kwargs
+    ) is True
+
+
+def test_memory_snapshot_event_type_is_stable():
+    assert EventTypes.RESOURCE_MEMORY_SNAPSHOT == "resource.memory_snapshot"
+
+
+def test_startup_phase_readiness_contract_is_bounded_and_defensive():
+    expected = {
+        "account": {
+            "readiness_scope": "account_critical",
+            "trading_impact": "protective_blocker",
+        },
+        "hsl": {
+            "readiness_scope": "held_position_protective",
+            "trading_impact": "protective_blocker",
+        },
+        "startup": {
+            "readiness_scope": "execution_loop",
+            "trading_impact": "protective_blocker",
+        },
+        "market": {
+            "readiness_scope": "first_market_state",
+            "trading_impact": "cycle_delay",
+        },
+        "full-warmup": {
+            "readiness_scope": "background_candles_complete",
+            "trading_impact": "entry_blocker",
+        },
+    }
+
+    for phase, contract in expected.items():
+        assert startup_phase_readiness_contract(phase) == contract
+        assert set(contract) == {"readiness_scope", "trading_impact"}
+
+    first = startup_phase_readiness_contract("account")
+    second = startup_phase_readiness_contract("account")
+    assert first is not None
+    assert second is not None
+    assert first is not second
+    first["readiness_scope"] = "modified"
+    assert second["readiness_scope"] == "account_critical"
+    assert startup_phase_readiness_contract("active-candle") is None
+    assert startup_phase_readiness_contract("unknown") is None
+    assert startup_phase_readiness_contract(["account"]) is None
+
+
+def test_startup_timing_phase_is_canonical_and_rejects_conflicts():
+    assert startup_timing_phase({"phase": "account"}) == "account"
+    assert startup_timing_phase({"stage": "hsl"}) == "hsl"
+    assert startup_timing_phase({"phase": "startup", "stage": "startup"}) == (
+        "startup"
+    )
+    assert startup_timing_phase({"phase": "account", "stage": "hsl"}) is None
+    assert startup_timing_phase({"phase": "custom-phase"}) == "other"
+    assert startup_timing_phase({}) is None
+    assert startup_timing_phase(None) is None
+
+
+def test_live_event_reason_code_registry_values_are_unique_and_query_safe():
+    values = _registry_values(ReasonCodes)
+
+    assert ReasonCodes.REQUIRED_EMA_UNAVAILABLE == "required_ema_unavailable"
+    assert ReasonCodes.EXCHANGE_ACKNOWLEDGED == "exchange_acknowledged"
+    assert ReasonCodes.EXCHANGE_CONFIG_REFRESH == "exchange_config_refresh"
+    assert ReasonCodes.EXECUTION_LOOP_ERROR_BURST == "execution_loop_error_burst"
+    assert ReasonCodes.WARMUP_CACHE_DECISION == "warmup_cache_decision"
+    assert ReasonCodes.CONFIG_MARKET_UNSUPPORTED == "config_market_unsupported"
+    assert (
+        ReasonCodes.CONFIG_ISOLATED_ONLY_MARKET_BLOCKED
+        == "config_isolated_only_market_blocked"
+    )
+    assert (
+        ReasonCodes.CONFIG_STOCK_PERP_WRONG_EXCHANGE
+        == "config_stock_perp_wrong_exchange"
+    )
+    assert (
+        ReasonCodes.CONFIG_STOCK_PERP_UNAVAILABLE_MARKET
+        == "config_stock_perp_unavailable_market"
+    )
+    assert (
+        ReasonCodes.CONFIG_HIP3_ACCOUNT_MODE_UNSUPPORTED
+        == "config_hip3_account_mode_unsupported"
+    )
+    assert authoritative_reason_code("balance") == "authoritative_balance"
+    assert sink_failed_reason_code("monitor") == "monitor_sink_failed"
+    assert len(values) == len(set(values))
+    assert all(re.fullmatch(r"[a-z][a-z0-9_]*", value) for value in values)
+
+
+def test_live_event_debug_profiles_normalize_and_validate():
+    assert normalize_live_event_debug_profiles(None) == ()
+    assert normalize_live_event_debug_profiles("") == ()
+    assert normalize_live_event_debug_profiles(
+        "rust,remote-calls candle EMA-readiness warmup"
+    ) == (
+        "cache",
+        "candles",
+        "ema",
+        "remote_calls",
+        "rust",
+    )
+    assert normalize_live_event_debug_profiles(["rust", "rust", "off", "hsl"]) == (
+        "hsl",
+        "rust",
+    )
+    assert normalize_live_event_debug_profiles("all") == tuple(
+        sorted(LIVE_EVENT_DEBUG_PROFILES)
+    )
+    with pytest.raises(ValueError, match="unknown live event debug profile"):
+        normalize_live_event_debug_profiles("rust,unknown_profile")
+
+    class Holder:
+        live_event_debug_profiles = ("rust",)
+
+    assert live_event_debug_profile_enabled(Holder(), "rust")
+    assert live_event_debug_profile_enabled(Holder(), "remote_calls") is False
+    assert LiveEventPipeline(debug_profiles="rust", start=False).debug_profiles == (
+        "rust",
+    )
+
+
+def test_live_event_console_flag_normalizes_common_config_values():
+    assert normalize_live_event_console_enabled(None) is False
+    assert normalize_live_event_console_enabled(False) is False
+    assert normalize_live_event_console_enabled("") is False
+    assert normalize_live_event_console_enabled("off") is False
+    assert normalize_live_event_console_enabled("0") is False
+    assert normalize_live_event_console_enabled(True) is True
+    assert normalize_live_event_console_enabled("on") is True
+    assert normalize_live_event_console_enabled("1") is True
+    assert normalize_live_event_console_enabled("console") is True
+
+
+def test_live_event_console_resolver_defaults_on_with_explicit_opt_outs():
+    assert resolve_live_event_console_enabled() is True
+    assert resolve_live_event_console_enabled(config_value=None, env_value=None) is True
+    assert resolve_live_event_console_enabled(config_value=False) is False
+    assert resolve_live_event_console_enabled(config_value="off") is False
+    assert resolve_live_event_console_enabled(config_value=True) is True
+    assert resolve_live_event_console_enabled(config_value=False, env_value="1") is True
+    assert resolve_live_event_console_enabled(config_value=True, env_value="0") is False
+
+
+def test_live_event_serializes_stable_envelope_and_redacts_sensitive_data():
+    event = LiveEvent(
+        EventTypes.RUST_ORCHESTRATOR_CALLED,
+        level="debug",
+        tags=("planning", "rust"),
+        exchange="binance",
+        user="user01",
+        cycle_id="cy_1",
+        status="started",
+        data={
+            "symbol_count": 3,
+            "apiKey": "secret",
+            "nested": {"password": "pw", "safe": "ok"},
+            "rows": [{"signature": "sig", "value": 1}],
+        },
+    )
+
+    data = event.to_dict()
+    assert data["schema_version"] == 1
+    assert data["event_type"] == EventTypes.RUST_ORCHESTRATOR_CALLED
+    assert data["level"] == "debug"
+    assert data["event_id"]
+    assert data["ts_ms"] > 0
+    assert data["monotonic_ms"] > 0
+    assert data["tags"] == ["planning", "rust"]
+    assert data["data"]["apiKey"] == REDACTED
+    assert data["data"]["nested"]["password"] == REDACTED
+    assert data["data"]["nested"]["safe"] == "ok"
+    assert data["data"]["rows"][0]["signature"] == REDACTED
+    assert json.loads(event.to_json())["event_type"] == event.event_type
+
+
+def test_live_event_data_budget_preserves_under_limit_json_and_redaction_without_marker():
+    source = {
+        "planning": {"ready": True, "candidate_count": 3},
+        "order_wave": {"created": 2, "cancelled": 1},
+        "health": {"queue_depth": 4, "healthy": True},
+        "apiKey": "secret",
+    }
+    expected_source = {
+        "planning": {"ready": True, "candidate_count": 3},
+        "order_wave": {"created": 2, "cancelled": 1},
+        "health": {"queue_depth": 4, "healthy": True},
+        "apiKey": "secret",
+    }
+
+    event = LiveEvent(EventTypes.CYCLE_COMPLETED, data=source)
+    monitor_payload = event.to_monitor_event()[2]
+
+    assert source == expected_source
+    assert event.data == {
+        "planning": {"ready": True, "candidate_count": 3},
+        "order_wave": {"created": 2, "cancelled": 1},
+        "health": {"queue_depth": 4, "healthy": True},
+        "apiKey": REDACTED,
+    }
+    assert LIVE_EVENT_BUDGET_METADATA_KEY not in event.data
+    assert event.to_dict()["data"] == event.data
+    assert monitor_payload["_live_event"]["data"] == event.data
+    assert monitor_payload["planning"] == event.data["planning"]
+
+
+def test_live_event_data_budget_bounds_shape_cycles_and_unsafe_values_without_mutation():
+    class Unrenderable:
+        def __repr__(self):
+            raise AssertionError("unsupported values must not render")
+
+        def __str__(self):
+            raise AssertionError("unsupported values must not render")
+
+    cycle: dict[str, object] = {}
+    cycle["self"] = cycle
+    deep: dict[str, object] = {}
+    cursor = deep
+    for _ in range(LIVE_EVENT_MAX_DATA_DEPTH + 2):
+        child: dict[str, object] = {}
+        cursor["child"] = child
+        cursor = child
+    long_key = "k" * 140
+    source = {
+        "apiKey": "secret",
+        "long_text": "x" * (LIVE_EVENT_MAX_STRING_CHARS + 8),
+        long_key: "must_not_be_retained",
+        "items": list(range(LIVE_EVENT_MAX_LIST_ITEMS + 3)),
+        "mapping": {
+            f"key_{index:03d}": index
+            for index in range(LIVE_EVENT_MAX_MAPPING_KEYS + 3)
+        },
+        "deep": deep,
+        "cycle": cycle,
+        LIVE_EVENT_BUDGET_METADATA_KEY: {"injected": "untrusted"},
+        "unsupported": Unrenderable(),
+        "nonfinite": float("nan"),
+    }
+
+    event = LiveEvent(EventTypes.PLANNING_UNAVAILABLE, data=source)
+    serialized = json.dumps(event.data, allow_nan=False, sort_keys=True)
+    metadata = event.data[LIVE_EVENT_BUDGET_METADATA_KEY]
+
+    assert source["apiKey"] == "secret"
+    assert source[long_key] == "must_not_be_retained"
+    assert source["cycle"] is cycle
+    assert event.data["apiKey"] == REDACTED
+    assert event.data["long_text"].endswith("...<truncated>")
+    assert len(event.data["items"]) == LIVE_EVENT_MAX_LIST_ITEMS
+    assert event.data["items"] == list(range(LIVE_EVENT_MAX_LIST_ITEMS))
+    assert len(event.data["mapping"]) == LIVE_EVENT_MAX_MAPPING_KEYS
+    assert event.data["cycle"]["self"] == "[cycle-limited]"
+    assert "[depth-limited]" in serialized
+    assert event.data["unsupported"] == "[unsupported]"
+    assert event.data["nonfinite"] == "[unsupported]"
+    assert "must_not_be_retained" not in serialized
+    assert "untrusted" not in serialized
+    assert metadata["version"] == 1
+    assert metadata["omitted_keys"] >= 3
+    assert metadata["omitted_items"] == 3
+    assert metadata["truncated_strings"] == 1
+    assert metadata["truncated_keys"] == 1
+    assert metadata["depth_limited"] >= 1
+    assert metadata["cycle_limited"] == 1
+    assert metadata["unsupported_values"] >= 2
+    assert metadata["reserved_keys"] == 1
+
+
+def test_live_event_data_budget_enforces_final_serialized_byte_limit_in_order():
+    source = {
+        f"order_wave_{index:03d}": "x" * LIVE_EVENT_MAX_STRING_CHARS
+        for index in range(LIVE_EVENT_MAX_MAPPING_KEYS)
+    }
+
+    event = LiveEvent(EventTypes.ORDER_WAVE_COMPLETED, data=source)
+    metadata = event.data[LIVE_EVENT_BUDGET_METADATA_KEY]
+    encoded = json.dumps(
+        event.data,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert len(encoded) <= LIVE_EVENT_MAX_DATA_BYTES
+    assert metadata["byte_limited"] >= 1
+    assert metadata["omitted_keys"] >= 1
+    assert event.data["order_wave_000"] == "x" * LIVE_EVENT_MAX_STRING_CHARS
+    assert "order_wave_127" not in event.data
+
+
+def test_live_event_data_budget_byte_pruning_uses_bounded_serialization_passes(
+    monkeypatch,
+):
+    calls = 0
+    original = live_event_bus_module._live_event_json_size
+
+    def counted_json_size(value):
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(
+        live_event_bus_module,
+        "_live_event_json_size",
+        counted_json_size,
+    )
+
+    LiveEvent(
+        EventTypes.ORDER_WAVE_COMPLETED,
+        data={
+            f"order_wave_{index:03d}": "x" * LIVE_EVENT_MAX_STRING_CHARS
+            for index in range(LIVE_EVENT_MAX_MAPPING_KEYS)
+        },
+    )
+
+    assert calls <= 12
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_omitted_keys", "expected_reserved_keys"),
+    [
+        (
+            {
+                **{"key_000": "x" * (LIVE_EVENT_MAX_STRING_CHARS + 1)},
+                **{
+                    f"key_{index:03d}": index
+                    for index in range(1, LIVE_EVENT_MAX_MAPPING_KEYS)
+                },
+            },
+            0,
+            0,
+        ),
+        (
+            {
+                f"key_{index:03d}": index
+                for index in range(LIVE_EVENT_MAX_MAPPING_KEYS + 1)
+            },
+            1,
+            0,
+        ),
+        (
+            {
+                LIVE_EVENT_BUDGET_METADATA_KEY: {"forged": True},
+                **{
+                    f"key_{index:03d}": index
+                    for index in range(LIVE_EVENT_MAX_MAPPING_KEYS + 1)
+                },
+            },
+            1,
+            1,
+        ),
+        (
+            {
+                **{
+                    f"key_{index:03d}": index
+                    for index in range(LIVE_EVENT_MAX_MAPPING_KEYS + 1)
+                },
+                LIVE_EVENT_BUDGET_METADATA_KEY: {"forged": True},
+            },
+            1,
+            1,
+        ),
+    ],
+)
+def test_live_event_data_budget_saturated_root_metadata_is_idempotent(
+    source,
+    expected_omitted_keys,
+    expected_reserved_keys,
+):
+    event = LiveEvent(EventTypes.CYCLE_COMPLETED, data=source)
+
+    for metadata in (
+        event.data[LIVE_EVENT_BUDGET_METADATA_KEY],
+        event.to_dict()["data"][LIVE_EVENT_BUDGET_METADATA_KEY],
+    ):
+        assert metadata["omitted_keys"] == expected_omitted_keys
+        assert metadata["reserved_keys"] == expected_reserved_keys
+
+    contextual = LiveEventContext(exchange="test_exchange").apply(event)
+    contextual_metadata = contextual.data[LIVE_EVENT_BUDGET_METADATA_KEY]
+    assert contextual_metadata["omitted_keys"] == expected_omitted_keys
+    assert contextual_metadata["reserved_keys"] == expected_reserved_keys
+
+    sink = ListEventSink()
+    pipeline = LiveEventPipeline(structured_sinks=[sink], monitor_sinks=[])
+    emitted = pipeline.emit(contextual)
+    assert emitted is not None
+    assert pipeline.flush(timeout=2.0) is True
+    emitted_metadata = emitted.data[LIVE_EVENT_BUDGET_METADATA_KEY]
+    assert emitted_metadata["omitted_keys"] == expected_omitted_keys
+    assert emitted_metadata["reserved_keys"] == expected_reserved_keys
+    assert sink.events == [emitted]
+    assert pipeline.close(timeout=2.0) is True
+
+
+@pytest.mark.parametrize("marker_first", [True, False])
+def test_live_event_data_budget_non_dict_mapping_reserves_saturated_root_marker(
+    marker_first,
+):
+    class OrderedMapping(Mapping):
+        def __init__(self, items):
+            self._items = list(items)
+            self._values = dict(items)
+
+        def __getitem__(self, key):
+            return self._values[key]
+
+        def __iter__(self):
+            return iter(self._values)
+
+        def __len__(self):
+            return len(self._values)
+
+        def items(self):
+            return iter(self._items)
+
+    caller_items = [
+        (f"key_{index:03d}", index)
+        for index in range(LIVE_EVENT_MAX_MAPPING_KEYS + 1)
+    ]
+    marker_item = (LIVE_EVENT_BUDGET_METADATA_KEY, {"forged": True})
+    items = (
+        [marker_item, *caller_items]
+        if marker_first
+        else [*caller_items, marker_item]
+    )
+
+    event = LiveEvent(
+        EventTypes.CYCLE_COMPLETED,
+        data=OrderedMapping(items),
+    )
+
+    metadata = event.to_dict()["data"][LIVE_EVENT_BUDGET_METADATA_KEY]
+    assert metadata["omitted_keys"] == 1
+    assert metadata["reserved_keys"] == 1
+
+
+def test_live_event_data_budget_caps_inspection_of_malformed_mapping_items():
+    class InfiniteMalformedMapping(Mapping):
+        def __init__(self):
+            self.inspections = 0
+
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            while True:
+                self.inspections += 1
+                yield object()
+
+    source = InfiniteMalformedMapping()
+    event = LiveEvent(EventTypes.CYCLE_COMPLETED, data=source)
+
+    assert source.inspections == LIVE_EVENT_MAX_MAPPING_INSPECTIONS
+    metadata = event.data[LIVE_EVENT_BUDGET_METADATA_KEY]
+    assert metadata["omitted_keys"] == 1
+    assert metadata["unsupported_values"] == LIVE_EVENT_MAX_MAPPING_INSPECTIONS
+
+
+def test_live_event_data_budget_limits_global_traversal(monkeypatch):
+    monkeypatch.setattr(live_event_bus_module, "LIVE_EVENT_MAX_NODES", 4)
+
+    event = LiveEvent(
+        EventTypes.CYCLE_COMPLETED,
+        data={"values": [{"value": 1}, {"value": 2}, {"value": 3}]},
+    )
+
+    assert event.data["values"][0] == {"value": 1}
+    assert event.data["values"] == [{"value": 1}]
+    assert event.data[LIVE_EVENT_BUDGET_METADATA_KEY]["node_limited"] >= 1
+    assert event.data[LIVE_EVENT_BUDGET_METADATA_KEY]["omitted_items"] == 2
+
+
+def test_live_event_data_budget_revalidates_mutated_data_at_every_output_boundary():
+    source = {"nested": {"items": [{"value": 1}]}}
+    event = LiveEvent(EventTypes.CYCLE_COMPLETED, data=source)
+
+    dict.__setitem__(event.data, "apiKey", "secret")
+    list.append(
+        event.data["nested"]["items"],
+        {"apiKey": "secret", "blob": "x" * 100_000},
+    )
+
+    direct_data = event.to_dict()["data"]
+    assert direct_data["apiKey"] == REDACTED
+    assert direct_data["nested"]["items"][1]["apiKey"] == REDACTED
+    assert direct_data["nested"]["items"][1]["blob"].endswith("...<truncated>")
+
+    contextual = LiveEventContext(exchange="test_exchange").apply(event)
+    dict.__setitem__(contextual.data, "auth_token", "secret")
+    dict.__setitem__(contextual.data, "oversized", "y" * 100_000)
+    sink = ListEventSink()
+    pipeline = LiveEventPipeline(structured_sinks=[sink], monitor_sinks=[])
+    emitted = pipeline.emit(contextual)
+
+    assert emitted is not contextual
+    assert emitted.data["apiKey"] == REDACTED
+    assert emitted.data["auth_token"] == REDACTED
+    assert len(emitted.data["oversized"]) == LIVE_EVENT_MAX_STRING_CHARS
+    assert (
+        len(
+            json.dumps(
+                emitted.data,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        <= LIVE_EVENT_MAX_DATA_BYTES
+    )
+    assert pipeline.flush(timeout=2.0) is True
+    assert sink.events == [emitted]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_live_event_data_budget_visible_metadata_cannot_erase_or_forge_counters():
+    limited = LiveEvent(
+        EventTypes.CYCLE_COMPLETED,
+        data={"items": list(range(LIVE_EVENT_MAX_LIST_ITEMS + 1))},
+    )
+    visible_metadata = limited.data[LIVE_EVENT_BUDGET_METADATA_KEY]
+    visible_metadata["omitted_items"] = 0
+    limited.data._budget_metadata = (999,) * 10
+
+    projected = limited.to_dict()["data"]
+    assert projected[LIVE_EVENT_BUDGET_METADATA_KEY]["omitted_items"] == 1
+
+    dict.__delitem__(limited.data, LIVE_EVENT_BUDGET_METADATA_KEY)
+    projected = limited.to_dict()["data"]
+    assert projected[LIVE_EVENT_BUDGET_METADATA_KEY]["omitted_items"] == 1
+
+    clean = LiveEvent(EventTypes.CYCLE_COMPLETED, data={"ready": True})
+    forged_metadata = dict(projected[LIVE_EVENT_BUDGET_METADATA_KEY])
+    forged_metadata["omitted_keys"] = 999
+    dict.__setitem__(
+        clean.data,
+        LIVE_EVENT_BUDGET_METADATA_KEY,
+        forged_metadata,
+    )
+
+    projected = clean.to_dict()["data"]
+    assert projected[LIVE_EVENT_BUDGET_METADATA_KEY]["omitted_keys"] == 0
+    assert projected[LIVE_EVENT_BUDGET_METADATA_KEY]["reserved_keys"] == 1
+
+
+def test_live_event_context_propagates_ids_without_overwriting_event_values():
+    context = LiveEventContext(
+        exchange="gateio",
+        user="gateio_01",
+        bot_id="bot_a",
+        cycle_id="cy_a",
+    )
+
+    event = LiveEvent(
+        EventTypes.SNAPSHOT_BUILT,
+        exchange="kucoin",
+        snapshot_id="snap_1",
+    ).with_context(context)
+
+    assert event.exchange == "kucoin"
+    assert event.user == "gateio_01"
+    assert event.bot_id == "bot_a"
+    assert event.cycle_id == "cy_a"
+    assert event.snapshot_id == "snap_1"
+
+    next_context = context.with_ids(plan_id="plan_1")
+    assert next_context.plan_id == "plan_1"
+    assert context.plan_id is None
+    with pytest.raises(KeyError):
+        context.with_ids(unknown_id="x")
+
+
+def test_pipeline_context_ids_can_be_updated_between_cycles():
+    sink = ListEventSink()
+    pipeline = LiveEventPipeline(
+        context=LiveEventContext(exchange="gateio", user="gateio_01"),
+        structured_sinks=[sink],
+        routes={EventTypes.CYCLE_STARTED: EventRoute(structured=True, monitor=False)},
+    )
+
+    pipeline.with_context_ids(cycle_id="cy_1")
+    first = pipeline.emit(LiveEvent(EventTypes.CYCLE_STARTED))
+    pipeline.with_context_ids(cycle_id="cy_2", order_wave_id="ow_1")
+    second = pipeline.emit(LiveEvent(EventTypes.CYCLE_STARTED))
+
+    assert first.cycle_id == "cy_1"
+    assert second.cycle_id == "cy_2"
+    assert second.order_wave_id == "ow_1"
+    assert pipeline.flush(timeout=2.0) is True
+    assert [event.cycle_id for event in sink.events] == ["cy_1", "cy_2"]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_route_table_keeps_data_events_off_console_by_default():
+    assert DEFAULT_ROUTES[EventTypes.DATA_PACKET_UPDATED].structured is True
+    assert DEFAULT_ROUTES[EventTypes.DATA_PACKET_UPDATED].monitor is True
+    assert DEFAULT_ROUTES[EventTypes.DATA_PACKET_UPDATED].console is False
+    assert DEFAULT_ROUTES[EventTypes.FORAGER_ELIGIBILITY_CHANGED].console is True
+    assert DEFAULT_ROUTES[EventTypes.FORAGER_ELIGIBILITY_CHANGED].text is True
+    for event_type in (
+        EventTypes.FORAGER_FEATURE_UNAVAILABLE,
+        EventTypes.ENTRY_INITIAL_ELIGIBILITY,
+        EventTypes.EXECUTION_CREATE_CONNECTOR_CALL_STARTED,
+        EventTypes.EXECUTION_CANCEL_CONNECTOR_CALL_STARTED,
+        EventTypes.CONFIG_MARKET_COMPATIBILITY,
+        EventTypes.ACTION_PLANNED,
+        EventTypes.EMA_BUNDLE_STARTED,
+        EventTypes.EMA_BUNDLE_COMPLETED,
+        EventTypes.CANDLE_COVERAGE_CHECKED,
+        EventTypes.CANDLE_TAIL_PROJECTED,
+        EventTypes.CACHE_LOAD_COMPLETED,
+        EventTypes.CACHE_FLUSH_COMPLETED,
+        EventTypes.CACHE_WARMUP_DECISION,
+        EventTypes.EXCHANGE_CONFIG_REFRESH,
+        EventTypes.WEBSOCKET_RECONNECT,
+        EventTypes.FILLS_REFRESH_SUMMARY,
+        EventTypes.PLANNING_DEFER_SUMMARY,
+        EventTypes.HSL_RAW_RED_PENDING,
+        EventTypes.HSL_RED_TRIGGERED,
+        EventTypes.HSL_RED_FINALIZED_WITHOUT_ORDER,
+        EventTypes.HSL_COOLDOWN_STARTED,
+        EventTypes.HSL_COOLDOWN_ENDED,
+    ):
+        assert DEFAULT_ROUTES[event_type].structured is True
+        assert DEFAULT_ROUTES[event_type].monitor is True
+        assert DEFAULT_ROUTES[event_type].console is False
+        assert DEFAULT_ROUTES[event_type].text is False
+    assert DEFAULT_ROUTES[EventTypes.CONFIG_MARKET_COMPATIBILITY].structured is True
+    assert DEFAULT_ROUTES[EventTypes.CONFIG_MARKET_COMPATIBILITY].monitor is True
+    assert DEFAULT_ROUTES[EventTypes.CONFIG_MARKET_COMPATIBILITY].console is False
+    assert DEFAULT_ROUTES[EventTypes.CONFIG_MARKET_COMPATIBILITY].text is False
+    ema_fallback_route = DEFAULT_ROUTES[EventTypes.EMA_FALLBACK_USED]
+    assert ema_fallback_route.console is True
+    assert ema_fallback_route.text is True
+    assert ema_fallback_route.throttle_interval_ms == 15 * 60 * 1000
+    ema_unavailable_route = DEFAULT_ROUTES[EventTypes.EMA_UNAVAILABLE]
+    assert ema_unavailable_route.console is True
+    assert ema_unavailable_route.text is True
+    assert ema_unavailable_route.throttle_interval_ms == 15 * 60 * 1000
+    assert DEFAULT_ROUTES[EventTypes.ORDER_WAVE_COMPLETED].console is True
+    assert DEFAULT_ROUTES[EventTypes.ORDER_WAVE_COMPLETED].text is True
+    assert DEFAULT_ROUTES[EventTypes.EXECUTION_CREATE_DEFERRED].console is False
+    assert DEFAULT_ROUTES[EventTypes.EXECUTION_CREATE_SKIPPED].console is True
+    assert DEFAULT_ROUTES[EventTypes.EXECUTION_CREATE_SKIPPED].text is True
+    assert DEFAULT_ROUTES[EventTypes.EXECUTION_CONFIRMATION_TIMEOUT].console is True
+    assert DEFAULT_ROUTES[EventTypes.EXECUTION_CONFIRMATION_TIMEOUT].text is True
+    for event_type in (
+        EventTypes.ORDER_CHURN_EVIDENCE,
+        EventTypes.ORDER_CHURN_ADMISSION,
+        EventTypes.ORDER_CHURN_ACTIONS_ACCOUNTED,
+        EventTypes.EXECUTION_CANCEL_FIRST_BARRIER,
+        EventTypes.EXECUTION_CANCEL_DEFERRED,
+    ):
+        assert DEFAULT_ROUTES[event_type].structured is True
+        assert DEFAULT_ROUTES[event_type].monitor is True
+        assert DEFAULT_ROUTES[event_type].console is False
+        assert DEFAULT_ROUTES[event_type].text is False
+    assert DEFAULT_ROUTES[EventTypes.ENTRY_MIN_EFFECTIVE_COST_BLOCKED].console is True
+    assert DEFAULT_ROUTES[EventTypes.ENTRY_MIN_EFFECTIVE_COST_BLOCKED].text is True
+    assert DEFAULT_ROUTES[EventTypes.FILL_INGESTED].console is True
+    assert DEFAULT_ROUTES[EventTypes.FILL_INGESTED].text is True
+    assert DEFAULT_ROUTES[EventTypes.FILLS_INGESTED_SUMMARY].console is True
+    assert DEFAULT_ROUTES[EventTypes.FILLS_INGESTED_SUMMARY].text is True
+    assert DEFAULT_ROUTES[EventTypes.POSITION_CHANGED].console is True
+    assert DEFAULT_ROUTES[EventTypes.POSITION_CHANGED].text is True
+    assert DEFAULT_ROUTES[EventTypes.BALANCE_CHANGED].console is True
+    assert DEFAULT_ROUTES[EventTypes.BALANCE_CHANGED].text is True
+    assert DEFAULT_ROUTES[EventTypes.RISK_MODE_CHANGED].console is True
+    assert DEFAULT_ROUTES[EventTypes.RISK_MODE_CHANGED].text is True
+    assert DEFAULT_ROUTES[EventTypes.HSL_TRANSITION].console is True
+    assert DEFAULT_ROUTES[EventTypes.HSL_TRANSITION].text is True
+    assert DEFAULT_ROUTES[EventTypes.BOT_STARTED].console is True
+    assert DEFAULT_ROUTES[EventTypes.BOT_STARTED].text is True
+    assert DEFAULT_ROUTES[EventTypes.RUNTIME_STARTED].structured is True
+    assert DEFAULT_ROUTES[EventTypes.RUNTIME_STARTED].monitor is True
+    assert DEFAULT_ROUTES[EventTypes.RUNTIME_STARTED].console is False
+    assert DEFAULT_ROUTES[EventTypes.RUNTIME_STARTED].text is False
+    assert DEFAULT_ROUTES[EventTypes.BOT_READY].structured is True
+    assert DEFAULT_ROUTES[EventTypes.BOT_READY].monitor is True
+    assert DEFAULT_ROUTES[EventTypes.BOT_READY].console is False
+    assert DEFAULT_ROUTES[EventTypes.BOT_READY].text is False
+    assert DEFAULT_ROUTES[EventTypes.BOT_STARTUP_TIMING].console is True
+    assert DEFAULT_ROUTES[EventTypes.BOT_STARTUP_TIMING].text is True
+    assert DEFAULT_ROUTES[EventTypes.BOT_SHUTDOWN_STAGE].console is True
+    assert DEFAULT_ROUTES[EventTypes.BOT_SHUTDOWN_STAGE].text is True
+    assert DEFAULT_ROUTES[EventTypes.HEALTH_SUMMARY].console is True
+    assert DEFAULT_ROUTES[EventTypes.HEALTH_SUMMARY].text is True
+    assert DEFAULT_ROUTES[EventTypes.RESOURCE_MEMORY_SNAPSHOT].structured is True
+    assert DEFAULT_ROUTES[EventTypes.RESOURCE_MEMORY_SNAPSHOT].monitor is True
+    assert DEFAULT_ROUTES[EventTypes.RESOURCE_MEMORY_SNAPSHOT].console is True
+    assert DEFAULT_ROUTES[EventTypes.RESOURCE_MEMORY_SNAPSHOT].text is True
+    assert DEFAULT_ROUTES[EventTypes.STATE_REFRESH_TIMING].structured is True
+    assert DEFAULT_ROUTES[EventTypes.STATE_REFRESH_TIMING].monitor is True
+    assert DEFAULT_ROUTES[EventTypes.STATE_REFRESH_TIMING].console is True
+    assert DEFAULT_ROUTES[EventTypes.STATE_REFRESH_TIMING].text is True
+    assert DEFAULT_ROUTES[EventTypes.HSL_STATUS].console is True
+    assert DEFAULT_ROUTES[EventTypes.HSL_STATUS].text is True
+    assert DEFAULT_ROUTES[EventTypes.TRAILING_STATUS].console is True
+    assert DEFAULT_ROUTES[EventTypes.TRAILING_STATUS].text is True
+    assert DEFAULT_ROUTES[EventTypes.UNSTUCK_STATUS].console is True
+    assert DEFAULT_ROUTES[EventTypes.UNSTUCK_STATUS].text is True
+    assert DEFAULT_ROUTES[EventTypes.UNSTUCK_SELECTION].console is True
+    assert DEFAULT_ROUTES[EventTypes.UNSTUCK_SELECTION].text is True
+    assert DEFAULT_ROUTES[EventTypes.REALIZED_LOSS_GATE_BLOCKED].console is True
+    assert DEFAULT_ROUTES[EventTypes.REALIZED_LOSS_GATE_BLOCKED].text is True
+
+
+def test_bot_ready_remains_durable_when_human_sinks_are_suppressed():
+    structured = ListEventSink()
+    monitor = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[monitor],
+        console_sink=console,
+        text_sink=text,
+    )
+
+    assert pipeline.emit(LiveEvent(EventTypes.BOT_READY, status="succeeded")) is not None
+    assert pipeline.flush(timeout=2.0) is True
+
+    assert [event.event_type for event in structured.events] == [EventTypes.BOT_READY]
+    assert [event.event_type for event in monitor.events] == [EventTypes.BOT_READY]
+    assert console.events == []
+    assert text.events == []
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_forager_eligibility_console_formatter_is_bounded_and_preserves_payload():
+    data = {
+        "source": "config_sources",
+        "list_kind": "approved_coins",
+        "operation": "added",
+        "changes": [
+            {
+                "pside": "long",
+                "count": 5,
+                "symbols": [
+                    "ZZZ/USDT:USDT",
+                    "\x1b[31mBBB\nbad/USDT:USDT",
+                    "AAA/USDT:USDT",
+                    "CCC/USDT:USDT",
+                ],
+            },
+            {"pside": "short", "count": 7, "symbols": ["SHORT/USDT:USDT"]},
+        ],
+    }
+    event = LiveEvent(EventTypes.FORAGER_ELIGIBILITY_CHANGED, data=data)
+    before = event.to_dict()
+
+    message = format_forager_eligibility_console(data)
+
+    assert message == (
+        "[forager] list=approved_coins op=added counts=long:5,short:7 "
+        "samples=AAA,BBB_bad,CCC omitted=9"
+    )
+    assert len(message) <= 240
+    assert len("2026-07-16T05:18:56Z INFO     [hyperliquid] " + message) <= 240
+    assert "\n" not in message
+    assert format_console_event(event) == message
+    assert event.to_dict() == before
+
+
+def test_forager_eligibility_console_route_keeps_event_durable():
+    structured = ListEventSink()
+    monitor = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[monitor],
+        console_sink=console,
+        text_sink=text,
+    )
+    event = LiveEvent(
+        EventTypes.FORAGER_ELIGIBILITY_CHANGED,
+        data={
+            "list_kind": "ignored_coins",
+            "operation": "removed",
+            "changes": [{"pside": "long", "count": 1, "symbols": ["BTC/USDT:USDT"]}],
+        },
+    )
+
+    pipeline.emit(event)
+
+    assert console.events == [event]
+    assert text.events == [event]
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [event]
+    assert monitor.events == [event]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_redact_payload_recurses_and_payload_hash_is_stable():
+    payload = {"safe": 1, "auth": {"token": "secret"}, "items": [{"secret": "x"}]}
+
+    assert redact_payload(payload) == {
+        "safe": 1,
+        "auth": REDACTED,
+        "items": [{"secret": REDACTED}],
+    }
+    assert payload_hash({"b": 2, "a": 1}) == payload_hash({"a": 1, "b": 2})
+
+
+def test_payload_hash_raw_hashes_exact_wire_payload():
+    assert payload_hash_raw('{"b":2,"a":1}') != payload_hash_raw('{"a":1,"b":2}')
+    assert payload_hash_raw("abc") == payload_hash_raw(b"abc")
+
+
+def test_legacy_event_type_names_normalize_to_phase1_schema():
+    assert normalize_event_type("planning_unavailable") == EventTypes.PLANNING_UNAVAILABLE
+    assert LiveEvent("planning_unavailable").event_type == EventTypes.PLANNING_UNAVAILABLE
+
+
+def test_pipeline_routes_console_and_async_sinks_with_context():
+    structured = ListEventSink()
+    monitor = ListEventSink()
+    console = ListEventSink()
+    pipeline = LiveEventPipeline(
+        context=LiveEventContext(exchange="okx", user="okx_01", cycle_id="cy_1"),
+        structured_sinks=[structured],
+        monitor_sinks=[monitor],
+        console_sink=console,
+    )
+
+    event = pipeline.emit(
+        LiveEvent(
+            EventTypes.ORDER_WAVE_COMPLETED,
+            status="succeeded",
+            message="create=1 cancel=0",
+        )
+    )
+
+    assert event.exchange == "okx"
+    assert event.user == "okx_01"
+    assert event.cycle_id == "cy_1"
+    assert console.events == [event]
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [event]
+    assert monitor.events == [event]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_pipeline_queue_overflow_is_observable_without_raising():
+    pipeline = LiveEventPipeline(
+        queue_maxsize=1,
+        start=False,
+        routes={
+            EventTypes.DATA_PACKET_UPDATED: EventRoute(
+                structured=True, monitor=False, console=False
+            )
+        },
+    )
+
+    first = pipeline.emit(LiveEvent(EventTypes.DATA_PACKET_UPDATED))
+    second = pipeline.emit(LiveEvent(EventTypes.DATA_PACKET_UPDATED))
+
+    assert first.event_type == EventTypes.DATA_PACKET_UPDATED
+    assert second.event_type == EventTypes.DATA_PACKET_UPDATED
+    assert pipeline.drop_counters[EventTypes.DATA_PACKET_UPDATED] == 1
+    assert pipeline.degraded_events[-1].event_type == EventTypes.SINK_DEGRADED
+    assert pipeline.degraded_events[-1].reason_code == "queue_full"
+    assert pipeline.degraded_events[-1].data == {
+        "dropped_event_type": EventTypes.DATA_PACKET_UPDATED
+    }
+
+
+def test_bounded_diagnostic_event_type_preserves_only_registered_labels():
+    assert (
+        live_event_bus_module.bounded_diagnostic_event_type(
+            EventTypes.DATA_PACKET_UPDATED
+        )
+        == EventTypes.DATA_PACKET_UPDATED
+    )
+    assert (
+        live_event_bus_module.bounded_diagnostic_event_type("planning_unavailable")
+        == EventTypes.PLANNING_UNAVAILABLE
+    )
+    for unsafe_value in (
+        "secret.event",
+        "event." + "x" * 200,
+        1,
+        None,
+    ):
+        assert (
+            live_event_bus_module.bounded_diagnostic_event_type(unsafe_value)
+            == "unknown_event"
+        )
+
+
+def test_pipeline_health_snapshot_reports_queue_and_degraded_counters():
+    pipeline = LiveEventPipeline(
+        queue_maxsize=1,
+        start=False,
+        routes={
+            EventTypes.DATA_PACKET_UPDATED: EventRoute(
+                structured=True, monitor=False, console=False
+            )
+        },
+    )
+
+    assert pipeline.emit(LiveEvent(EventTypes.DATA_PACKET_UPDATED)) is not None
+    assert (
+        pipeline.emit(LiveEvent(EventTypes.DATA_PACKET_UPDATED), require_enqueue=True)
+        is None
+    )
+
+    snapshot = pipeline.health_snapshot()
+
+    assert snapshot["event_queue_depth"] == 1
+    assert snapshot["event_queue_maxsize"] == 1
+    assert snapshot["event_queue_unfinished_tasks"] == 1
+    assert snapshot["event_dropped_total"] == 1
+    assert snapshot["event_drop_counts"] == {EventTypes.DATA_PACKET_UPDATED: 1}
+    assert snapshot["event_sink_error_total"] == 0
+    assert snapshot["event_sink_error_counts"] == {}
+    assert snapshot["event_degraded_count"] == 1
+    assert snapshot["event_pipeline_stopping"] is False
+    assert snapshot["event_pipeline_worker_alive"] is False
+
+    pipeline._queue.get_nowait()
+    pipeline._queue.task_done()
+
+
+def test_pipeline_health_snapshot_tracks_and_consumes_queue_timing(monkeypatch):
+    clock = {"ns": 1_000_000_000}
+    monkeypatch.setattr(
+        live_event_bus_module.time,
+        "monotonic_ns",
+        lambda: clock["ns"],
+    )
+
+    class ControlledSink:
+        def __init__(self, service_ns):
+            self.service_ns = service_ns
+            self.events = []
+
+        def write(self, event):
+            self.events.append(event)
+            clock["ns"] += self.service_ns
+            return event
+
+    structured = ControlledSink(3_000_000)
+    structured_secondary = ControlledSink(2_000_000)
+    monitor = ControlledSink(5_000_000)
+    console = ControlledSink(11_000_000)
+    text = ControlledSink(13_000_000)
+    pipeline = LiveEventPipeline(
+        start=False,
+        structured_sinks=[structured, structured_secondary],
+        monitor_sinks=[monitor],
+        console_sink=console,
+        text_sink=text,
+        routes={
+            EventTypes.DATA_PACKET_UPDATED: EventRoute(
+                structured=True, monitor=False, console=False
+            ),
+            EventTypes.SNAPSHOT_BUILT: EventRoute(
+                structured=False, monitor=True, console=False
+            ),
+            EventTypes.CYCLE_STARTED: EventRoute(
+                structured=True, monitor=True, console=True, text=True
+            ),
+        },
+    )
+
+    assert pipeline.emit(LiveEvent(EventTypes.DATA_PACKET_UPDATED)) is not None
+    assert pipeline.emit(LiveEvent(EventTypes.SNAPSHOT_BUILT)) is not None
+    assert pipeline.emit(LiveEvent(EventTypes.CYCLE_STARTED)) is not None
+    clock["ns"] += 7_000_000
+    pipeline.start()
+    assert pipeline.flush(timeout=2.0) is True
+
+    expected_timing = {
+        "event_pipeline_timing_window_ms": 51.0,
+        "event_pipeline_processed_count": 3,
+        "event_queue_wait_ms_total": 84.0,
+        "event_queue_wait_ms_max": 36.0,
+        "event_worker_service_ms_total": 20.0,
+        "event_worker_service_ms_max": 10.0,
+        "event_structured_sink_write_count": 4,
+        "event_structured_sink_service_ms_total": 10.0,
+        "event_structured_sink_service_ms_max": 3.0,
+        "event_monitor_sink_write_count": 2,
+        "event_monitor_sink_service_ms_total": 10.0,
+        "event_monitor_sink_service_ms_max": 5.0,
+    }
+    non_consuming_snapshot = pipeline.health_snapshot()
+    assert {key: non_consuming_snapshot[key] for key in expected_timing} == expected_timing
+    repeated_snapshot = pipeline.health_snapshot()
+    assert {key: repeated_snapshot[key] for key in expected_timing} == expected_timing
+    consumed_snapshot, consumed_token = pipeline.consume_timing_snapshot()
+    assert {key: consumed_snapshot[key] for key in expected_timing} == expected_timing
+    pipeline.restore_timing_snapshot(consumed_token)
+    restored_snapshot = pipeline.health_snapshot()
+    assert {key: restored_snapshot[key] for key in expected_timing} == expected_timing
+    _confirmed_snapshot, confirmed_token = pipeline.consume_timing_snapshot()
+    pipeline.confirm_timing_snapshot(confirmed_token)
+    reset_snapshot = pipeline.health_snapshot()
+    assert {key: reset_snapshot[key] for key in expected_timing} == {
+        "event_pipeline_timing_window_ms": 0.0,
+        "event_pipeline_processed_count": 0,
+        "event_queue_wait_ms_total": 0.0,
+        "event_queue_wait_ms_max": 0.0,
+        "event_worker_service_ms_total": 0.0,
+        "event_worker_service_ms_max": 0.0,
+        "event_structured_sink_write_count": 0,
+        "event_structured_sink_service_ms_total": 0.0,
+        "event_structured_sink_service_ms_max": 0.0,
+        "event_monitor_sink_write_count": 0,
+        "event_monitor_sink_service_ms_total": 0.0,
+        "event_monitor_sink_service_ms_max": 0.0,
+    }
+    assert len(console.events) == 1
+    assert len(text.events) == 1
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_pipeline_aggregates_and_resets_monitor_publisher_phase_timing(monkeypatch):
+    clock = {"ns": 1_000_000_000}
+    monkeypatch.setattr(
+        live_event_bus_module.time,
+        "monotonic_ns",
+        lambda: clock["ns"],
+    )
+    original_to_monitor_event = LiveEvent.to_monitor_event
+
+    def timed_to_monitor_event(event):
+        clock["ns"] += 1_000_000
+        return original_to_monitor_event(event)
+
+    class TimedPublisher:
+        def __init__(self):
+            self.timings = iter(
+                (
+                    {
+                        "lock_wait_ns": 2_000_000,
+                        "rotation_ns": 3_000_000,
+                        "persist_ns": 5_000_000,
+                        "maintenance_ns": 7_000_000,
+                        "manifest_checkpoint_count": 1,
+                        "manifest_checkpoint_ns_total": 2_000_000,
+                        "manifest_checkpoint_ns_max": 2_000_000,
+                        "retention_run_count": 1,
+                        "retention_ns_total": 4_000_000,
+                        "retention_ns_max": 4_000_000,
+                        "retention_thread_cpu_ns_total": 1_500_000,
+                        "retention_thread_cpu_ns_max": 1_500_000,
+                        "retention_non_cpu_ns_total": 2_500_000,
+                        "retention_non_cpu_ns_max": 2_500_000,
+                        "retention_inventory_ns_total": 3_000_000,
+                        "retention_inventory_ns_max": 3_000_000,
+                        "retention_age_filter_ns_total": 1_800_000,
+                        "retention_age_filter_ns_max": 1_800_000,
+                        "retention_cap_prune_ns_total": 1_000_000,
+                        "retention_cap_prune_ns_max": 1_000_000,
+                        "retention_age_unlink_ns_total": 700_000,
+                        "retention_age_unlink_ns_max": 700_000,
+                        "retention_cap_unlink_ns_total": 300_000,
+                        "retention_cap_unlink_ns_max": 300_000,
+                        "retention_inventory_entries_visited": 11,
+                        "retention_inventory_candidates": 7,
+                        "retention_age_deleted": 2,
+                        "retention_cap_deleted": 1,
+                    },
+                    {
+                        "lock_wait_ns": 11_000_000,
+                        "rotation_ns": 13_000_000,
+                        "persist_ns": 17_000_000,
+                        "maintenance_ns": 19_000_000,
+                        "manifest_checkpoint_count": 0,
+                        "manifest_checkpoint_ns_total": 0,
+                        "manifest_checkpoint_ns_max": 0,
+                        "retention_run_count": 0,
+                        "retention_ns_total": 0,
+                        "retention_ns_max": 0,
+                        "retention_thread_cpu_ns_total": 0,
+                        "retention_thread_cpu_ns_max": 0,
+                        "retention_non_cpu_ns_total": 0,
+                        "retention_non_cpu_ns_max": 0,
+                        "retention_inventory_ns_total": 0,
+                        "retention_inventory_ns_max": 0,
+                        "retention_age_filter_ns_total": 0,
+                        "retention_age_filter_ns_max": 0,
+                        "retention_cap_prune_ns_total": 0,
+                        "retention_cap_prune_ns_max": 0,
+                        "retention_age_unlink_ns_total": 0,
+                        "retention_age_unlink_ns_max": 0,
+                        "retention_cap_unlink_ns_total": 0,
+                        "retention_cap_unlink_ns_max": 0,
+                        "retention_inventory_entries_visited": 0,
+                        "retention_inventory_candidates": 0,
+                        "retention_age_deleted": 0,
+                        "retention_cap_deleted": 0,
+                    },
+                )
+            )
+
+        def _record_event_timed(self, kind, *_args, **_kwargs):
+            return {"kind": kind}, next(self.timings)
+
+    monkeypatch.setattr(LiveEvent, "to_monitor_event", timed_to_monitor_event)
+    pipeline = LiveEventPipeline(
+        start=False,
+        monitor_sinks=[
+            MonitorEventSink(TimedPublisher(), publisher_phase_timing=True)
+        ],
+        routes={EventTypes.SNAPSHOT_BUILT: EventRoute(structured=False, monitor=True)},
+    )
+
+    assert pipeline.emit(LiveEvent(EventTypes.SNAPSHOT_BUILT)) is not None
+    assert pipeline.emit(LiveEvent(EventTypes.SNAPSHOT_BUILT)) is not None
+    pipeline.start()
+    assert pipeline.flush(timeout=2.0) is True
+
+    expected = {
+        "event_monitor_prepare_ms_total": 2.0,
+        "event_monitor_prepare_ms_max": 1.0,
+        "event_monitor_publisher_lock_wait_ms_total": 13.0,
+        "event_monitor_publisher_lock_wait_ms_max": 11.0,
+        "event_monitor_publisher_rotation_ms_total": 16.0,
+        "event_monitor_publisher_rotation_ms_max": 13.0,
+        "event_monitor_publisher_persist_ms_total": 22.0,
+        "event_monitor_publisher_persist_ms_max": 17.0,
+        "event_monitor_publisher_maintenance_ms_total": 26.0,
+        "event_monitor_publisher_maintenance_ms_max": 19.0,
+        "event_monitor_publisher_manifest_checkpoint_count": 1,
+        "event_monitor_publisher_manifest_checkpoint_ms_total": 2.0,
+        "event_monitor_publisher_manifest_checkpoint_ms_max": 2.0,
+        "event_monitor_publisher_retention_run_count": 1,
+        "event_monitor_publisher_retention_ms_total": 4.0,
+        "event_monitor_publisher_retention_ms_max": 4.0,
+        "event_monitor_publisher_retention_thread_cpu_ms_total": 1.5,
+        "event_monitor_publisher_retention_thread_cpu_ms_max": 1.5,
+        "event_monitor_publisher_retention_non_cpu_ms_total": 2.5,
+        "event_monitor_publisher_retention_non_cpu_ms_max": 2.5,
+        "event_monitor_publisher_retention_inventory_ms_total": 3.0,
+        "event_monitor_publisher_retention_inventory_ms_max": 3.0,
+        "event_monitor_publisher_retention_age_filter_ms_total": 1.8,
+        "event_monitor_publisher_retention_age_filter_ms_max": 1.8,
+        "event_monitor_publisher_retention_cap_prune_ms_total": 1.0,
+        "event_monitor_publisher_retention_cap_prune_ms_max": 1.0,
+        "event_monitor_publisher_retention_age_unlink_ms_total": 0.7,
+        "event_monitor_publisher_retention_age_unlink_ms_max": 0.7,
+        "event_monitor_publisher_retention_cap_unlink_ms_total": 0.3,
+        "event_monitor_publisher_retention_cap_unlink_ms_max": 0.3,
+        "event_monitor_publisher_retention_inventory_entries_visited": 11,
+        "event_monitor_publisher_retention_inventory_candidates": 7,
+        "event_monitor_publisher_retention_age_deleted": 2,
+        "event_monitor_publisher_retention_cap_deleted": 1,
+    }
+    snapshot = pipeline.health_snapshot()
+    assert {key: snapshot[key] for key in expected} == expected
+    _consumed, token = pipeline.consume_timing_snapshot()
+    pipeline.confirm_timing_snapshot(token)
+    reset = pipeline.health_snapshot()
+    assert {key: reset[key] for key in expected} == {key: 0.0 for key in expected}
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_pipeline_monitor_phase_timing_restores_overlapping_window(monkeypatch):
+    clock = {"ns": 1_000_000_000}
+    monkeypatch.setattr(
+        live_event_bus_module.time,
+        "monotonic_ns",
+        lambda: clock["ns"],
+    )
+    pipeline = LiveEventPipeline(start=False)
+    pipeline._timing_monitor_prepare_ns_total = 2_000_000
+    pipeline._timing_monitor_prepare_ns_max = 2_000_000
+    pipeline._timing_monitor_publisher_persist_ns_total = 3_000_000
+    pipeline._timing_monitor_publisher_persist_ns_max = 3_000_000
+    pipeline._timing_monitor_publisher_manifest_checkpoint_count = 2
+    pipeline._timing_monitor_publisher_manifest_checkpoint_ns_total = 13_000_000
+    pipeline._timing_monitor_publisher_manifest_checkpoint_ns_max = 8_000_000
+    pipeline._timing_monitor_publisher_retention_run_count = 3
+    pipeline._timing_monitor_publisher_retention_ns_total = 17_000_000
+    pipeline._timing_monitor_publisher_retention_ns_max = 9_000_000
+    pipeline._timing_monitor_publisher_retention_thread_cpu_ns_total = 7_000_000
+    pipeline._timing_monitor_publisher_retention_thread_cpu_ns_max = 4_000_000
+    pipeline._timing_monitor_publisher_retention_non_cpu_ns_total = 10_000_000
+    pipeline._timing_monitor_publisher_retention_non_cpu_ns_max = 5_000_000
+    pipeline._timing_monitor_publisher_retention_inventory_ns_total = 11_000_000
+    pipeline._timing_monitor_publisher_retention_inventory_ns_max = 6_000_000
+    pipeline._timing_monitor_publisher_retention_age_filter_ns_total = 8_000_000
+    pipeline._timing_monitor_publisher_retention_age_filter_ns_max = 5_000_000
+    pipeline._timing_monitor_publisher_retention_cap_prune_ns_total = 6_000_000
+    pipeline._timing_monitor_publisher_retention_cap_prune_ns_max = 4_000_000
+    pipeline._timing_monitor_publisher_retention_age_unlink_ns_total = 4_000_000
+    pipeline._timing_monitor_publisher_retention_age_unlink_ns_max = 3_000_000
+    pipeline._timing_monitor_publisher_retention_cap_unlink_ns_total = 2_000_000
+    pipeline._timing_monitor_publisher_retention_cap_unlink_ns_max = 1_000_000
+    pipeline._timing_monitor_publisher_retention_inventory_entries_visited = 31
+    pipeline._timing_monitor_publisher_retention_inventory_candidates = 13
+    pipeline._timing_monitor_publisher_retention_age_deleted = 4
+    pipeline._timing_monitor_publisher_retention_cap_deleted = 2
+
+    first, first_token = pipeline.consume_timing_snapshot()
+    pipeline._timing_monitor_prepare_ns_total = 5_000_000
+    pipeline._timing_monitor_prepare_ns_max = 5_000_000
+    pipeline._timing_monitor_publisher_persist_ns_total = 7_000_000
+    pipeline._timing_monitor_publisher_persist_ns_max = 7_000_000
+    pipeline._timing_monitor_publisher_manifest_checkpoint_count = 5
+    pipeline._timing_monitor_publisher_manifest_checkpoint_ns_total = 19_000_000
+    pipeline._timing_monitor_publisher_manifest_checkpoint_ns_max = 12_000_000
+    pipeline._timing_monitor_publisher_retention_run_count = 7
+    pipeline._timing_monitor_publisher_retention_ns_total = 23_000_000
+    pipeline._timing_monitor_publisher_retention_ns_max = 14_000_000
+    pipeline._timing_monitor_publisher_retention_thread_cpu_ns_total = 8_000_000
+    pipeline._timing_monitor_publisher_retention_thread_cpu_ns_max = 5_000_000
+    pipeline._timing_monitor_publisher_retention_non_cpu_ns_total = 15_000_000
+    pipeline._timing_monitor_publisher_retention_non_cpu_ns_max = 9_000_000
+    pipeline._timing_monitor_publisher_retention_inventory_ns_total = 17_000_000
+    pipeline._timing_monitor_publisher_retention_inventory_ns_max = 10_000_000
+    pipeline._timing_monitor_publisher_retention_age_filter_ns_total = 13_000_000
+    pipeline._timing_monitor_publisher_retention_age_filter_ns_max = 9_000_000
+    pipeline._timing_monitor_publisher_retention_cap_prune_ns_total = 11_000_000
+    pipeline._timing_monitor_publisher_retention_cap_prune_ns_max = 8_000_000
+    pipeline._timing_monitor_publisher_retention_age_unlink_ns_total = 5_000_000
+    pipeline._timing_monitor_publisher_retention_age_unlink_ns_max = 4_000_000
+    pipeline._timing_monitor_publisher_retention_cap_unlink_ns_total = 3_000_000
+    pipeline._timing_monitor_publisher_retention_cap_unlink_ns_max = 2_000_000
+    pipeline._timing_monitor_publisher_retention_inventory_entries_visited = 47
+    pipeline._timing_monitor_publisher_retention_inventory_candidates = 19
+    pipeline._timing_monitor_publisher_retention_age_deleted = 6
+    pipeline._timing_monitor_publisher_retention_cap_deleted = 3
+    _second, second_token = pipeline.consume_timing_snapshot()
+    pipeline.confirm_timing_snapshot(first_token)
+    pipeline.restore_timing_snapshot(second_token)
+
+    assert first["event_monitor_prepare_ms_total"] == 2.0
+    assert first["event_monitor_publisher_persist_ms_total"] == 3.0
+    assert first["event_monitor_publisher_manifest_checkpoint_count"] == 2
+    assert first["event_monitor_publisher_retention_run_count"] == 3
+    restored = pipeline.health_snapshot()
+    assert restored["event_monitor_prepare_ms_total"] == 5.0
+    assert restored["event_monitor_prepare_ms_max"] == 5.0
+    assert restored["event_monitor_publisher_persist_ms_total"] == 7.0
+    assert restored["event_monitor_publisher_persist_ms_max"] == 7.0
+    assert restored["event_monitor_publisher_manifest_checkpoint_count"] == 5
+    assert restored["event_monitor_publisher_manifest_checkpoint_ms_total"] == 19.0
+    assert restored["event_monitor_publisher_manifest_checkpoint_ms_max"] == 12.0
+    assert restored["event_monitor_publisher_retention_run_count"] == 7
+    assert restored["event_monitor_publisher_retention_ms_total"] == 23.0
+    assert restored["event_monitor_publisher_retention_ms_max"] == 14.0
+    assert restored["event_monitor_publisher_retention_thread_cpu_ms_total"] == 8.0
+    assert restored["event_monitor_publisher_retention_thread_cpu_ms_max"] == 5.0
+    assert restored["event_monitor_publisher_retention_non_cpu_ms_total"] == 15.0
+    assert restored["event_monitor_publisher_retention_non_cpu_ms_max"] == 9.0
+    assert restored["event_monitor_publisher_retention_inventory_ms_total"] == 17.0
+    assert restored["event_monitor_publisher_retention_inventory_ms_max"] == 10.0
+    assert restored["event_monitor_publisher_retention_age_filter_ms_total"] == 13.0
+    assert restored["event_monitor_publisher_retention_age_filter_ms_max"] == 9.0
+    assert restored["event_monitor_publisher_retention_cap_prune_ms_total"] == 11.0
+    assert restored["event_monitor_publisher_retention_cap_prune_ms_max"] == 8.0
+    assert restored["event_monitor_publisher_retention_age_unlink_ms_total"] == 5.0
+    assert restored["event_monitor_publisher_retention_age_unlink_ms_max"] == 4.0
+    assert restored["event_monitor_publisher_retention_cap_unlink_ms_total"] == 3.0
+    assert restored["event_monitor_publisher_retention_cap_unlink_ms_max"] == 2.0
+    assert restored["event_monitor_publisher_retention_inventory_entries_visited"] == 47
+    assert restored["event_monitor_publisher_retention_inventory_candidates"] == 19
+    assert restored["event_monitor_publisher_retention_age_deleted"] == 6
+    assert restored["event_monitor_publisher_retention_cap_deleted"] == 3
+
+
+def test_pipeline_custom_monitor_sink_reports_zero_internal_phase_timing():
+    class CustomMonitorSink:
+        def write(self, event):
+            return event
+
+    pipeline = LiveEventPipeline(
+        monitor_sinks=[CustomMonitorSink()],
+        routes={EventTypes.SNAPSHOT_BUILT: EventRoute(structured=False, monitor=True)},
+    )
+
+    assert pipeline.emit(LiveEvent(EventTypes.SNAPSHOT_BUILT)) is not None
+    assert pipeline.flush(timeout=2.0) is True
+    timing = pipeline.health_snapshot()
+    assert {
+        key: timing[key]
+        for key in timing
+        if key.startswith("event_monitor_prepare_ms")
+        or key.startswith("event_monitor_publisher_")
+    } == {
+        "event_monitor_prepare_ms_total": 0.0,
+        "event_monitor_prepare_ms_max": 0.0,
+        "event_monitor_publisher_lock_wait_ms_total": 0.0,
+        "event_monitor_publisher_lock_wait_ms_max": 0.0,
+        "event_monitor_publisher_rotation_ms_total": 0.0,
+        "event_monitor_publisher_rotation_ms_max": 0.0,
+        "event_monitor_publisher_persist_ms_total": 0.0,
+        "event_monitor_publisher_persist_ms_max": 0.0,
+        "event_monitor_publisher_maintenance_ms_total": 0.0,
+        "event_monitor_publisher_maintenance_ms_max": 0.0,
+        "event_monitor_publisher_manifest_checkpoint_count": 0,
+        "event_monitor_publisher_manifest_checkpoint_ms_total": 0.0,
+        "event_monitor_publisher_manifest_checkpoint_ms_max": 0.0,
+        "event_monitor_publisher_retention_run_count": 0,
+        "event_monitor_publisher_retention_ms_total": 0.0,
+        "event_monitor_publisher_retention_ms_max": 0.0,
+        "event_monitor_publisher_retention_thread_cpu_ms_total": 0.0,
+        "event_monitor_publisher_retention_thread_cpu_ms_max": 0.0,
+        "event_monitor_publisher_retention_non_cpu_ms_total": 0.0,
+        "event_monitor_publisher_retention_non_cpu_ms_max": 0.0,
+        "event_monitor_publisher_retention_inventory_ms_total": 0.0,
+        "event_monitor_publisher_retention_inventory_ms_max": 0.0,
+        "event_monitor_publisher_retention_age_filter_ms_total": 0.0,
+        "event_monitor_publisher_retention_age_filter_ms_max": 0.0,
+        "event_monitor_publisher_retention_cap_prune_ms_total": 0.0,
+        "event_monitor_publisher_retention_cap_prune_ms_max": 0.0,
+        "event_monitor_publisher_retention_age_unlink_ms_total": 0.0,
+        "event_monitor_publisher_retention_age_unlink_ms_max": 0.0,
+        "event_monitor_publisher_retention_cap_unlink_ms_total": 0.0,
+        "event_monitor_publisher_retention_cap_unlink_ms_max": 0.0,
+        "event_monitor_publisher_retention_inventory_entries_visited": 0,
+        "event_monitor_publisher_retention_inventory_candidates": 0,
+        "event_monitor_publisher_retention_age_deleted": 0,
+        "event_monitor_publisher_retention_cap_deleted": 0,
+    }
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_monitor_event_sink_custom_publisher_ignores_private_timing_name_collision():
+    class CustomPublisher:
+        def __init__(self):
+            self.recorded = []
+
+        def record_event(self, kind, *_args, **_kwargs):
+            self.recorded.append(kind)
+            return {"kind": kind}
+
+        def _record_event_timed(self, *_args, **_kwargs):
+            raise AssertionError("private timing hook must require explicit opt-in")
+
+    publisher = CustomPublisher()
+    event = LiveEvent(EventTypes.SNAPSHOT_BUILT)
+
+    result = MonitorEventSink(publisher).write(event)
+
+    assert result == {"kind": EventTypes.SNAPSHOT_BUILT}
+    assert publisher.recorded == [EventTypes.SNAPSHOT_BUILT]
+
+
+def test_pipeline_monitor_publisher_failure_retains_phase_timing(monkeypatch):
+    clock = {"ns": 1_000_000_000}
+    monkeypatch.setattr(
+        live_event_bus_module.time,
+        "monotonic_ns",
+        lambda: clock["ns"],
+    )
+
+    class FailingPublisher:
+        def _record_event_timed(self, *_args, **_kwargs):
+            return (
+                None,
+                {
+                    "lock_wait_ns": 2_000_000,
+                    "rotation_ns": 3_000_000,
+                    "persist_ns": 5_000_000,
+                    "maintenance_ns": 0,
+                },
+            )
+
+    pipeline = LiveEventPipeline(
+        monitor_sinks=[
+            MonitorEventSink(FailingPublisher(), publisher_phase_timing=True)
+        ],
+        routes={EventTypes.SNAPSHOT_BUILT: EventRoute(structured=False, monitor=True)},
+    )
+
+    assert pipeline.emit(LiveEvent(EventTypes.SNAPSHOT_BUILT)) is not None
+    assert pipeline.flush(timeout=2.0) is True
+    timing = pipeline.health_snapshot()
+    assert timing["event_monitor_publisher_lock_wait_ms_total"] == 2.0
+    assert timing["event_monitor_publisher_rotation_ms_total"] == 3.0
+    assert timing["event_monitor_publisher_persist_ms_total"] == 5.0
+    assert timing["event_monitor_publisher_maintenance_ms_total"] == 0.0
+    assert pipeline.sink_error_counters["monitor"] == 1
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_pipeline_retains_prepare_timing_when_monitor_conversion_fails(monkeypatch):
+    clock = {"ns": 1_000_000_000}
+    monkeypatch.setattr(
+        live_event_bus_module.time,
+        "monotonic_ns",
+        lambda: clock["ns"],
+    )
+
+    def fail_to_monitor_event(_event):
+        clock["ns"] += 4_000_000
+        raise ValueError("bad monitor event")
+
+    class Publisher:
+        def record_event(self, *_args, **_kwargs):
+            raise AssertionError("publisher must not receive a failed conversion")
+
+    monkeypatch.setattr(LiveEvent, "to_monitor_event", fail_to_monitor_event)
+    pipeline = LiveEventPipeline(
+        monitor_sinks=[MonitorEventSink(Publisher())],
+        routes={EventTypes.SNAPSHOT_BUILT: EventRoute(structured=False, monitor=True)},
+    )
+
+    assert pipeline.emit(LiveEvent(EventTypes.SNAPSHOT_BUILT)) is not None
+    assert pipeline.flush(timeout=2.0) is True
+    timing = pipeline.health_snapshot()
+    assert timing["event_monitor_prepare_ms_total"] == 4.0
+    assert timing["event_monitor_prepare_ms_max"] == 4.0
+    assert timing["event_monitor_publisher_lock_wait_ms_total"] == 0.0
+    assert pipeline.sink_error_counters["monitor"] == 1
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_pipeline_overlapping_timing_snapshots_resolve_by_token(monkeypatch):
+    clock = {"ns": 1_000_000_000}
+    monkeypatch.setattr(
+        live_event_bus_module.time,
+        "monotonic_ns",
+        lambda: clock["ns"],
+    )
+    pipeline = LiveEventPipeline(start=False)
+    pipeline._timing_processed_count = 7
+    pipeline._timing_structured_sink_write_count = 2
+    pipeline._timing_structured_sink_service_ns_total = 3_000_000
+    pipeline._timing_structured_sink_service_ns_max = 2_000_000
+    pipeline._timing_monitor_sink_write_count = 3
+    pipeline._timing_monitor_sink_service_ns_total = 8_000_000
+    pipeline._timing_monitor_sink_service_ns_max = 4_000_000
+
+    first, first_token = pipeline.consume_timing_snapshot()
+    pipeline._timing_processed_count = 3
+    pipeline._timing_structured_sink_write_count = 5
+    pipeline._timing_structured_sink_service_ns_total = 11_000_000
+    pipeline._timing_structured_sink_service_ns_max = 7_000_000
+    pipeline._timing_monitor_sink_write_count = 1
+    pipeline._timing_monitor_sink_service_ns_total = 6_000_000
+    pipeline._timing_monitor_sink_service_ns_max = 6_000_000
+    clock["ns"] += 1_000_000
+    second, second_token = pipeline.consume_timing_snapshot()
+    pipeline.confirm_timing_snapshot(first_token)
+    pipeline.restore_timing_snapshot(second_token)
+
+    assert first["event_pipeline_processed_count"] == 7
+    assert first["event_structured_sink_write_count"] == 2
+    assert first["event_monitor_sink_write_count"] == 3
+    assert second["event_pipeline_processed_count"] == 3
+    assert second["event_structured_sink_write_count"] == 5
+    assert second["event_structured_sink_service_ms_total"] == 11
+    assert second["event_structured_sink_service_ms_max"] == 7
+    assert second["event_monitor_sink_write_count"] == 1
+    assert second["event_monitor_sink_service_ms_total"] == 6
+    assert second["event_monitor_sink_service_ms_max"] == 6
+    restored = pipeline.health_snapshot()
+    assert restored["event_pipeline_processed_count"] == 3
+    assert restored["event_structured_sink_write_count"] == 5
+    assert restored["event_monitor_sink_write_count"] == 1
+
+
+def test_pipeline_restore_merges_newly_processed_timing(monkeypatch):
+    clock = {"ns": 1_000_000_000}
+    monkeypatch.setattr(
+        live_event_bus_module.time,
+        "monotonic_ns",
+        lambda: clock["ns"],
+    )
+    pipeline = LiveEventPipeline(start=False)
+    pipeline._timing_processed_count = 5
+    pipeline._timing_queue_wait_ns_total = 8_000_000
+    pipeline._timing_queue_wait_ns_max = 3_000_000
+    pipeline._timing_worker_service_ns_total = 12_000_000
+    pipeline._timing_worker_service_ns_max = 5_000_000
+    pipeline._timing_structured_sink_write_count = 3
+    pipeline._timing_structured_sink_service_ns_total = 21_000_000
+    pipeline._timing_structured_sink_service_ns_max = 9_000_000
+    pipeline._timing_monitor_sink_write_count = 4
+    pipeline._timing_monitor_sink_service_ns_total = 30_000_000
+    pipeline._timing_monitor_sink_service_ns_max = 11_000_000
+    _snapshot, token = pipeline.consume_timing_snapshot()
+
+    pipeline._timing_processed_count = 2
+    pipeline._timing_queue_wait_ns_total = 7_000_000
+    pipeline._timing_queue_wait_ns_max = 6_000_000
+    pipeline._timing_worker_service_ns_total = 4_000_000
+    pipeline._timing_worker_service_ns_max = 3_000_000
+    pipeline._timing_structured_sink_write_count = 2
+    pipeline._timing_structured_sink_service_ns_total = 8_000_000
+    pipeline._timing_structured_sink_service_ns_max = 6_000_000
+    pipeline._timing_monitor_sink_write_count = 1
+    pipeline._timing_monitor_sink_service_ns_total = 12_000_000
+    pipeline._timing_monitor_sink_service_ns_max = 12_000_000
+    pipeline.restore_timing_snapshot(token)
+
+    restored = pipeline.health_snapshot()
+    assert restored["event_pipeline_processed_count"] == 7
+    assert restored["event_queue_wait_ms_total"] == 15
+    assert restored["event_queue_wait_ms_max"] == 6
+    assert restored["event_worker_service_ms_total"] == 16
+    assert restored["event_worker_service_ms_max"] == 5
+    assert restored["event_structured_sink_write_count"] == 5
+    assert restored["event_structured_sink_service_ms_total"] == 29
+    assert restored["event_structured_sink_service_ms_max"] == 9
+    assert restored["event_monitor_sink_write_count"] == 5
+    assert restored["event_monitor_sink_service_ms_total"] == 42
+    assert restored["event_monitor_sink_service_ms_max"] == 12
+
+
+def test_pipeline_queue_overflow_is_logged_and_monitor_visible(caplog):
+    monitor = ListEventSink()
+    pipeline = LiveEventPipeline(
+        queue_maxsize=1,
+        start=False,
+        monitor_sinks=[monitor],
+        routes={
+            EventTypes.DATA_PACKET_UPDATED: EventRoute(
+                structured=False, monitor=True, console=False
+            )
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert pipeline.emit(LiveEvent(EventTypes.DATA_PACKET_UPDATED)) is not None
+        assert (
+            pipeline.emit(
+                LiveEvent(EventTypes.DATA_PACKET_UPDATED),
+                require_enqueue=True,
+            )
+            is None
+        )
+
+    assert pipeline.drop_counters[EventTypes.DATA_PACKET_UPDATED] == 1
+    assert monitor.events[-1].event_type == EventTypes.SINK_DEGRADED
+    assert monitor.events[-1].reason_code == "queue_full"
+    assert any("live event queue full" in record.message for record in caplog.records)
+
+
+def test_sink_failure_degrades_observability_without_raising(monkeypatch, caplog):
+    clock = {"ns": 1_000_000_000}
+    secret = "sink-secret"
+    hostile_type_name = "SinkApiKeyFailure"
+    HostileSinkFailure = type(hostile_type_name, (OSError,), {})
+    monkeypatch.setattr(
+        live_event_bus_module.time,
+        "monotonic_ns",
+        lambda: clock["ns"],
+    )
+
+    class FailingSink:
+        def write(self, event):
+            clock["ns"] += 3_000_000
+            raise HostileSinkFailure(
+                f"disk full https://example.invalid/private?api_key={secret}\nTraceback"
+            )
+
+    class ControlledMonitorSink(ListEventSink):
+        def write(self, event):
+            clock["ns"] += 5_000_000
+            return super().write(event)
+
+    monitor = ControlledMonitorSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[FailingSink()],
+        monitor_sinks=[monitor],
+        routes={EventTypes.SNAPSHOT_BUILT: EventRoute(structured=True, monitor=False)},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        event = pipeline.emit(LiveEvent(EventTypes.SNAPSHOT_BUILT))
+        assert pipeline.flush(timeout=2.0) is True
+
+    assert event.event_type == EventTypes.SNAPSHOT_BUILT
+    assert pipeline.sink_error_counters["structured"] == 1
+    timing = pipeline.health_snapshot()
+    assert timing["event_structured_sink_write_count"] == 1
+    assert timing["event_structured_sink_service_ms_total"] == 3
+    assert timing["event_structured_sink_service_ms_max"] == 3
+    assert timing["event_monitor_sink_write_count"] == 1
+    assert timing["event_monitor_sink_service_ms_total"] == 5
+    assert timing["event_monitor_sink_service_ms_max"] == 5
+    assert pipeline.degraded_events[-1].reason_code == "structured_sink_failed"
+    assert pipeline.degraded_events[-1].data == {
+        "sink": "structured",
+        "error_type": "OSError",
+    }
+    assert monitor.events[-1].event_type == EventTypes.SINK_DEGRADED
+    assert monitor.events[-1].reason_code == "structured_sink_failed"
+    assert monitor.events[-1].data == {
+        "sink": "structured",
+        "error_type": "OSError",
+    }
+    emitted_diagnostics = "\n".join(
+        [repr(pipeline.degraded_events), repr(monitor.events)]
+        + [record.getMessage() for record in caplog.records]
+    )
+    for unsafe_value in (
+        hostile_type_name,
+        secret,
+        "example.invalid",
+        "Traceback",
+    ):
+        assert unsafe_value not in emitted_diagnostics
+    assert pipeline.close(timeout=2.0) is True
+
+
+@pytest.mark.parametrize("prepare_error", [False, True])
+def test_degraded_monitor_warning_uses_bounded_exception_type(caplog, prepare_error):
+    secret = "monitor-secret"
+    hostile_type_name = "MonitorTokenFailure"
+    HostileMonitorFailure = type(hostile_type_name, (OSError,), {})
+
+    class FailingMonitor(MonitorEventSink):
+        def _write_with_timing(self, event):
+            error = HostileMonitorFailure(
+                f"https://example.invalid/monitor?token={secret}\nTraceback"
+            )
+            if prepare_error:
+                raise live_event_bus_module._MonitorEventPrepareError(
+                    error,
+                    live_event_bus_module._empty_monitor_phase_timing(),
+                )
+            raise error
+
+    pipeline = LiveEventPipeline(
+        monitor_sinks=[FailingMonitor(object())],
+        start=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        pipeline._record_degraded(
+            reason_code=ReasonCodes.QUEUE_FULL,
+            message="live event queue full; dropped unknown_event",
+            data={"dropped_event_type": "unknown_event"},
+        )
+
+    assert pipeline.sink_error_counters["monitor"] == 1
+    assert pipeline.degraded_events[-1].data == {"dropped_event_type": "unknown_event"}
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "failed to emit sink.degraded to monitor: OSError" in messages
+    for unsafe_value in (
+        hostile_type_name,
+        secret,
+        "example.invalid",
+        "Traceback",
+    ):
+        assert unsafe_value not in messages
+
+
+@pytest.mark.parametrize("pipeline_closing", [False, True])
+def test_drop_diagnostics_bound_hostile_event_types(caplog, pipeline_closing):
+    secret = "event-secret"
+    hostile_event_type = f"secret.event https://example.invalid/?token={secret}\nTraceback"
+    monitor = ListEventSink()
+    pipeline = LiveEventPipeline(
+        queue_maxsize=1,
+        start=False,
+        monitor_sinks=[monitor],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        if pipeline_closing:
+            pipeline._stop.set()
+        else:
+            assert pipeline.emit(LiveEvent(hostile_event_type)) is not None
+        assert (
+            pipeline.emit(LiveEvent(hostile_event_type), require_enqueue=True) is None
+        )
+
+    expected_reason = (
+        ReasonCodes.SINK_PIPELINE_CLOSING if pipeline_closing else ReasonCodes.QUEUE_FULL
+    )
+    assert pipeline.drop_counters == {"unknown_event": 1}
+    assert pipeline.health_snapshot()["event_drop_counts"] == {"unknown_event": 1}
+    assert pipeline.degraded_events[-1].reason_code == expected_reason
+    assert pipeline.degraded_events[-1].data == {"dropped_event_type": "unknown_event"}
+    assert monitor.events[-1] == pipeline.degraded_events[-1]
+    emitted_diagnostics = "\n".join(
+        [repr(pipeline.degraded_events), repr(monitor.events)]
+        + [record.getMessage() for record in caplog.records]
+    )
+    for unsafe_value in (hostile_event_type, secret, "example.invalid", "Traceback"):
+        assert unsafe_value not in emitted_diagnostics
+
+
+def test_monitor_sink_none_ack_records_monitor_sink_failure():
+    class NonePublisher:
+        def record_event(self, *args, **kwargs):
+            return None
+
+    pipeline = LiveEventPipeline(
+        monitor_sinks=[MonitorEventSink(NonePublisher())],
+        routes={EventTypes.SNAPSHOT_BUILT: EventRoute(structured=False, monitor=True)},
+    )
+
+    event = pipeline.emit(LiveEvent(EventTypes.SNAPSHOT_BUILT))
+
+    assert event.event_type == EventTypes.SNAPSHOT_BUILT
+    assert pipeline.flush(timeout=2.0) is True
+    assert pipeline.sink_error_counters["monitor"] == 1
+    assert pipeline.health_snapshot()["event_monitor_sink_write_count"] == 1
+    assert pipeline.degraded_events[-1].reason_code == "monitor_sink_failed"
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_pipeline_close_drains_queued_events_after_close_starts():
+    class SlowSink:
+        def __init__(self):
+            self.events = []
+
+        def write(self, event):
+            time.sleep(0.02)
+            self.events.append(event)
+            return event
+
+    sink = SlowSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[sink],
+        routes={EventTypes.DATA_PACKET_UPDATED: EventRoute(structured=True, monitor=False)},
+    )
+
+    for _ in range(5):
+        pipeline.emit(LiveEvent(EventTypes.DATA_PACKET_UPDATED))
+
+    assert pipeline.close(timeout=2.0) is True
+    assert [event.event_type for event in sink.events] == [
+        EventTypes.DATA_PACKET_UPDATED,
+        EventTypes.DATA_PACKET_UPDATED,
+        EventTypes.DATA_PACKET_UPDATED,
+        EventTypes.DATA_PACKET_UPDATED,
+        EventTypes.DATA_PACKET_UPDATED,
+    ]
+
+
+def test_pipeline_rejects_new_async_events_after_close_begins():
+    pipeline = LiveEventPipeline(
+        start=False,
+        routes={EventTypes.DATA_PACKET_UPDATED: EventRoute(structured=True, monitor=False)},
+    )
+
+    closer = threading.Thread(target=lambda: pipeline.close(timeout=0.1))
+    closer.start()
+    closer.join(timeout=1.0)
+
+    assert (
+        pipeline.emit(
+            LiveEvent(EventTypes.DATA_PACKET_UPDATED),
+            require_enqueue=True,
+        )
+        is None
+    )
+    assert pipeline.degraded_events[-1].reason_code == "pipeline_closing"
+
+
+def test_pipeline_close_waits_for_in_flight_enqueue_before_sentinel():
+    class BlockingQueue(queue.Queue):
+        def __init__(self):
+            super().__init__(maxsize=10)
+            self.entered_put_nowait = threading.Event()
+            self.release_put_nowait = threading.Event()
+
+        def put_nowait(self, item):
+            if isinstance(getattr(item, "event", item), LiveEvent):
+                self.entered_put_nowait.set()
+                assert self.release_put_nowait.wait(timeout=2.0)
+            return super().put_nowait(item)
+
+    sink = ListEventSink()
+    blocking_queue = BlockingQueue()
+    pipeline = LiveEventPipeline(
+        start=False,
+        structured_sinks=[sink],
+        routes={EventTypes.DATA_PACKET_UPDATED: EventRoute(structured=True, monitor=False)},
+    )
+    pipeline._queue = blocking_queue
+    pipeline.start()
+
+    emit_result = {}
+    close_result = {}
+
+    def emit_event():
+        emit_result["event"] = pipeline.emit(
+            LiveEvent(EventTypes.DATA_PACKET_UPDATED),
+            require_enqueue=True,
+        )
+
+    emitter = threading.Thread(target=emit_event)
+    emitter.start()
+    assert blocking_queue.entered_put_nowait.wait(timeout=2.0)
+
+    closer = threading.Thread(target=lambda: close_result.update(ok=pipeline.close(timeout=2.0)))
+    closer.start()
+    time.sleep(0.05)
+    blocking_queue.release_put_nowait.set()
+
+    emitter.join(timeout=2.0)
+    closer.join(timeout=2.0)
+
+    assert close_result["ok"] is True
+    assert emit_result["event"].event_type == EventTypes.DATA_PACKET_UPDATED
+    assert [event.event_type for event in sink.events] == [EventTypes.DATA_PACKET_UPDATED]
+    assert blocking_queue.unfinished_tasks == 0
+
+
+def test_monitor_sink_preserves_current_monitor_record_event_contract():
+    class Publisher:
+        def __init__(self):
+            self.calls = []
+
+        def record_event(self, kind, tags, payload, *, ts=None, symbol=None, pside=None):
+            self.calls.append(
+                {
+                    "kind": kind,
+                    "tags": tags,
+                    "payload": payload,
+                    "ts": ts,
+                    "symbol": symbol,
+                    "pside": pside,
+                }
+            )
+            return self.calls[-1]
+
+    publisher = Publisher()
+    event = LiveEvent(
+        EventTypes.PLANNING_UNAVAILABLE,
+        tags=("planning", "gate"),
+        exchange="binance",
+        user="binance_01",
+        bot_id="bot_1",
+        symbol="BTC/USDT:USDT",
+        pside="long",
+        side="buy",
+        order_id="order-1",
+        client_order_id="client-1",
+        data={"reason": "stale_ema"},
+        ts_ms=12345,
+    )
+
+    result = MonitorEventSink(publisher).write(event)
+
+    assert result["kind"] == EventTypes.PLANNING_UNAVAILABLE
+    assert result["tags"] == ("planning", "gate")
+    assert result["symbol"] == "BTC/USDT:USDT"
+    assert result["pside"] == "long"
+    assert result["ts"] == 12345
+    assert result["payload"]["reason"] == "stale_ema"
+    live_event = result["payload"]["_live_event"]
+    assert live_event["event_type"] == EventTypes.PLANNING_UNAVAILABLE
+    assert live_event["exchange"] == "binance"
+    assert live_event["user"] == "binance_01"
+    assert live_event["bot_id"] == "bot_1"
+    assert live_event["symbol"] == "BTC/USDT:USDT"
+    assert live_event["pside"] == "long"
+    assert live_event["side"] == "buy"
+    assert live_event["order_id"] == "order-1"
+    assert live_event["client_order_id"] == "client-1"
+    assert live_event["data"] == {"reason": "stale_ema"}
+
+
+def test_diagnostic_event_uses_pipeline_when_available_and_legacy_when_absent():
+    class BotWithPipeline:
+        exchange = "binance"
+        bot_id = "bot_1"
+
+        def __init__(self):
+            self._live_event_pipeline = LiveEventPipeline(
+                context=LiveEventContext(user="binance_01"),
+                structured_sinks=[],
+                monitor_sinks=[],
+            )
+
+        def config_get(self, keys):
+            return "binance_01"
+
+    bot = BotWithPipeline()
+    event = DiagnosticEvent.build(
+        "planning_unavailable",
+        ("planning",),
+        {"apiKey": "secret", "reason": "stale"},
+        ts_ms=1000,
+        symbol="ETH/USDT:USDT",
+        pside="long",
+    )
+
+    emitted = event.emit(bot)
+
+    assert emitted.event_type == EventTypes.PLANNING_UNAVAILABLE
+    assert emitted.exchange == "binance"
+    assert emitted.user == "binance_01"
+    assert emitted.bot_id == "bot_1"
+    assert emitted.cycle_id is None
+    assert emitted.snapshot_id is None
+    assert emitted.data["apiKey"] == REDACTED
+    assert emitted.data["reason"] == "stale"
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+    class LegacyBot:
+        def __init__(self):
+            self.calls = []
+
+        def _monitor_record_event(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return "legacy"
+
+    legacy = LegacyBot()
+    assert event.emit(legacy) == "legacy"
+    assert legacy.calls[0][0][:3] == (
+        "planning_unavailable",
+        ("planning",),
+        {"apiKey": "secret", "reason": "stale"},
+    )
+
+
+def test_diagnostic_event_carries_envelope_ids_to_pipeline():
+    class BotWithPipeline:
+        exchange = "binance"
+        bot_id = "bot_1"
+
+        def __init__(self):
+            self._live_event_pipeline = LiveEventPipeline(
+                context=LiveEventContext(user="binance_01"),
+                structured_sinks=[],
+                monitor_sinks=[],
+            )
+
+        def config_get(self, keys):
+            return "binance_01"
+
+    bot = BotWithPipeline()
+    event = DiagnosticEvent.build(
+        "snapshot.built",
+        ("diagnostic", "snapshot"),
+        {"snapshot_id": "snap_1"},
+        cycle_id="cy_7",
+        snapshot_id="snap_1",
+    )
+
+    emitted = event.emit(bot)
+
+    assert emitted.event_type == EventTypes.SNAPSHOT_BUILT
+    assert emitted.cycle_id == "cy_7"
+    assert emitted.snapshot_id == "snap_1"
+    assert emitted.data["snapshot_id"] == "snap_1"
+    assert bot._live_event_pipeline.close(timeout=2.0) is True
+
+
+def test_diagnostic_event_falls_back_to_legacy_recorder_when_pipeline_queue_is_full():
+    class BotWithFullPipeline:
+        exchange = "binance"
+        bot_id = "bot_1"
+
+        def __init__(self):
+            self.calls = []
+            self._live_event_pipeline = LiveEventPipeline(
+                queue_maxsize=1,
+                start=False,
+                structured_sinks=[],
+                monitor_sinks=[],
+                routes={
+                    EventTypes.PLANNING_UNAVAILABLE: EventRoute(
+                        structured=True, monitor=False, console=False
+                    )
+                },
+            )
+
+        def config_get(self, keys):
+            return "binance_01"
+
+        def _monitor_record_event(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return "legacy"
+
+    bot = BotWithFullPipeline()
+    first = DiagnosticEvent.build("planning_unavailable", ("planning",), {"n": 1})
+    second = DiagnosticEvent.build("planning_unavailable", ("planning",), {"n": 2})
+
+    assert first.emit(bot).event_type == EventTypes.PLANNING_UNAVAILABLE
+    assert second.emit(bot) == "legacy"
+    assert bot.calls[0][0][:3] == ("planning_unavailable", ("planning",), {"n": 2})
+
+
+def test_diagnostic_event_legacy_fallback_failure_redacts_hostile_exception_metadata(caplog):
+    secret = "https://hostile.example.invalid/v1/orders?api_key=legacy-monitor-secret"
+    unsafe_type = type("ApiKeyLegacyMonitorFailure", (RuntimeError,), {})
+
+    class LegacyBot:
+        def _monitor_record_event(self, *_args, **_kwargs):
+            raise unsafe_type(secret)
+
+    event = DiagnosticEvent.build("planning_unavailable", ("planning",), {"safe": True})
+
+    with caplog.at_level(logging.DEBUG):
+        assert event.emit(LegacyBot()) is None
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "[diagnostic] failed to emit planning_unavailable event error_type=RuntimeError"
+        in message
+        for message in messages
+    )
+    assert all(secret not in message for message in messages)
+    assert all("hostile.example.invalid" not in message for message in messages)
+    assert all("legacy-monitor-secret" not in message for message in messages)
+    assert all(unsafe_type.__name__ not in message for message in messages)
+
+
+def test_run_diagnostic_step_failure_redacts_hostile_exception_metadata(caplog):
+    secret = "https://hostile.example.invalid/v1/orders?token=diagnostic-step-secret"
+    unsafe_type = type("ApiKeyDiagnosticStepFailure", (RuntimeError,), {})
+
+    def fail():
+        raise unsafe_type(secret)
+
+    with caplog.at_level(logging.DEBUG):
+        assert run_diagnostic_step("finalize snapshot metadata", fail, default="fallback") == "fallback"
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "[diagnostic] finalize snapshot metadata failed error_type=RuntimeError" in message
+        for message in messages
+    )
+    assert all(secret not in message for message in messages)
+    assert all("hostile.example.invalid" not in message for message in messages)
+    assert all("diagnostic-step-secret" not in message for message in messages)
+    assert all(unsafe_type.__name__ not in message for message in messages)
+
+
+def test_console_format_is_compact_and_operator_facing():
+    event = LiveEvent(
+        EventTypes.PLANNING_UNAVAILABLE,
+        status="deferred",
+        cycle_id="cy_1",
+        symbol="BTC/USDT:USDT",
+        pside="long",
+        reason_code="stale_ema",
+        message="entries deferred",
+    )
+
+    expected = (
+        "[gate] deferred cycle=cy_1 symbol=BTC/USDT:USDT "
+        "pside=long reason=stale_ema entries deferred"
+    )
+    assert format_console_event(event) == expected
+
+
+def test_memory_snapshot_event_payload_is_bounded_and_monitor_safe():
+    class Bot:
+        def __init__(self):
+            self.calls = []
+
+        def _emit_live_event(self, event_type, **kwargs):
+            self.calls.append((event_type, kwargs))
+            return kwargs
+
+    bot = Bot()
+    live_event_emitters.emit_memory_snapshot_event(
+        bot,
+        rss_bytes=198 * 1024 * 1024,
+        rss_delta_pct=91.0,
+        cache_bytes=5 * 1024 * 1024,
+        cache_candles=100,
+        cache_symbols=39,
+        cache_samples=[
+            ("BTC/USDT:USDT", 2**70, 10),
+            ("https://example.invalid/secret", 3, 4),
+            ("X" * 128, 5, 6),
+            ("ignored", 7, 8),
+        ],
+        timeframe_cache_bytes=4 * 1024 * 1024,
+        timeframe_cache_ranges=115,
+        timeframe_cache_samples=[
+            ("ETH/USDT:USDT", "1m", 9, 10),
+            ("SOL/USDT:USDT", "https://bad", 11, 12),
+            ("X" * 128, "1h", 13, 14),
+            ("ignored", "1m", 15, 16),
+        ],
+        task_total=5,
+        task_pending=5,
+        task_samples=[
+            ("run_forever", 1),
+            ("secret_worker", 2),
+            ("X" * 128, 3),
+            ("Worker-1", 4),
+            ("ignored", 5),
+        ],
+    )
+
+    assert len(bot.calls) == 1
+    event_type, kwargs = bot.calls[0]
+    assert event_type == EventTypes.RESOURCE_MEMORY_SNAPSHOT
+    assert kwargs["level"] == "info"
+    assert kwargs["reason_code"] == ReasonCodes.MEMORY_SNAPSHOT
+    assert kwargs["tags"] == (
+        EventTags.RESOURCE,
+        EventTags.MEMORY,
+    )
+    data = kwargs["data"]
+    assert data["rss_bytes"] == 198 * 1024 * 1024
+    assert data["rss_delta_pct"] == 91.0
+    assert data["cache"]["bytes"] == 5 * 1024 * 1024
+    assert len(data["cache"]["samples"]) == 3
+    assert data["cache"]["samples"][0]["bytes"] == (1 << 63) - 1
+    assert data["cache"]["samples"][1]["symbol"] == "unknown"
+    assert data["cache"]["samples"][2]["symbol"] == "unknown"
+    assert len(data["timeframe_cache"]["samples"]) == 3
+    assert data["timeframe_cache"]["samples"][1]["timeframe"] == "unknown"
+    assert len(data["tasks"]["samples"]) == 4
+    assert data["tasks"]["samples"][1]["name"] == "unknown"
+    assert data["tasks"]["samples"][2]["name"] == "unknown"
+    monitor_payload = LiveEvent(event_type, data=data).to_monitor_event()[2]
+    serialized = json.dumps(monitor_payload, sort_keys=True)
+    assert "https://" not in serialized
+    assert "secret" not in serialized
+    assert "X" * 128 not in serialized
+
+
+def test_memory_snapshot_console_formatter_is_compact_and_omits_samples():
+    data = {
+        "rss_bytes": 198 * 1024 * 1024,
+        "rss_delta_pct": 91.0,
+        "cache": {
+            "bytes": 5 * 1024 * 1024,
+            "symbols": 39,
+            "samples": [{"symbol": "private-task-name", "bytes": 1, "candles": 1}],
+        },
+        "timeframe_cache": {"bytes": 4 * 1024 * 1024, "ranges": 115},
+        "tasks": {"total": 5, "pending": 5, "samples": [{"name": "private"}]},
+    }
+    message = format_memory_snapshot_console(data)
+
+    assert message == (
+        "[memory] rss=198.0MiB delta=+91.0% cache=5.0MiB/39sym "
+        "tf=4.0MiB/115rng tasks=5/5"
+    )
+    assert len(message) <= 240
+    assert "private" not in message
+    assert format_console_event(
+        LiveEvent(EventTypes.RESOURCE_MEMORY_SNAPSHOT, data=data)
+    ) == message
+
+
+def test_ema_fallback_console_route_hides_recovery_and_forager_events_but_keeps_them_durable():
+    structured = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[],
+        console_sink=console,
+        text_sink=text,
+    )
+    recovery = LiveEvent(
+        EventTypes.EMA_FALLBACK_USED,
+        ts_ms=1_000,
+        data={"close_fallback_count": 0, "close_recovered_count": 2},
+    )
+    forager = LiveEvent(
+        EventTypes.EMA_FALLBACK_USED,
+        ts_ms=1_001,
+        data={"close_fallback_count": 0, "forager_cached_fallback_count": 2},
+    )
+    close_first = LiveEvent(
+        EventTypes.EMA_FALLBACK_USED,
+        ts_ms=2_000,
+        data={"close_fallback_count": 1},
+    )
+    close_throttled = LiveEvent(
+        EventTypes.EMA_FALLBACK_USED,
+        ts_ms=2_000 + 15 * 60 * 1000 - 1,
+        data={"close_fallback_count": 1},
+    )
+    close_boundary = LiveEvent(
+        EventTypes.EMA_FALLBACK_USED,
+        ts_ms=2_000 + 15 * 60 * 1000,
+        data={"close_fallback_count": 1},
+    )
+
+    for event in (recovery, forager, close_first, close_throttled, close_boundary):
+        pipeline.emit(event)
+
+    assert console.events == [close_first, close_boundary]
+    assert text.events == [close_first, close_boundary]
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [
+        recovery,
+        forager,
+        close_first,
+        close_throttled,
+        close_boundary,
+    ]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_ema_fallback_console_formatter_retains_compact_warning_semantics():
+    data = {
+        "close_fallback_count": 3,
+        "close_fallback_symbols": {
+            "count": 2,
+            "sample": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+            "truncated": 0,
+        },
+        "examples": {
+            "close_fallback": [
+                {
+                    "symbol": "BTC/USDT:USDT",
+                    "spans": [10.0, 20.0],
+                    "max_age_ms": 120_000,
+                    "max_fallbacks": 3,
+                    "ema_type": "m1_close",
+                    "reason_code": "exception",
+                    "error_type": "TimeoutError",
+                },
+                {
+                    "symbol": "ETH/USDT:USDT",
+                    "spans": [30.0],
+                    "max_age_ms": 60_000,
+                    "max_fallbacks": 2,
+                    "ema_type": "m1_close",
+                    "reason_code": "exception",
+                    "error_type": "RequestTimeout",
+                },
+            ]
+        },
+    }
+    event = LiveEvent(EventTypes.EMA_FALLBACK_USED, status="recovered", data=data)
+    before = event.to_dict()
+
+    message = format_ema_fallback_console(event.data)
+
+    assert message.startswith("[ema] close fallback n=3 sym=2(BTC/USDT:USDT,ETH/USDT:USDT)")
+    assert "age=120000ms" in message
+    assert "streak=3" in message
+    assert (
+        "ex=BTC/USDT:USDT[10,20] age=120000ms n=3 ema=m1_close "
+        "why=exception err=TimeoutError"
+    ) in message
+    assert "recovered" not in message
+    assert "reason=" not in message
+    assert format_console_event(event) == message
+    assert event.to_dict() == before
+
+
+def test_ema_fallback_console_formatter_uses_safe_fields_without_raw_reason():
+    message = format_ema_fallback_console(
+        {
+            "close_fallback_count": 1,
+            "close_fallback_symbols": {"count": 1, "sample": ["BTC/USDT:USDT"]},
+            "examples": {
+                "close_fallback": [
+                    {
+                        "symbol": "BTC/USDT:USDT",
+                        "spans": [60.0],
+                        "max_age_ms": 1000,
+                        "max_fallbacks": 1,
+                        "ema_type": "m1_close",
+                        "reason_code": "exception",
+                        "error_type": "RequestTimeout",
+                        "reason": "https://private.example/token",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert "why=exception" in message
+    assert "err=RequestTimeout" in message
+    assert "private.example" not in message
+
+
+def test_emit_event_failure_log_omits_exception_text(caplog):
+    secret = "https://private.example/path?api_key=pipeline-secret"
+
+    class FailingPipeline:
+        def emit(self, *_args, **_kwargs):
+            raise RuntimeError(secret)
+
+    bot = type("Bot", (), {"_live_event_pipeline": FailingPipeline()})()
+    event = LiveEvent("ema.fallback_used", data={"safe": True})
+
+    with caplog.at_level(logging.DEBUG):
+        assert live_event_bus_module.emit_event(bot, event) is None
+
+    messages = [record.message for record in caplog.records]
+    assert any(
+        "failed to emit ema.fallback_used error_type=RuntimeError" in message
+        for message in messages
+    )
+    assert all(secret not in message for message in messages)
+    assert all("pipeline-secret" not in message for message in messages)
+
+
+def test_emit_event_failure_log_bounds_hostile_event_type_and_exception_class(caplog):
+    secret = "fallback-secret"
+    hostile_type_name = "FallbackPrivateKeyFailure"
+    HostilePipelineFailure = type(hostile_type_name, (RuntimeError,), {})
+    hostile_event_type = f"secret.event https://example.invalid/?token={secret}\nTraceback"
+
+    class FailingPipeline:
+        def emit(self, *_args, **_kwargs):
+            raise HostilePipelineFailure(secret)
+
+    class HostileEventMapping(dict):
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError(
+                f"https://example.invalid/mapping?token={secret}\nTraceback"
+            )
+
+    bot = type("Bot", (), {"_live_event_pipeline": FailingPipeline()})()
+
+    with caplog.at_level(logging.DEBUG):
+        for event in (
+            {"event_type": hostile_event_type},
+            HostileEventMapping(event_type=hostile_event_type),
+        ):
+            assert live_event_bus_module.emit_event(bot, event) is None
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum(
+        "failed to emit unknown_event error_type=RuntimeError" in message
+        for message in messages
+    ) == 2
+    emitted_diagnostics = "\n".join(messages)
+    for unsafe_value in (
+        hostile_type_name,
+        hostile_event_type,
+        secret,
+        "example.invalid",
+        "Traceback",
+    ):
+        assert unsafe_value not in emitted_diagnostics
+
+
+def test_ema_fallback_console_formatter_is_bounded_without_mutating_payload():
+    maximum = (1 << 63) - 1
+    data = {
+        "close_fallback_count": maximum,
+        "close_fallback_symbols": {
+            "count": maximum,
+            "sample": ["X" * 10_000, "Y" * 10_000, "ignored"],
+        },
+        "examples": {
+            "close_fallback": [
+                {
+                    "symbol": "A" * 10_000,
+                    "spans": [1e300, 1e-300, 999.0],
+                    "max_age_ms": maximum,
+                    "max_fallbacks": maximum,
+                    "ema_type": "m1_close",
+                    "reason_code": "exception",
+                    "error_type": "TimeoutError",
+                },
+                {
+                    "symbol": "B" * 10_000,
+                    "spans": [2e300],
+                    "max_age_ms": maximum,
+                    "max_fallbacks": maximum,
+                    "ema_type": "m1_close",
+                    "reason_code": "non_finite_value",
+                    "error_type": "NonFiniteValue",
+                },
+            ]
+        },
+    }
+    event = LiveEvent(EventTypes.EMA_FALLBACK_USED, data=data)
+    before = event.to_dict()
+
+    message = format_console_event(event)
+    longest_prefix = "2026-07-15T23:45:40Z WARNING  [hyperliquid] "
+
+    assert len(longest_prefix + message) <= 240
+    assert "n=999999999+" in message
+    assert "sym=999999999+(XXXXXXXXXXXXXXXX,YYYYYYYYYYYYYYYY)" in message
+    assert "age=999999999+ms" in message
+    assert "streak=999999999+" in message
+    assert "ema=m1_close" in message
+    assert "private.example" not in message
+    assert event.to_dict() == before
+
+
+def test_ema_unavailable_console_route_throttles_human_projection_but_keeps_detail_durable():
+    structured = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[],
+        console_sink=console,
+        text_sink=text,
+    )
+    data = {
+        "candidate_unavailable": {"count": 1, "sample": ["BTC/USDT:USDT"]},
+        "candidate_unavailable_groups": [
+            {
+                "reason": "cache_only_fetch_failed",
+                "symbols": {"count": 1, "sample": ["BTC/USDT:USDT"]},
+                "error_types": ["RuntimeError"],
+                "ema_types": [{"ema_type": "h1_log_range", "count": 1}],
+                "spans": [672.0],
+            }
+        ],
+    }
+    first = LiveEvent(EventTypes.EMA_UNAVAILABLE, ts_ms=1_000, data=data)
+    throttled = LiveEvent(
+        EventTypes.EMA_UNAVAILABLE,
+        ts_ms=1_000 + 15 * 60 * 1000 - 1,
+        data=data,
+    )
+    boundary = LiveEvent(
+        EventTypes.EMA_UNAVAILABLE,
+        ts_ms=1_000 + 15 * 60 * 1000,
+        data=data,
+    )
+
+    for event in (first, throttled, boundary):
+        pipeline.emit(event)
+
+    assert console.events == [first, boundary]
+    assert text.events == [first, boundary]
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [first, throttled, boundary]
+    assert structured.events[0].data["candidate_unavailable_groups"][0]["ema_types"] == [
+        {"ema_type": "h1_log_range", "count": 1}
+    ]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_ema_unavailable_console_formatter_is_bounded_and_retains_required_signals():
+    data = {
+        "candidate_unavailable": {
+            "count": 7,
+            "sample": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+        },
+        "candidate_unavailable_groups": [
+            {
+                "reason": "cache_only_fetch_failed",
+                "symbols": {
+                    "count": 4,
+                    "sample": [
+                        "BTC/USDT:USDT",
+                        "ETH/USDT:USDT",
+                        "SOL/USDT:USDT",
+                    ],
+                },
+                "error_types": ["MissingLogRangeEma", "RuntimeError"],
+                "ema_types": [{"ema_type": "h1_log_range", "count": 1}],
+                "spans": [672.0],
+            }
+        ],
+    }
+    event = LiveEvent(EventTypes.EMA_UNAVAILABLE, data=data)
+    before = event.to_dict()
+
+    message = format_ema_unavailable_console(event.data)
+    longest_prefix = "2026-07-15T23:45:40Z WARNING  [hyperliquid] "
+
+    assert message == (
+        "[ema] unavailable n=7 group=cache_only_fetch_failed "
+        "action=mark_nontradable_until_fresh sym=4(BTC,ETH,+2) "
+        "err=MissingLogRangeEma ema=h1_log_range"
+    )
+    assert len(longest_prefix + message) <= 240
+    assert "SOL/USDT:USDT" not in message
+    assert "example_error" not in message
+    assert format_console_event(event) == message
+    assert event.to_dict() == before
+
+
+def test_ema_unavailable_console_formatter_keeps_identity_under_pathological_lengths():
+    maximum = (1 << 63) - 1
+    data = {
+        "candidate_unavailable": {"count": maximum},
+        "candidate_unavailable_groups": [
+            {
+                "reason": "r" * 10_000,
+                "symbols": {"count": maximum, "sample": ["S" * 10_000] * 3},
+                "error_types": ["E" * 10_000],
+                "ema_types": [{"ema_type": "h1_log_range", "count": maximum}],
+            }
+        ],
+    }
+    event = LiveEvent(EventTypes.EMA_UNAVAILABLE, data=data)
+    before = event.to_dict()
+
+    message = format_ema_unavailable_console(event.data)
+    longest_prefix = "2026-07-15T23:45:40Z WARNING  [hyperliquid] "
+
+    assert len(message) <= 188
+    assert len(longest_prefix + message) <= 240
+    assert "action=mark_nontradable_until_fresh" in message
+    assert "ema=h1_log_range" in message
+    assert "S" * 15 not in message
+    assert event.to_dict() == before
+
+
+def test_state_refresh_timing_console_formatters_retain_operator_timing_signals():
+    detail = {
+        "plan": ["balance", "fills", "open_orders", "positions"],
+        "timings_ms": {
+            "balance": 2500,
+            "fills": 4000,
+            "open_orders": 2000,
+            "positions": 3000,
+        },
+        "wall_ms": 10_000,
+        "residual_ms": 6000,
+        "parallel": True,
+    }
+    summary = {
+        "summary": True,
+        "plan": ["balance", "fills", "open_orders", "positions"],
+        "count": 60,
+        "wall_ms": {"min": 100, "mean": 130, "max": 159},
+        "residual_ms": {"min": 0, "mean": 10, "max": 20},
+        "surfaces_ms": {
+            "balance": {"min": 90, "mean": 120, "max": 140},
+            "open_orders": {"min": 100, "mean": 130, "max": 159},
+        },
+    }
+
+    assert format_state_refresh_timing_console(detail) == (
+        "[state] refresh plan=bal,fills,orders,pos wall=10000ms "
+        "surfaces_ms=bal:2500,fills:4000,orders:2000,pos:3000 parallel residual=6000ms"
+    )
+    assert format_state_refresh_timing_console(summary) == (
+        "[state] refresh summary plan=bal,fills,orders,pos n=60 "
+        "wall_ms=100/130/159 slow=orders:100/130/159 resid_ms=0/10/20"
+    )
+
+
+def test_state_refresh_timing_console_and_text_admission_preserves_detail_durability():
+    structured = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[],
+        console_sink=console,
+        text_sink=text,
+    )
+    hidden_detail = LiveEvent(
+        EventTypes.STATE_REFRESH_TIMING,
+        data={"wall_ms": 9999, "timings_ms": {"balance": 9999}},
+    )
+    admitted_detail = LiveEvent(
+        EventTypes.STATE_REFRESH_TIMING,
+        data={"wall_ms": 10_000, "timings_ms": {"balance": 10_000}},
+    )
+    aggregate = LiveEvent(
+        EventTypes.STATE_REFRESH_TIMING,
+        data={"summary": True, "wall_ms": {"min": 1, "mean": 2, "max": 3}},
+    )
+
+    pipeline.emit(hidden_detail)
+    pipeline.emit(admitted_detail)
+    pipeline.emit(aggregate)
+
+    assert console.events == [admitted_detail, aggregate]
+    assert text.events == [admitted_detail, aggregate]
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [hidden_detail, admitted_detail, aggregate]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_state_refresh_timing_console_formatters_are_bounded_without_mutating_payload():
+    maximum = (1 << 63) - 1
+    detail_data = {
+        "plan": ["unbounded-plan-name"] * 5,
+        "timings_ms": {f"unbounded-surface-{idx}": maximum for idx in range(5)},
+        "wall_ms": maximum,
+        "residual_ms": maximum,
+        "parallel": True,
+    }
+    summary_data = {
+        "summary": True,
+        "plan": ["unbounded-plan-name"] * 5,
+        "count": maximum,
+        "wall_ms": {"min": maximum, "mean": maximum, "max": maximum},
+        "residual_ms": {"min": maximum, "mean": maximum, "max": maximum},
+        "surfaces_ms": {
+            "unbounded-surface": {"min": maximum, "mean": maximum, "max": maximum}
+        },
+    }
+    detail_event = LiveEvent(EventTypes.STATE_REFRESH_TIMING, data=detail_data)
+    summary_event = LiveEvent(EventTypes.STATE_REFRESH_TIMING, data=summary_data)
+    detail_before = detail_event.to_dict()
+    summary_before = summary_event.to_dict()
+
+    detail_message = format_console_event(detail_event)
+    summary_message = format_console_event(summary_event)
+    longest_prefix = "2026-07-15T23:45:40Z WARNING  [hyperliquid] "
+
+    assert len(longest_prefix + detail_message) <= 240
+    assert "plan=unbound,unbound,unbound,+more" in detail_message
+    assert "wall=" in detail_message
+    assert "surfaces_ms=" in detail_message
+    assert "parallel" in detail_message
+    assert "residual=" in detail_message
+    assert len(longest_prefix + summary_message) <= 240
+    assert "plan=unbound,unbound,unbound,+more" in summary_message
+    assert "wall_ms=" in summary_message
+    assert "slow=unbound:" in summary_message
+    assert "resid_ms=" in summary_message
+    assert detail_event.to_dict() == detail_before
+    assert summary_event.to_dict() == summary_before
+
+
+def test_state_refresh_timing_console_formatter_names_combined_position_balance_surface():
+    message = format_state_refresh_timing_console(
+        {
+            "plan": ["balance", "fills", "open_orders", "positions"],
+            "timings_ms": {
+                "fills": 1384,
+                "open_orders": 12372,
+                "positions_balance": 13376,
+            },
+            "wall_ms": 13381,
+            "residual_ms": 5,
+            "parallel": True,
+        }
+    )
+
+    assert "surfaces_ms=fills:1384,orders:12372,pos+bal:13376" in message
+
+
+def test_console_format_summarizes_order_wave_payload():
+    event = LiveEvent(
+        EventTypes.ORDER_WAVE_COMPLETED,
+        status="deferred",
+        cycle_id="cy_9",
+        order_wave_id="ow_7",
+        reason_code="create_deferred",
+        data={
+            "planned_cancel": 1,
+            "cancel_posted": 1,
+            "planned_create": 3,
+            "create_posted": 2,
+            "deferred_create": 1,
+            "elapsed_ms": 642,
+            "symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[execute] deferred wave=ow_7 cancel=1/1 create=2/3 "
+        "deferred_create=1 elapsed=642ms "
+        "symbols=BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT "
+        "reason=create_deferred"
+    )
+
+
+def test_console_format_summarizes_startup_timing():
+    event = LiveEvent(
+        EventTypes.BOT_STARTUP_TIMING,
+        status="succeeded",
+        reason_code=ReasonCodes.STARTUP_PHASE_READY,
+        data={
+            "phase": "hsl",
+            "elapsed_ms": 12345,
+            "since_previous_ms": 2345,
+            "details": "mode=coin",
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[boot] succeeded phase=hsl-ready elapsed=12.35s since_previous=2.35s "
+        "details=mode=coin reason=startup_phase_ready"
+    )
+
+
+def test_console_format_summarizes_order_write_without_raw_payload():
+    event = LiveEvent(
+        EventTypes.EXECUTION_CREATE_SUCCEEDED,
+        status="succeeded",
+        cycle_id="cy_3",
+        order_wave_id="ow_2",
+        symbol="AAVE/USDT:USDT",
+        pside="long",
+        side="buy",
+        data={
+            "order_type": "limit",
+            "qty": 1.23456789,
+            "price": 88.7654321,
+            "reduce_only": False,
+            "result_status": "open",
+            "result_order_id_short": "abc123",
+            "result_client_order_id_short": "pbot_456",
+            "apiKey": "must_not_leak",
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[order] succeeded cycle=cy_3 wave=ow_2 side=buy type=limit "
+        "qty=1.23456789 price=88.7654321 exchange_status=open "
+        "order_id=abc123 client_id=pbot_456 symbol=AAVE/USDT:USDT pside=long"
+    )
+
+
+def test_console_format_includes_bounded_exchange_rejection_context():
+    event = LiveEvent(
+        EventTypes.EXECUTION_AMBIGUOUS,
+        status="degraded",
+        cycle_id="cy_3",
+        order_wave_id="ow_2",
+        symbol="DOGE/USDT:USDT",
+        pside="long",
+        side="buy",
+        reason_code="result_exception",
+        data={
+            "order_type": "entry_initial_normal_long",
+            "qty": 66.0,
+            "price": 0.07111,
+            "error_type": "ExchangeError",
+            "error_status": "400",
+            "error_code": "10001",
+            "error_label": "INVALID_PARAM_VALUE",
+            "error_reason": "invalid argument: size",
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert "error_type=ExchangeError" in rendered
+    assert "status=400" in rendered
+    assert "code=10001" in rendered
+    assert "label=INVALID_PARAM_VALUE" in rendered
+    assert "reason=invalid argument: size" in rendered
+
+
+def test_console_format_bounds_exchange_rejection_reason_length():
+    event = LiveEvent(
+        EventTypes.EXECUTION_CREATE_REJECTED,
+        status="failed",
+        symbol="DOGE/USDT:USDT",
+        data={"error_reason": "x" * 160},
+    )
+
+    rendered = format_console_event(event)
+
+    assert "reason=" + ("x" * 93) + "..." in rendered
+    assert "x" * 97 not in rendered
+
+
+def test_console_format_marks_ambiguous_cancel_as_requiring_full_account_confirmation():
+    event = LiveEvent(
+        EventTypes.EXECUTION_CANCEL_AMBIGUOUS_TERMINAL,
+        status="degraded",
+        cycle_id="cy_3",
+        order_wave_id="ow_2",
+        symbol="AAVE/USDT:USDT",
+        pside="long",
+        side="buy",
+        reason_code="requires_full_authoritative_confirmation",
+        data={"order_type": "limit"},
+    )
+
+    assert format_console_event(event) == (
+        "[order] degraded cycle=cy_3 confirmation=full_account_required "
+        "wave=ow_2 side=buy type=limit symbol=AAVE/USDT:USDT pside=long "
+        "reason=requires_full_authoritative_confirmation"
+    )
+
+
+def test_console_format_summarizes_create_filter_payload():
+    event = LiveEvent(
+        EventTypes.EXECUTION_CREATE_SKIPPED,
+        status="skipped",
+        cycle_id="cy_8",
+        order_wave_id="ow_4",
+        reason_code=ReasonCodes.PENDING_EXCHANGE_CONFIG,
+        message="create orders skipped while exchange config update is pending",
+        data={
+            "order_count": 2,
+            "symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[gate] skipped cycle=cy_8 wave=ow_4 orders=2 "
+        "symbols=BTC/USDT:USDT,ETH/USDT:USDT "
+        "reason=pending_exchange_config "
+        "create orders skipped while exchange config update is pending"
+    )
+
+
+def test_console_format_bounds_pre_create_skip_with_error_and_many_symbols():
+    event = LiveEvent(
+        EventTypes.EXECUTION_CREATE_SKIPPED,
+        status="skipped",
+        cycle_id="cy_123456",
+        reason_code=ReasonCodes.PRE_CREATE_MARKET_SNAPSHOT_UNAVAILABLE,
+        message="unbounded message " * 100,
+        data={
+            "stage": "market_snapshot_refresh",
+            "order_count": 4,
+            "symbols": [
+                "BTC/USDT:USDT",
+                "ETH/USDT:USDT",
+                "SOL/USDT:USDT",
+                "XRP/USDT:USDT",
+            ],
+            "error_type": "ExchangeNotAvailable",
+        },
+    )
+
+    rendered = format_console_event(event)
+    longest_prefix = "2026-07-15T23:45:40Z WARNING  [hyperliquid] "
+
+    assert len(longest_prefix + rendered) <= 240
+    assert "cycle=cy_123456" in rendered
+    assert "orders=4" in rendered
+    assert "symbols=BTC,ETH,+2" in rendered
+    assert "error_type=ExchangeNotAvailable" in rendered
+    assert "reason=pre_create_market_snapshot_unavailable" in rendered
+    assert "pre-create market snapshot refresh failed" in rendered
+    assert "unbounded message" not in rendered
+
+    pathological = LiveEvent(
+        EventTypes.EXECUTION_CREATE_SKIPPED,
+        status="skipped",
+        cycle_id="C" * 1_000,
+        reason_code=ReasonCodes.PRE_CREATE_MARKET_SNAPSHOT_UNAVAILABLE,
+        message="M" * 10_000,
+        data={
+            "stage": "market_snapshot_refresh",
+            "order_count": 10**20,
+            "symbols": ["S" * 1_000] * 12,
+            "error_type": "E" * 1_000,
+        },
+    )
+
+    pathological_rendered = format_console_event(pathological)
+    assert len(longest_prefix + pathological_rendered) <= 240
+    assert "cycle=" + "C" * 32 in pathological_rendered
+    assert "orders=999999999" in pathological_rendered
+    assert "symbols=" + "S" * 8 + "," + "S" * 8 + ",+10" in pathological_rendered
+    assert "error_type=" + "E" * 24 in pathological_rendered
+    assert "reason=pre_create_market_snapshot_unavailable" in pathological_rendered
+
+
+def test_create_filter_emitter_reports_whether_live_event_emission_succeeded():
+    class Bot:
+        live_event_debug_profiles = ()
+
+        def _current_live_event_cycle_id(self):
+            return "cy_1"
+
+        def _emit_live_event(self, *_args, **_kwargs):
+            return None
+
+    bot = Bot()
+    kwargs = {
+        "event_type": EventTypes.EXECUTION_CREATE_SKIPPED,
+        "status": "skipped",
+        "reason_code": ReasonCodes.PRE_CREATE_MARKET_SNAPSHOT_UNAVAILABLE,
+        "order_count": 1,
+        "symbols": ["BTC/USDT:USDT"],
+    }
+
+    assert live_event_emitters.emit_execution_create_filter_event(bot, **kwargs) is False
+
+    bot._emit_live_event = lambda *_args, **_kwargs: LiveEvent("test.event")
+    assert live_event_emitters.emit_execution_create_filter_event(bot, **kwargs) is True
+
+
+def test_order_churn_emitters_use_valid_live_event_statuses():
+    emitted = []
+
+    class Bot:
+        exchange = "weex"
+        user = "weex_01"
+
+        @staticmethod
+        def _current_live_event_cycle_id():
+            return "cy_1"
+
+        @staticmethod
+        def _emit_live_event(event_type, **kwargs):
+            event = LiveEvent(event_type, **kwargs)
+            emitted.append(event)
+            return event
+
+    bot = Bot()
+    assert live_event_emitters.emit_order_churn_evidence_event(
+        bot,
+        generation=1,
+        reset=True,
+        reset_count=1,
+        reason_counts={"no_history": 1},
+        churn_count=0,
+        order_count=1,
+        symbols=["BTC/USDT:USDT"],
+        history_symbol_count=1,
+        snapshot_status="observed",
+    )
+    assert live_event_emitters.emit_order_churn_admission_event(
+        bot,
+        orders=[],
+        rolling_count=1,
+        activation_count=10,
+        market_distance_threshold=0.005,
+    )
+    assert live_event_emitters.emit_order_churn_actions_accounted_event(
+        bot,
+        action_count=1,
+        rolling_count=2,
+    )
+
+    assert [event.status for event in emitted] == [
+        "succeeded",
+        "succeeded",
+        "succeeded",
+    ]
+    assert emitted[0].data["snapshot_status"] == "observed"
+
+
+def test_console_format_summarizes_low_balance_create_skip():
+    event = LiveEvent(
+        EventTypes.EXECUTION_CREATE_SKIPPED,
+        status="skipped",
+        cycle_id="cy_low_balance",
+        order_wave_id="ow_5",
+        reason_code=ReasonCodes.LOW_BALANCE,
+        message="exposure-increasing creates skipped because balance is below threshold",
+        data={
+            "order_count": 3,
+            "symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+            "raw_balance": 0.25,
+            "balance_threshold": 1.0,
+            "quote": "USDT",
+            "allowed_cancel": 2,
+            "allowed_protective_create": 1,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[gate] skipped cycle=cy_low_balance wave=ow_5 orders=3 "
+        "symbols=BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT "
+        "balance=0.25 USDT threshold=1 USDT allow_cancel=2 "
+        "allow_protective_create=1 reason=low_balance "
+        "exposure-increasing creates skipped because balance is below threshold"
+    )
+
+
+def test_console_format_summarizes_confirmation_timeout():
+    event = LiveEvent(
+        EventTypes.EXECUTION_CONFIRMATION_TIMEOUT,
+        status="degraded",
+        cycle_id="cy_5",
+        order_wave_id="ow_3",
+        reason_code="authoritative_confirmation_timeout",
+        data={
+            "fresh_surfaces": ["balance", "positions"],
+            "pending_surfaces": ["open_orders"],
+            "elapsed_ms": 2200,
+            "timeout_ms": 2000,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[execute] degraded cycle=cy_5 wave=ow_3 fresh=balance,positions "
+        "pending=open_orders elapsed=2200ms timeout=2000ms "
+        "reason=authoritative_confirmation_timeout"
+    )
+
+
+def test_console_format_summarizes_rust_return():
+    event = LiveEvent(
+        EventTypes.RUST_ORCHESTRATOR_RETURNED,
+        status="succeeded",
+        cycle_id="cy_6",
+        data={"order_count": 4, "elapsed_ms": 17},
+    )
+
+    assert format_console_event(event) == "[rust] succeeded cycle=cy_6 orders=4 elapsed=17ms"
+
+
+def test_console_format_summarizes_forager_selection():
+    event = LiveEvent(
+        EventTypes.FORAGER_SELECTION,
+        status="succeeded",
+        cycle_id="cy_forager",
+        pside="long",
+        reason_code="rust_orchestrator_selection",
+        data={
+            "candidate_count": 40,
+            "eligible_count": 33,
+            "selected_count": 3,
+            "selected_symbols": [
+                "BTC/USDT:USDT",
+                "ETH/USDT:USDT",
+                "SOL/USDT:USDT",
+            ],
+            "incumbent_symbols": ["BTC/USDT:USDT"],
+            "slots_to_fill": 1,
+            "max_n_positions": 3,
+            "feature_unavailable_count": 7,
+            "volatility_dropped_count": 5,
+            "max_age_ms": 180_000,
+            "fetch_budget": 4,
+            "hysteresis_event_count": 2,
+            "source": "rust_orchestrator",
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[forager] succeeded cycle=cy_forager selected=3/33/40 slots=1/3 "
+        "unavailable=7 volatility_dropped=5 "
+        "symbols=BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT "
+        "incumbents=BTC/USDT:USDT max_age=180s fetch_budget=4 "
+        "hysteresis_events=2 source=rust_orchestrator pside=long "
+        "reason=rust_orchestrator_selection"
+    )
+
+
+def test_forager_selection_console_route_is_throttled():
+    route = DEFAULT_ROUTES[EventTypes.FORAGER_SELECTION]
+
+    assert route.structured is True
+    assert route.monitor is True
+    assert route.console is True
+    assert route.text is True
+    assert route.throttle_interval_ms == 5 * 60 * 1000
+
+
+def test_rust_forager_selection_event_skips_console_and_text_only():
+    structured = ListEventSink()
+    monitor = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[monitor],
+        console_sink=console,
+        text_sink=text,
+    )
+    event = LiveEvent(
+        EventTypes.FORAGER_SELECTION,
+        status="succeeded",
+        pside="long",
+        data={
+            "selected_symbols": ["BTC/USDT:USDT"],
+            "slots_to_fill": 1,
+            "source": "rust_orchestrator",
+        },
+    )
+
+    pipeline.emit(event)
+
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [event]
+    assert monitor.events == [event]
+    assert console.events == []
+    assert text.events == []
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_python_forager_selection_event_remains_operator_visible():
+    structured = ListEventSink()
+    monitor = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[monitor],
+        console_sink=console,
+        text_sink=text,
+    )
+    event = LiveEvent(
+        EventTypes.FORAGER_SELECTION,
+        status="skipped",
+        pside="long",
+        reason_code="all_features_unavailable",
+        data={"selected_symbols": [], "source": "python_filter"},
+    )
+
+    pipeline.emit(event)
+
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [event]
+    assert monitor.events == [event]
+    assert console.events == [event]
+    assert text.events == [event]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_console_format_summarizes_hsl_status_distance_to_red():
+    event = LiveEvent(
+        EventTypes.HSL_STATUS,
+        status="succeeded",
+        cycle_id="cy_hsl",
+        symbol="ZEC/USDT:USDT",
+        pside="long",
+        reason_code="green",
+        data={
+            "signal_mode": "coin",
+            "tier": "green",
+            "dist_to_red": 0.02,
+            "drawdown_score": 0.03,
+            "red_threshold": 0.05,
+            "cooldown_remaining": "none",
+            "last_red_ts": 1_600_000,
+            "has_open_position": True,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[risk] succeeded cycle=cy_hsl mode=coin tier=green "
+        "dist_to_red=0.020000 drawdown_score=0.030000 red_threshold=0.050000 "
+        "cooldown=none last_red_ts=1600000 symbol=ZEC/USDT:USDT "
+        "pside=long reason=green"
+    )
+
+
+def test_console_format_summarizes_hsl_cooldown_seconds():
+    event = LiveEvent(
+        EventTypes.HSL_STATUS,
+        status="degraded",
+        symbol="NEAR/USDT:USDT",
+        pside="long",
+        reason_code="cooldown_active",
+        data={"tier": "red", "cooldown_remaining_seconds": 300.0},
+    )
+
+    assert format_console_event(event) == (
+        "[risk] degraded tier=red cooldown=300s symbol=NEAR/USDT:USDT "
+        "pside=long reason=cooldown_active"
+    )
+
+
+def test_console_format_summarizes_min_effective_cost_block():
+    event = LiveEvent(
+        EventTypes.ENTRY_MIN_EFFECTIVE_COST_BLOCKED,
+        status="skipped",
+        symbol="SOL/USDT:USDT",
+        pside="long",
+        reason_code="min_effective_cost_blocked",
+        data={
+            "action": "skip_create",
+            "projected_initial_cost": 3.25,
+            "effective_min_cost": 10.0,
+            "balance": 250.0,
+            "effective_limit": 0.12,
+            "entry_initial_qty_pct": 0.05,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[entry] skipped action=skip_create notional=3.25/10 "
+        "effective_limit=12.0000% initial_qty=5.0000% "
+        "symbol=SOL/USDT:USDT pside=long reason=min_effective_cost_blocked"
+    )
+
+
+def test_console_format_summarizes_realized_loss_gate_block():
+    event = LiveEvent(
+        EventTypes.REALIZED_LOSS_GATE_BLOCKED,
+        status="deferred",
+        symbol="ETH/USDT:USDT",
+        pside="short",
+        reason_code="realized_loss_gate_blocked",
+        data={
+            "order_type": "close_grid_short",
+            "qty": 0.25,
+            "price": 3_100.0,
+            "projected_pnl": -12.5,
+            "projected_balance_after": 987.5,
+            "balance_floor": 990.0,
+            "max_realized_loss_pct": 0.01,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[risk] deferred type=close_grid_short qty=0.25 price=3100 "
+        "projected_pnl=-12.5 projected_balance=987.5 floor=990 "
+        "max_loss=1.0000% symbol=ETH/USDT:USDT pside=short "
+        "reason=realized_loss_gate_blocked"
+    )
+
+
+def test_console_format_summarizes_trailing_status():
+    event = LiveEvent(
+        EventTypes.TRAILING_STATUS,
+        status="succeeded",
+        cycle_id="cy_trailing",
+        symbol="BTC/USDT:USDT",
+        pside="long",
+        reason_code="trailing_status",
+        data={
+            "kind": "entry",
+            "trailing_status": "waiting_threshold",
+            "selected_mode": "grid",
+            "threshold_met": False,
+            "threshold_pct": 0.0125,
+            "threshold_price": 98_750.0,
+            "retracement_met": False,
+            "retracement_pct": 0.004,
+            "retracement_price": 99_145.0,
+            "threshold_projection_retracement_price": 99_145.0,
+            "current_price": 101_000.0,
+            "current_vs_threshold_ratio": 101_000.0 / 98_750.0 - 1.0,
+            "current_vs_retracement_ratio": 101_000.0 / 99_145.0 - 1.0,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[trailing] symbol=BTC/USDT:USDT pside=long entry/waiting_threshold mode=grid "
+        "gates=t:n/r:n threshold=1.2500%@98750 retracement=0.4000%@99145 cur=101000"
+    )
+
+
+def test_console_format_compacts_trailing_status_with_long_identifiers():
+    cycle_id = "cy_20260715_123456789012345678901234"
+    symbol = "LONG-UNDERLYING-NAME-2026-PERP/USDC:USDC"
+    event = LiveEvent(
+        EventTypes.TRAILING_STATUS,
+        status="succeeded",
+        cycle_id=cycle_id,
+        symbol=symbol,
+        pside="long",
+        reason_code="trailing_status",
+        data={
+            "kind": "close",
+            "trailing_status": "armed",
+            "selected_mode": "auto_reduce",
+            "threshold_met": True,
+            "threshold_pct": -0.019649,
+            "threshold_price": 887.25,
+            "retracement_met": True,
+            "retracement_pct": 0.000212,
+            "retracement_price": 1049.58,
+            "current_price": 902.465,
+            "current_vs_threshold_ratio": -0.140163,
+            "current_vs_retracement_ratio": -0.140163,
+            "threshold_projection_retracement_price": 1030.0,
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered == (
+        f"[trailing] symbol={symbol} pside=long close/armed mode=auto_reduce "
+        "gates=t:y/r:y threshold=-1.9649%@887.25 retracement=0.0212%@1049.58 cur=902.465"
+    )
+    assert len(rendered) <= 240
+    assert event.data["current_vs_threshold_ratio"] == -0.140163
+    assert event.data["current_vs_retracement_ratio"] == -0.140163
+    assert event.data["threshold_projection_retracement_price"] == 1030.0
+
+
+def test_console_format_summarizes_unsupported_trailing_status():
+    event = LiveEvent(
+        EventTypes.TRAILING_STATUS,
+        status="succeeded",
+        symbol="BTC/USDT:USDT",
+        pside="long",
+        reason_code="trailing_status",
+        data={
+            "kind": "position",
+            "diagnostics_supported": False,
+            "strategy_kind": "trailing_grid_v7",
+            "unsupported_reason": "monitor trailing diagnostics use trailing_martingale helper formulas",
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[trailing] succeeded kind=position strategy=trailing_grid_v7 "
+        "unsupported=monitor trailing diagnostics use trailing_martingale helper "
+        "formulas symbol=BTC/USDT:USDT pside=long reason=trailing_status"
+    )
+
+
+def test_console_format_summarizes_unstuck_status():
+    event = LiveEvent(
+        EventTypes.UNSTUCK_STATUS,
+        status="succeeded",
+        reason_code="unstuck_status",
+        data={
+            "changed": True,
+            "over_budget_sides": ["long"],
+            "sides": {
+                "long": {
+                    "status": "ok",
+                    "allowance": -12.3,
+                    "over_budget": True,
+                    "next_symbol": "BTC/USDT:USDT",
+                    "next_target_price": 101_000.0,
+                    "next_target_distance_ratio": 0.005,
+                    "next_unstuck_trigger_distance_ratio": 0.0125,
+                },
+                "short": {"status": "disabled"},
+            },
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[unstuck] succeeded long:ok allowance=-12.3 over_budget "
+        "candidate=BTC/USDT:USDT target=101000 target_dist=0.5000% ema_gate_dist=1.2500% "
+        "short:disabled over_budget=long changed=true reason=unstuck_status"
+    )
+
+
+def test_console_format_summarizes_unstuck_selection():
+    event = LiveEvent(
+        EventTypes.UNSTUCK_SELECTION,
+        status="succeeded",
+        symbol="SUI/USDT:USDT",
+        pside="long",
+        reason_code="unstuck_selection",
+        data={
+            "changed": True,
+            "entry_price": 1.0,
+            "current_price": 1.1,
+            "price_diff_pct": 10.0,
+            "allowance": -12.3,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[unstuck] succeeded entry=1 current=1.1 pos_pnl_dist=10.0000% "
+        "allowance=-12.3 changed=true symbol=SUI/USDT:USDT pside=long "
+        "reason=unstuck_selection"
+    )
+
+
+def test_console_format_summarizes_periodic_health():
+    event = LiveEvent(
+        EventTypes.HEALTH_SUMMARY,
+        status="succeeded",
+        cycle_id="cy_health",
+        reason_code=ReasonCodes.PERIODIC_HEALTH_SUMMARY,
+        data={
+            "uptime_ms": 123_456,
+            "last_loop_duration_ms": 1_250,
+            "positions_long": 2,
+            "positions_short": 1,
+            "balance_raw": 1_005.25,
+            "balance_snapped": 1_004.75,
+            "quote": "USDT",
+            "orders_placed": 3,
+            "orders_cancelled": 1,
+            "fills": 2,
+            "pnl": -1.5,
+            "errors_last_hour": 1,
+            "error_budget_max": 10,
+            "ws_reconnects": 2,
+            "rate_limits": 3,
+            "rss_bytes": 157_286_400,
+            "event_queue_depth": 4,
+            "event_queue_maxsize": 1000,
+            "event_dropped_total": 2,
+            "event_sink_error_total": 1,
+            "event_pipeline_worker_alive": True,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[health] up=2m3s last_loop=1.2s pos=2L/1S open_orders=? account_age=? last_cycle=? last_write=? "
+        "errors_1h=1/10 ws_reconnects_total=2 rate_limits_total=3 "
+        "rss=150.0MiB event_q=4/1000 event_drop=2 sink_err=1"
+    )
+
+
+def test_console_health_keeps_cumulative_activity_in_durable_event():
+    event = LiveEvent(
+        EventTypes.HEALTH_SUMMARY,
+        reason_code=ReasonCodes.PERIODIC_HEALTH_SUMMARY,
+        data={
+            "uptime_ms": 1_173_000,
+            "last_loop_duration_ms": 39_500,
+            "positions_long": 0,
+            "positions_short": 0,
+            "balance_raw": 0.0,
+            "balance_snapped": 0.0,
+            "quote": "USDT",
+            "orders_placed": 0,
+            "orders_cancelled": 0,
+            "fills": 1,
+            "pnl": 0.0,
+            "errors_last_hour": 0,
+            "error_budget_max": 10,
+            "rss_bytes": 87_658_496,
+            "ws_reconnects": 0,
+            "rate_limits": 0,
+            "health_summary_lag_ms": 0,
+            "event_queue_depth": 0,
+            "event_dropped_total": 0,
+            "event_sink_error_total": 0,
+            "event_pipeline_worker_alive": True,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[health] up=19m33s last_loop=39.5s pos=0L/0S open_orders=? account_age=? last_cycle=? last_write=? "
+        "errors_1h=0/10 rss=83.6MiB"
+    )
+
+
+def test_console_format_periodic_health_compacts_representative_longest_payload():
+    event = LiveEvent(
+        EventTypes.HEALTH_SUMMARY,
+        reason_code=ReasonCodes.PERIODIC_HEALTH_SUMMARY,
+        data={
+            "uptime_ms": 1_173_000,
+            "last_loop_duration_ms": 39_500,
+            "positions_long": 0,
+            "positions_short": 0,
+            "balance_raw": 2_946.66,
+            "balance_snapped": 2_951.82,
+            "quote": "USDT",
+            "orders_placed": 0,
+            "orders_cancelled": 0,
+            "fills": 0,
+            "errors_last_hour": 0,
+            "error_budget_max": 10,
+            "ws_reconnects": 4,
+            "rate_limits": 5,
+            "rss_bytes": 87_658_496,
+            "health_summary_lag_ms": 2_345,
+            "slow_phases": [
+                {"phase": "maintenance", "duration_ms": 5_000},
+                {"phase": "account", "duration_ms": 3_000},
+                {"phase": "market", "duration_ms": 1_000},
+            ],
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered == (
+        "[health] up=19m33s last_loop=39.5s pos=0L/0S open_orders=? account_age=? last_cycle=? last_write=? "
+        "errors_1h=0/10 ws_reconnects_total=4 rate_limits_total=5 rss=83.6MiB "
+        "summary_late=2.3s slow=maintenance:5.0s,account:3.0s,market:1.0s"
+    )
+    from live.event_bus import split_health_console
+    assert all(len("2026-07-15T12:34:56Z INFO [hyperliquid] " + line) <= 240
+               for line in split_health_console(rendered))
+
+
+def test_console_format_summarizes_health_error_burst_without_raw_error():
+    event = LiveEvent(
+        EventTypes.HEALTH_SUMMARY,
+        level="warning",
+        status="degraded",
+        cycle_id="cy_error",
+        reason_code=ReasonCodes.EXECUTION_LOOP_ERROR_BURST,
+        data={
+            "count": 3,
+            "window_s": 60,
+            "top_endpoints": [
+                {"endpoint": "account-overview", "count": 2},
+                {"endpoint": "open-orders", "count": 1},
+            ],
+            "latest_error_type": "RequestTimeout",
+            "latest_status": "-",
+            "latest_code": "-",
+            "latest_endpoint": "account-overview",
+        },
+    )
+
+    rendered = format_console_event(event)
+    assert rendered == (
+        "[health] degraded cycle=cy_error errors=3/60s "
+        "top=account-overview:2,open-orders:1 latest=RequestTimeout "
+        "status=- code=- reason=execution_loop_error_burst"
+    )
+    assert "SECRET" not in rendered
+    assert "example.invalid" not in rendered
+
+
+def test_console_format_summarizes_fill_ingested():
+    event = LiveEvent(
+        EventTypes.FILL_INGESTED,
+        symbol="BTC/USDT:USDT",
+        pside="long",
+        side="buy",
+        data={
+            "timestamp": 1_782_271_234_000,
+            "pb_order_type": "entry_grid_normal_long",
+            "qty": 0.001,
+            "price": 101_234.5,
+            "pnl": -1.25,
+            "fee": -0.04,
+            "fill_id_hash": "9f54f33d005de125ca93371eeda0374f039e520574633e8335066351e275c6a2",
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[fill] 2026-06-24T03:20:34Z BTC long entry_grid_normal_long +0.001 @ 101234.5, "
+        "pnl=-1.25 USDT, fee=-0.04 USDT id=9f54f33d005d"
+    )
+
+
+def test_console_format_fill_ingested_preserves_pending_and_known_zero_close_pnl():
+    pending = LiveEvent(
+        EventTypes.FILL_INGESTED,
+        symbol="ETH/USDT:USDT",
+        pside="short",
+        side="sell",
+        data={
+            "timestamp": 1_704_067_200_000,
+            "pb_order_type": "close_grid_normal_short",
+            "qty": 0.5,
+            "price": 2_500.0,
+            "pnl": 0.0,
+            "pnl_status": "pending",
+        },
+    )
+    known_zero = LiveEvent(
+        EventTypes.FILL_INGESTED,
+        symbol="ETH/USDT:USDT",
+        pside="short",
+        side="sell",
+        data={
+            "timestamp": 1_704_067_200_000,
+            "pb_order_type": "close_grid_normal_short",
+            "qty": 0.5,
+            "price": 2_500.0,
+            "pnl": 0.0,
+            "pnl_status": "complete",
+        },
+    )
+
+    assert format_console_event(pending).endswith("-0.5 @ 2500, pnl=pending")
+    assert format_console_event(known_zero).endswith("-0.5 @ 2500, pnl=+0 USDT")
+
+
+def test_console_format_fill_ingested_uses_hash_prefix_and_bounded_unknown_client_id():
+    raw_fill_id = "exchange-fill-id-should-never-be-rendered"
+    event = LiveEvent(
+        EventTypes.FILL_INGESTED,
+        symbol="SOL/USDT:USDT",
+        pside="long",
+        side="buy",
+        data={
+            "pb_order_type": "unknown",
+            "qty": 2.0,
+            "price": 100.0,
+            "client_order_id_short": "pbot_unknown...7b51e9d2",
+            "fill_id_hash": "a1b2c3d4e5f67890aabbccddeeff00112233445566778899aabbccddeeff0011",
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert "(coid=pbot_unknown...7b51e9d2)" in rendered
+    assert "id=a1b2c3d4e5f6" in rendered
+    assert raw_fill_id not in rendered
+
+
+def test_console_format_fills_ingested_summary():
+    event = LiveEvent(
+        EventTypes.FILLS_INGESTED_SUMMARY,
+        data={
+            "count": 21,
+            "known_net_realized_pnl": 4.25,
+            "known_pnl_count": 19,
+            "pending_pnl_count": 2,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[fill] 21 fills, pnl=+4.25 USDT, pnl_known=19, pnl_pending=2"
+    )
+
+
+def test_console_format_fills_ingested_summary_does_not_claim_zero_for_all_pending():
+    event = LiveEvent(
+        EventTypes.FILLS_INGESTED_SUMMARY,
+        data={
+            "count": 21,
+            "known_net_realized_pnl": 0.0,
+            "known_pnl_count": 0,
+            "pending_pnl_count": 21,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[fill] 21 fills, pnl=-, pnl_known=0, pnl_pending=21"
+    )
+
+
+def test_operator_visibility_suppresses_all_operator_sinks_only():
+    structured = ListEventSink()
+    monitor = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[monitor],
+        console_sink=console,
+        text_sink=text,
+    )
+    fill_event = LiveEvent(
+        EventTypes.FILL_INGESTED,
+        data={"operator_visible": False, "qty": 1.0, "price": 100.0},
+    )
+    trailing_event = LiveEvent(
+        EventTypes.TRAILING_STATUS,
+        data={"operator_visible": False, "threshold_pct": 0.01},
+    )
+    missing_metadata_event = LiveEvent(EventTypes.TRAILING_STATUS, data={})
+
+    pipeline.emit(fill_event)
+    pipeline.emit(trailing_event)
+    pipeline.emit(missing_metadata_event)
+
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [fill_event, trailing_event, missing_metadata_event]
+    assert monitor.events == [fill_event, trailing_event, missing_metadata_event]
+    assert console.events == [missing_metadata_event]
+    assert text.events == [missing_metadata_event]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_balance_raw_only_change_skips_console_but_preserves_durable_sinks():
+    structured = ListEventSink()
+    monitor = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[monitor],
+        console_sink=console,
+        text_sink=text,
+    )
+    event = LiveEvent(
+        EventTypes.BALANCE_CHANGED,
+        data={
+            "previous_balance_raw": 1_000.0,
+            "balance_raw": 999.5,
+            "balance_raw_delta": -0.5,
+            "previous_balance_snapped": 1_000.0,
+            "balance_snapped": 1_000.0,
+            "balance_snapped_delta": 0.0,
+            "equity": 999.5,
+            "source": "REST",
+        },
+    )
+
+    pipeline.emit(event)
+
+    assert pipeline.flush(timeout=2.0) is True
+    assert structured.events == [event]
+    assert monitor.events == [event]
+    assert console.events == []
+    assert text.events == [event]
+    assert pipeline.close(timeout=2.0) is True
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"balance_snapped_delta": 1.0},
+        {},
+        {"balance_snapped_delta": float("nan")},
+        {"balance_snapped_delta": float("inf")},
+    ],
+)
+def test_balance_console_keeps_material_and_unclassifiable_changes_visible(data):
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[],
+        monitor_sinks=[],
+        console_sink=console,
+        text_sink=text,
+    )
+    event = LiveEvent(EventTypes.BALANCE_CHANGED, data=data)
+
+    pipeline.emit(event)
+
+    assert console.events == [event]
+    assert text.events == [event]
+    assert pipeline.close(timeout=2.0) is True
+
+
+@pytest.mark.parametrize(
+    ("action", "old_size", "old_price", "new_size", "new_price"),
+    [
+        ("new", 0.0, 0.0, 0.07328, 67_352.9),
+        ("added", 0.07328, 67_352.9, 0.12, 67_000.0),
+        ("reduced", 0.12, 67_000.0, 0.07328, 67_352.9),
+        ("closed", 0.07328, 67_352.9, 0.0, 0.0),
+    ],
+)
+def test_console_format_position_changed_renders_all_actions(
+    action, old_size, old_price, new_size, new_price
+):
+    event = LiveEvent(
+        EventTypes.POSITION_CHANGED,
+        status="succeeded",
+        cycle_id="cy_pos",
+        symbol="BTC/USDT:USDT",
+        pside="long",
+        reason_code=action,
+        data={
+            "action": action,
+            "old_size": old_size,
+            "old_price": old_price,
+            "new_size": new_size,
+            "new_price": new_price,
+            "wallet_exposure": 0.234841,
+            "wel_ratio": 1.095924,
+            "wele_ratio": 0.862929,
+            "twel_ratio": 0.178443,
+            "upnl": -265.815872,
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered.startswith(f"[pos] {action:>7} BTC        long  ")
+    assert "succeeded" not in rendered
+    assert "cycle=" not in rendered
+    assert "symbol=" not in rendered
+    assert "pside=" not in rendered
+    assert "reason=" not in rendered
+    assert "WE=23.4841% WEL=109.5924% eWEL=86.2929% TWEL=17.8443%" in rendered
+    assert "uPnL=-265.815872" in rendered
+
+
+def test_console_format_position_changed_aligns_columns_and_preserves_event_data():
+    event = LiveEvent(
+        EventTypes.POSITION_CHANGED,
+        status="succeeded",
+        cycle_id="cy_pos",
+        symbol="BTC/USDT:USDT",
+        pside="long",
+        reason_code="new",
+        data={
+            "action": "new",
+            "old_size": 0.0,
+            "old_price": 0.0,
+            "new_size": 0.07328,
+            "new_price": 67_352.9,
+            "wallet_exposure": 0.234841,
+            "wel_ratio": 1.095924,
+            "wele_ratio": 0.862929,
+            "twel_ratio": 0.178443,
+            "upnl": -265.815872,
+        },
+    )
+    before = event.to_dict()
+
+    rendered = format_console_event(event)
+
+    assert rendered == (
+        "[pos]     new BTC        long  0 @ 0                  "
+        "-> 0.07328 @ 67352.9      | WE=23.4841% WEL=109.5924% "
+        "eWEL=86.2929% TWEL=17.8443% uPnL=-265.815872"
+    )
+    assert event.to_dict() == before
+
+
+def test_console_format_position_changed_renders_zero_and_missing_metrics():
+    event = LiveEvent(
+        EventTypes.POSITION_CHANGED,
+        symbol="ETH/USDT:USDT",
+        pside="short",
+        data={
+            "action": "closed",
+            "old_size": 0.0,
+            "old_price": 0.0,
+            "new_size": 0.0,
+            "new_price": 0.0,
+            "wallet_exposure": 0.0,
+            "wel_ratio": 0.0,
+            "upnl": 0.0,
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert "0 @ 0" in rendered
+    assert "WE=0.0000% WEL=0.0000% eWEL=- TWEL=- uPnL=0" in rendered
+
+
+def test_console_format_position_changed_does_not_truncate_long_values():
+    event = LiveEvent(
+        EventTypes.POSITION_CHANGED,
+        symbol="VERYLONGCOINNAME/USDT:USDT",
+        pside="very_long_position_side",
+        data={
+            "action": "very_long_action_name",
+            "old_size": 12345678901.2345,
+            "old_price": 98765432109.8765,
+            "new_size": 12345678902.2345,
+            "new_price": 98765432110.8765,
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert "VERYLONGCOINNAME" in rendered
+    assert "very_long_action_name" in rendered
+    assert "very_long_position_side" in rendered
+    assert "1.23456789e+10 @ 9.876543211e+10" in rendered
+    assert "WE=- WEL=- eWEL=- TWEL=- uPnL=-" in rendered
+
+
+def test_console_format_position_changed_preserves_signed_short_values():
+    event = LiveEvent(
+        EventTypes.POSITION_CHANGED,
+        symbol="BTC/USDT:USDT",
+        pside="short",
+        data={
+            "action": "added",
+            "old_size": -0.2,
+            "old_price": 67_000.0,
+            "new_size": -0.35,
+            "new_price": 66_500.0,
+            "wallet_exposure": 0.12,
+            "wel_ratio": 0.6,
+            "wele_ratio": 0.5,
+            "twel_ratio": 0.24,
+            "upnl": -7.5,
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert "short -0.2 @ 67000" in rendered
+    assert "-> -0.35 @ 66500" in rendered
+    assert "eWEL=50.0000%" in rendered
+    assert "uPnL=-7.5" in rendered
+
+
+def test_console_format_position_changed_handles_nonfinite_and_missing_values():
+    event = LiveEvent(
+        EventTypes.POSITION_CHANGED,
+        data={
+            "old_size": float("nan"),
+            "old_price": float("inf"),
+            "new_size": float("-inf"),
+            "new_price": None,
+            "wallet_exposure": float("nan"),
+            "wel_ratio": float("inf"),
+            "wele_ratio": float("-inf"),
+            "twel_ratio": None,
+            "upnl": float("nan"),
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered.startswith("[pos]       - -          -     - @ -")
+    assert "-> - @ -" in rendered
+    assert "WE=- WEL=- eWEL=- TWEL=- uPnL=-" in rendered
+    assert "nan" not in rendered.lower()
+    assert "inf" not in rendered.lower()
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected_coin"),
+    [
+        ("1000PEPE/USDT:USDT", "PEPE"),
+        ("kSHIB/USDC:USDC", "SHIB"),
+    ],
+)
+def test_console_format_position_changed_normalizes_common_coin_aliases(
+    symbol, expected_coin
+):
+    event = LiveEvent(
+        EventTypes.POSITION_CHANGED,
+        symbol=symbol,
+        pside="long",
+        data={"action": "new"},
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered.startswith(f"[pos]     new {expected_coin:<10} long  ")
+
+
+def test_console_format_position_changed_strips_ansi_and_control_characters():
+    event = LiveEvent(
+        EventTypes.POSITION_CHANGED,
+        symbol="BTC\n/USDT:USDT",
+        pside="long\r",
+        data={"action": "\x1b[31mnew\x1b[0m\t"},
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered.startswith("[pos]     new BTC        long  ")
+    assert "\x1b" not in rendered
+    assert not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in rendered)
+
+
+def test_console_format_balance_changed_renders_exact_transition_and_preserves_projections():
+    event = LiveEvent(
+        EventTypes.BALANCE_CHANGED,
+        status="succeeded",
+        cycle_id="cy_balance",
+        reason_code="balance_changed",
+        data={
+            "previous_balance_raw": 1_000.0,
+            "balance_raw": 1_005.25,
+            "balance_raw_delta": 5.25,
+            "previous_balance_snapped": 1_000.0,
+            "balance_snapped": 1_004.0,
+            "balance_snapped_delta": 4.0,
+            "equity": 1_010.75,
+            "source": "REST",
+        },
+    )
+    before = event.to_dict()
+    monitor_before = event.to_monitor_event()
+
+    assert format_console_event(event) == (
+        "[balance] raw  1000 -> 1005.25 (+5.25) | snap 1000 -> 1004 (+4) | "
+        "equity=1010.75 source=REST"
+    )
+    assert event.to_dict() == before
+    assert event.to_monitor_event() == monitor_before
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (
+            {
+                "previous_balance_raw": 1_000.0,
+                "balance_raw": 995.0,
+                "balance_raw_delta": -5.0,
+                "previous_balance_snapped": 1_000.0,
+                "balance_snapped": 1_000.0,
+                "balance_snapped_delta": 0.0,
+                "equity": 995.0,
+                "source": "REST",
+            },
+            "[balance] raw  1000 -> 995 (-5) | snap 1000 -> 1000 (0) | "
+            "equity=995 source=REST",
+        ),
+        (
+            {
+                "previous_balance_raw": 1_000.0,
+                "balance_raw": 1_000.0,
+                "balance_raw_delta": -0.0,
+                "previous_balance_snapped": 1_000.0,
+                "balance_snapped": 999.0,
+                "balance_snapped_delta": -1.0,
+                "equity": 1_000.0,
+                "source": "REST",
+            },
+            "[balance] raw  1000 -> 1000 (0) | snap 1000 -> 999 (-1) | "
+            "equity=1000 source=REST",
+        ),
+    ],
+)
+def test_console_format_balance_changed_renders_raw_only_and_snapped_only_transitions(
+    data, expected
+):
+    assert format_console_event(LiveEvent(EventTypes.BALANCE_CHANGED, data=data)) == expected
+
+
+def test_console_format_balance_changed_renders_zero_and_negative_zero():
+    event = LiveEvent(
+        EventTypes.BALANCE_CHANGED,
+        data={
+            "previous_balance_raw": -0.0,
+            "balance_raw": 0.0,
+            "balance_raw_delta": -0.0,
+            "previous_balance_snapped": 0.0,
+            "balance_snapped": -0.0,
+            "balance_snapped_delta": 0.0,
+            "equity": -0.0,
+            "source": "REST",
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[balance] raw  0 -> 0 (0) | snap 0 -> 0 (0) | equity=0 source=REST"
+    )
+
+
+def test_console_format_balance_changed_handles_missing_and_nonfinite_values():
+    event = LiveEvent(
+        EventTypes.BALANCE_CHANGED,
+        data={
+            "previous_balance_raw": float("nan"),
+            "balance_raw": float("inf"),
+            "balance_raw_delta": float("-inf"),
+            "previous_balance_snapped": None,
+            "balance_snapped": float("nan"),
+            "balance_snapped_delta": float("inf"),
+            "equity": float("-inf"),
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered == (
+        "[balance] raw  unavailable | snap unavailable | equity=- source=-"
+    )
+    assert "nan" not in rendered.lower()
+    assert "inf" not in rendered.lower()
+
+
+@pytest.mark.parametrize(
+    ("previous_raw", "raw"),
+    [(None, 100.0), (100.0, None), (float("nan"), 100.0), (100.0, float("inf"))],
+)
+def test_console_format_balance_changed_does_not_infer_partial_raw_transition(
+    previous_raw, raw
+):
+    event = LiveEvent(
+        EventTypes.BALANCE_CHANGED,
+        data={
+            "previous_balance_raw": previous_raw,
+            "balance_raw": raw,
+            "balance_raw_delta": 5.0,
+            "previous_balance_snapped": 90.0,
+            "balance_snapped": 91.0,
+            "balance_snapped_delta": 1.0,
+            "equity": 100.0,
+            "source": "REST",
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[balance] raw  unavailable | snap 90 -> 91 (+1) | "
+        "equity=100 source=REST"
+    )
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [None, float("nan"), float("inf"), float("-inf")],
+)
+def test_console_format_balance_changed_keeps_known_transition_when_delta_unavailable(delta):
+    event = LiveEvent(
+        EventTypes.BALANCE_CHANGED,
+        data={
+            "previous_balance_raw": 100.0,
+            "balance_raw": 105.0,
+            "balance_raw_delta": delta,
+            "previous_balance_snapped": 200.0,
+            "balance_snapped": 205.0,
+            "balance_snapped_delta": delta,
+            "equity": 105.0,
+            "source": "REST",
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered == (
+        "[balance] raw  100 -> 105 (-) | snap 200 -> 205 (-) | "
+        "equity=105 source=REST"
+    )
+    assert "nan" not in rendered.lower()
+    assert "inf" not in rendered.lower()
+
+
+def test_console_format_balance_changed_does_not_truncate_long_values():
+    event = LiveEvent(
+        EventTypes.BALANCE_CHANGED,
+        data={
+            "previous_balance_raw": 12_345_678_901.2345,
+            "balance_raw": 12_345_678_902.2345,
+            "balance_raw_delta": 1.0,
+            "previous_balance_snapped": 98_765_432_109.8765,
+            "balance_snapped": 98_765_432_110.8765,
+            "balance_snapped_delta": 1.0,
+            "equity": 123_456_789_012.3456,
+            "source": "VERY_LONG_FINITE_BALANCE_SOURCE",
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert "1.23456789e+10 -> 1.23456789e+10 (+1)" in rendered
+    assert "9.876543211e+10 -> 9.876543211e+10 (+1)" in rendered
+    assert "equity=1.23456789e+11" in rendered
+    assert "VERY_LONG_FINITE_BALANCE_SOURCE" in rendered
+
+
+def test_console_format_balance_changed_sanitizes_source_to_one_colorless_line():
+    event = LiveEvent(
+        EventTypes.BALANCE_CHANGED,
+        data={
+            "previous_balance_raw": 1.0,
+            "balance_raw": 2.0,
+            "balance_raw_delta": 1.0,
+            "previous_balance_snapped": 1.0,
+            "balance_snapped": 2.0,
+            "balance_snapped_delta": 1.0,
+            "equity": 2.0,
+            "source": "\x1b[31mREST\x1b[0m\nprimary\tfeed\r",
+        },
+    )
+
+    rendered = format_console_event(event)
+
+    assert rendered.endswith("equity=2 source=REST primary feed")
+    assert "\x1b" not in rendered
+    assert not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in rendered)
+
+
+def test_console_format_summarizes_risk_mode_changed():
+    event = LiveEvent(
+        EventTypes.RISK_MODE_CHANGED,
+        status="succeeded",
+        cycle_id="cy_risk_mode",
+        symbol="BTC/USDT:USDT",
+        pside="long",
+        reason_code="hsl_red_runtime_forced_modes",
+        data={
+            "source": "hsl",
+            "action": "replace",
+            "symbols": {
+                "count": 3,
+                "sample": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+            },
+            "previous_mode_counts": {"normal": 3},
+            "mode_counts": {"panic": 2, "manual": 1},
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[risk] succeeded cycle=cy_risk_mode source=hsl action=replace "
+        "symbols=3:BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT "
+        "previous_counts=normal:3 mode_counts=manual:1,panic:2 "
+        "symbol=BTC/USDT:USDT pside=long reason=hsl_red_runtime_forced_modes"
+    )
+
+
+def test_console_format_summarizes_hsl_transition():
+    event = LiveEvent(
+        EventTypes.HSL_TRANSITION,
+        status="succeeded",
+        cycle_id="cy_hsl_transition",
+        symbol="NEAR/USDT:USDT",
+        pside="long",
+        reason_code="yellow_to_orange",
+        data={
+            "signal_mode": "coin",
+            "previous_tier": "yellow",
+            "tier": "orange",
+            "dist_to_red": 0.012345678,
+            "drawdown_score": 0.1875,
+            "red_threshold": 0.2,
+            "balance": 1_000.0,
+            "strategy_equity": 950.0,
+            "metrics": {"balance": 1_000.0},
+            "timestamp_ms": 1_782_946_000_000,
+        },
+    )
+
+    assert format_console_event(event) == (
+        "[risk] succeeded cycle=cy_hsl_transition mode=coin tier=yellow->orange "
+        "dist_to_red=0.012346 drawdown_score=0.187500 red_threshold=0.200000 "
+        "ts=1782946000000 symbol=NEAR/USDT:USDT pside=long reason=yellow_to_orange"
+    )
+
+
+def test_operator_console_filters_flat_green_coin_hsl_status():
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[],
+        monitor_sinks=[],
+        console_sink=console,
+        text_sink=text,
+    )
+
+    flat_green = LiveEvent(
+        EventTypes.HSL_STATUS,
+        status="succeeded",
+        symbol="ARB/USDT:USDT",
+        pside="long",
+        reason_code="green",
+        data={
+            "signal_mode": "coin",
+            "tier": "green",
+            "dist_to_red": 0.02,
+            "has_open_position": False,
+        },
+    )
+    held_green = LiveEvent(
+        EventTypes.HSL_STATUS,
+        status="succeeded",
+        symbol="ZEC/USDT:USDT",
+        pside="long",
+        reason_code="green",
+        data={
+            "signal_mode": "coin",
+            "tier": "green",
+            "dist_to_red": 0.02,
+            "has_open_position": True,
+        },
+    )
+    flat_orange = LiveEvent(
+        EventTypes.HSL_STATUS,
+        status="succeeded",
+        symbol="MORPHO/USDT:USDT",
+        pside="long",
+        reason_code="orange",
+        data={
+            "signal_mode": "coin",
+            "tier": "orange",
+            "dist_to_red": 0.01,
+            "has_open_position": False,
+        },
+    )
+    cooldown = LiveEvent(
+        EventTypes.HSL_STATUS,
+        status="degraded",
+        symbol="NEAR/USDT:USDT",
+        pside="long",
+        reason_code="cooldown_active",
+        data={"tier": "red", "cooldown_remaining_seconds": 300.0},
+    )
+
+    pipeline.emit(flat_green)
+    pipeline.emit(held_green)
+    pipeline.emit(flat_orange)
+    pipeline.emit(cooldown)
+
+    assert console.events == [held_green, cooldown]
+    assert text.events == [held_green, cooldown]
+    assert pipeline.close(timeout=2.0) is True
+
+
+def test_shutdown_stage_console_format_uses_shutdown_tag():
+    event = LiveEvent(
+        EventTypes.BOT_SHUTDOWN_STAGE,
+        status="started",
+        reason_code="maintainers_stopping",
+        message="waiting for maintainer tasks task_count=2 elapsed=0.01s",
+    )
+
+    assert (
+        format_console_event(event)
+        == "[shutdown] started reason=maintainers_stopping waiting for maintainer "
+        "tasks task_count=2 elapsed=0.01s"
+    )
+
+
+def test_route_throttle_applies_only_to_console_and_text_sinks():
+    structured = ListEventSink()
+    console = ListEventSink()
+    text = ListEventSink()
+    pipeline = LiveEventPipeline(
+        structured_sinks=[structured],
+        monitor_sinks=[],
+        console_sink=console,
+        text_sink=text,
+        routes={
+            EventTypes.CYCLE_STARTED: EventRoute(
+                structured=True,
+                monitor=False,
+                console=True,
+                text=True,
+                throttle_interval_ms=60_000,
+            )
+        },
+    )
+
+    for ts_ms in (1_000, 2_000, 61_000):
+        pipeline.emit(
+            LiveEvent(
+                EventTypes.CYCLE_STARTED,
+                status="started",
+                cycle_id=f"cy_{ts_ms}",
+                ts_ms=ts_ms,
+            )
+        )
+
+    assert pipeline.flush(timeout=2.0) is True
+    assert pipeline.close(timeout=2.0) is True
+    assert [event.cycle_id for event in structured.events] == [
+        "cy_1000",
+        "cy_2000",
+        "cy_61000",
+    ]
+    assert [event.cycle_id for event in console.events] == ["cy_1000", "cy_61000"]
+    assert [event.cycle_id for event in text.events] == ["cy_1000", "cy_61000"]
+
+
+def test_monitor_event_sink_writes_real_monitor_event_stream(tmp_path):
+    publisher = _make_monitor_publisher(tmp_path)
+    pipeline = LiveEventPipeline(
+        context=LiveEventContext(exchange="bybit", user="user01", cycle_id="cy_1"),
+        structured_sinks=[],
+        monitor_sinks=[MonitorEventSink(publisher)],
+    )
+
+    event = pipeline.emit(
+        LiveEvent(
+            "planning_unavailable",
+            tags=("planning", "ema"),
+            symbol="ETH/USDT:USDT",
+            pside="long",
+            status="deferred",
+            reason_code="stale_ema",
+            data={"age_ms": 300_000, "apiKey": "secret"},
+            ts_ms=12345,
+        )
+    )
+
+    assert event.event_type == EventTypes.PLANNING_UNAVAILABLE
+    assert pipeline.flush(timeout=2.0) is True
+    assert pipeline.close(timeout=2.0) is True
+
+    event_path = tmp_path / "bybit" / "user01" / "events" / "current.ndjson"
+    rows = [json.loads(line) for line in event_path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["kind"] == EventTypes.PLANNING_UNAVAILABLE
+    assert rows[0]["symbol"] == "ETH/USDT:USDT"
+    assert rows[0]["pside"] == "long"
+    assert rows[0]["payload"]["age_ms"] == 300_000
+    assert rows[0]["payload"]["apiKey"] == REDACTED
+    assert rows[0]["payload"]["_live_event"]["event_type"] == EventTypes.PLANNING_UNAVAILABLE
+    assert rows[0]["payload"]["_live_event"]["exchange"] == "bybit"
+    assert rows[0]["payload"]["_live_event"]["user"] == "user01"
+    assert rows[0]["payload"]["_live_event"]["symbol"] == "ETH/USDT:USDT"
+    assert rows[0]["payload"]["_live_event"]["pside"] == "long"
+    assert rows[0]["payload"]["_live_event"]["ids"]["cycle_id"] == "cy_1"
+    assert rows[0]["payload"]["_live_event"]["reason_code"] == "stale_ema"
+    assert rows[0]["payload"]["_live_event"]["data"]["apiKey"] == REDACTED
+
+
+def test_monitor_event_sink_persists_the_same_budgeted_canonical_data(tmp_path):
+    publisher = _make_monitor_publisher(tmp_path)
+    pipeline = LiveEventPipeline(
+        context=LiveEventContext(exchange="bybit", user="user01"),
+        structured_sinks=[],
+        monitor_sinks=[MonitorEventSink(publisher)],
+    )
+    event = pipeline.emit(
+        LiveEvent(
+            EventTypes.PLANNING_UNAVAILABLE,
+            data={
+                "availability": "missing_candles",
+                "samples": list(range(LIVE_EVENT_MAX_LIST_ITEMS + 1)),
+            },
+            ts_ms=12345,
+        )
+    )
+
+    assert event is not None
+    assert pipeline.flush(timeout=2.0) is True
+    assert pipeline.close(timeout=2.0) is True
+
+    event_path = tmp_path / "bybit" / "user01" / "events" / "current.ndjson"
+    row = json.loads(event_path.read_text().splitlines()[0])
+    persisted_data = row["payload"]["_live_event"]["data"]
+    assert persisted_data == event.data
+    assert row["payload"]["availability"] == "missing_candles"
+    assert persisted_data[LIVE_EVENT_BUDGET_METADATA_KEY]["omitted_items"] == 1
+
+
+def test_cycle_events_are_reconstructable_by_cycle_id():
+    structured = ListEventSink()
+    pipeline = LiveEventPipeline(
+        context=LiveEventContext(exchange="gateio", user="gateio_01", cycle_id="cy_1"),
+        structured_sinks=[structured],
+        monitor_sinks=[],
+    )
+
+    for event_type in (
+        EventTypes.CYCLE_STARTED,
+        EventTypes.DATA_PACKET_UPDATED,
+        EventTypes.SNAPSHOT_BUILT,
+        EventTypes.RUST_ORCHESTRATOR_CALLED,
+        EventTypes.RUST_ORCHESTRATOR_RETURNED,
+        EventTypes.ACTION_PLANNED,
+        EventTypes.ORDER_WAVE_COMPLETED,
+        EventTypes.EXECUTION_CONFIRMATION_TIMEOUT,
+        EventTypes.CYCLE_COMPLETED,
+    ):
+        pipeline.emit(LiveEvent(event_type, status="succeeded"))
+
+    assert pipeline.flush(timeout=2.0) is True
+    assert pipeline.close(timeout=2.0) is True
+    assert [event.event_type for event in structured.events] == [
+        EventTypes.CYCLE_STARTED,
+        EventTypes.DATA_PACKET_UPDATED,
+        EventTypes.SNAPSHOT_BUILT,
+        EventTypes.RUST_ORCHESTRATOR_CALLED,
+        EventTypes.RUST_ORCHESTRATOR_RETURNED,
+        EventTypes.ACTION_PLANNED,
+        EventTypes.ORDER_WAVE_COMPLETED,
+        EventTypes.EXECUTION_CONFIRMATION_TIMEOUT,
+        EventTypes.CYCLE_COMPLETED,
+    ]
+    assert {event.cycle_id for event in structured.events} == {"cy_1"}
+
+
+def test_authoritative_duration_is_numeric_only_and_context_scoped():
+    from live.event_bus import redact_payload, REDACTED
+    result = redact_payload(dict(authoritative=2, auth='secret', timings_ms=dict(
+        authoritative=123, authorization='secret', nested=dict(authoritative=5))))
+    assert result['authoritative'] == REDACTED
+    assert result['auth'] == REDACTED
+    assert result['timings_ms']['authoritative'] == 123
+    assert result['timings_ms']['authorization'] == REDACTED
+    assert result['timings_ms']['nested']['authoritative'] == REDACTED
+    event = LiveEvent(EventTypes.CYCLE_COMPLETED, data=dict(authoritative=2, auth='secret', timings_ms=dict(authoritative=123, authorization='secret', nested=dict(authoritative=5))))
+    assert dict(event.data) == result
+    for value in ('secret', {'secret': 'value'}, True, -1, 10**1000, float('inf'), float('nan')):
+        assert redact_payload({'timings_ms': {'authoritative': value}})['timings_ms']['authoritative'] == REDACTED
+        assert LiveEvent(EventTypes.CYCLE_COMPLETED, data={'timings_ms': {'authoritative': value}}).data['timings_ms']['authoritative'] == REDACTED

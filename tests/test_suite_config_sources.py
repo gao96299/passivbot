@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from config_utils import get_template_config
+from optimize_suite import ensure_suite_config
+
+
+def test_optimizer_suite_reads_backtest_scenarios(tmp_path: Path):
+    """Test that optimizer reads suite config from new backtest.scenarios structure."""
+    base_cfg = get_template_config()
+    base_cfg["backtest"]["suite_enabled"] = True
+    base_cfg["backtest"]["scenarios"] = [{"label": "test_scenario"}]
+    base_cfg["backtest"]["reducer"] = {"default": "mean"}
+    config_path = tmp_path / "base.json"
+    config_path.write_text(json.dumps(base_cfg))
+
+    suite_cfg = ensure_suite_config(config_path, None)
+    assert suite_cfg["enabled"] is True
+    assert suite_cfg["reducer"]["default"] == "mean"
+    assert suite_cfg["scenarios"] == [{"label": "test_scenario"}]
+
+
+def test_optimizer_suite_config_override_uses_backtest_scenarios(tmp_path: Path):
+    """Test that suite config override properly merges with base config."""
+    base_cfg = get_template_config()
+    base_cfg["backtest"]["suite_enabled"] = True
+    base_cfg["backtest"]["scenarios"] = [{"label": "base_scenario"}]
+    base_cfg["backtest"]["reducer"] = {"default": "mean"}
+
+    # Override config needs to be a full valid config
+    override_cfg = get_template_config()
+    override_cfg["backtest"]["scenarios"] = [{"label": "override_scenario"}]
+    override_cfg["backtest"]["reducer"] = {"default": "median"}
+
+    config_path = tmp_path / "base.json"
+    suite_path = tmp_path / "override.json"
+    config_path.write_text(json.dumps(base_cfg))
+    suite_path.write_text(json.dumps(override_cfg))
+
+    suite_cfg = ensure_suite_config(config_path, suite_path)
+    assert suite_cfg["enabled"] is True
+    assert suite_cfg["reducer"]["default"] == "median"
+    assert suite_cfg["scenarios"] == [{"label": "override_scenario"}]
+
+
+def test_optimizer_suite_config_override_accepts_partial_backtest_scenarios(tmp_path: Path):
+    """Suite override files do not need enough bot config fields for flavor detection."""
+    base_cfg = get_template_config()
+    base_cfg["backtest"]["suite_enabled"] = True
+    base_cfg["backtest"]["scenarios"] = [{"label": "base_scenario"}]
+
+    override_cfg = {
+        "backtest": {
+            "scenarios": [
+                {
+                    "label": "stress_window",
+                    "start_date": "2025-09-19",
+                    "end_date": "2026-01-08",
+                    "coins": ["BTC", "ETH"],
+                }
+            ],
+            "reducer": {"default": "median"},
+        }
+    }
+
+    config_path = tmp_path / "base.json"
+    suite_path = tmp_path / "partial_suite.hjson"
+    config_path.write_text(json.dumps(base_cfg))
+    suite_path.write_text(json.dumps(override_cfg))
+
+    suite_cfg = ensure_suite_config(config_path, suite_path)
+    assert suite_cfg["enabled"] is True
+    assert suite_cfg["reducer"]["default"] == "median"
+    assert suite_cfg["scenarios"] == override_cfg["backtest"]["scenarios"]
+
+
+def test_partial_backtest_suite_config_preserves_base_reducer(tmp_path: Path):
+    base_cfg = get_template_config()
+    base_cfg["backtest"]["suite_enabled"] = True
+    base_cfg["backtest"]["scenarios"] = [{"label": "base_scenario"}]
+    base_cfg["backtest"]["reducer"] = {"default": "max", "adg": "median"}
+
+    override_cfg = {
+        "backtest": {
+            "scenarios": [{"label": "stress_window"}],
+        }
+    }
+
+    config_path = tmp_path / "base.json"
+    suite_path = tmp_path / "partial_suite.hjson"
+    config_path.write_text(json.dumps(base_cfg))
+    suite_path.write_text(json.dumps(override_cfg))
+
+    suite_cfg = ensure_suite_config(config_path, suite_path)
+    assert suite_cfg["reducer"] == {"default": "max", "adg": "median"}
+    assert suite_cfg["scenarios"] == override_cfg["backtest"]["scenarios"]
+
+
+def test_partial_top_level_suite_config_preserves_base_reducer(tmp_path: Path):
+    base_cfg = get_template_config()
+    base_cfg["backtest"]["suite_enabled"] = True
+    base_cfg["backtest"]["scenarios"] = [{"label": "base_scenario"}]
+    base_cfg["backtest"]["reducer"] = {"default": "max", "adg": "median"}
+
+    override_cfg = {"scenarios": [{"label": "top_level_stress"}]}
+
+    config_path = tmp_path / "base.json"
+    suite_path = tmp_path / "partial_suite.hjson"
+    config_path.write_text(json.dumps(base_cfg))
+    suite_path.write_text(json.dumps(override_cfg))
+
+    suite_cfg = ensure_suite_config(config_path, suite_path)
+    assert suite_cfg["reducer"] == {"default": "max", "adg": "median"}
+    assert suite_cfg["scenarios"] == override_cfg["scenarios"]
+
+
+def test_optimizer_suite_legacy_override_format(tmp_path: Path):
+    """Test that legacy backtest.suite format in override config still works."""
+    base_cfg = get_template_config()
+    base_cfg["backtest"]["suite_enabled"] = True
+    base_cfg["backtest"]["scenarios"] = [{"label": "base_scenario"}]
+
+    # Legacy format with suite wrapper - needs to be a full valid config
+    override_cfg = get_template_config()
+    override_cfg["backtest"]["suite"] = {
+        "scenarios": [{"label": "legacy_override"}],
+        "aggregate": {"default": "max"},
+    }
+
+    config_path = tmp_path / "base.json"
+    suite_path = tmp_path / "override.json"
+    config_path.write_text(json.dumps(base_cfg))
+    suite_path.write_text(json.dumps(override_cfg))
+
+    suite_cfg = ensure_suite_config(config_path, suite_path)
+    assert suite_cfg["scenarios"] == [{"label": "legacy_override"}]
+    assert suite_cfg["reducer"]["default"] == "max"
+
+
+def test_optimizer_suite_legacy_override_accepts_partial_backtest_suite(tmp_path: Path):
+    base_cfg = get_template_config()
+    base_cfg["backtest"]["suite_enabled"] = True
+    base_cfg["backtest"]["scenarios"] = [{"label": "base_scenario"}]
+
+    override_cfg = {
+        "backtest": {
+            "suite": {
+                "scenarios": [{"label": "legacy_partial"}],
+                "aggregate": {"default": "min"},
+            }
+        }
+    }
+
+    config_path = tmp_path / "base.json"
+    suite_path = tmp_path / "legacy_partial_suite.hjson"
+    config_path.write_text(json.dumps(base_cfg))
+    suite_path.write_text(json.dumps(override_cfg))
+
+    suite_cfg = ensure_suite_config(config_path, suite_path)
+    assert suite_cfg["scenarios"] == [{"label": "legacy_partial"}]
+    assert suite_cfg["reducer"]["default"] == "min"

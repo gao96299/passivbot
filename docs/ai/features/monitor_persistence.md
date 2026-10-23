@@ -1,0 +1,88 @@
+# Monitor Persistence
+
+## Contract
+
+`src/monitor_publisher.py` owns monitor appends, snapshots, manifest checkpoints, rotation,
+retention, and startup recovery. Persistence failures stay visible but never alter trading behavior.
+
+`state.latest.json` is refreshed by a serialized background maintainer, independent
+of whether the trading loop reaches a valid planning snapshot. Successful and
+degraded cycles may also request a flush; concurrent requests serialize and the
+publisher's configured interval remains the write throttle. The independent
+maintainer uses a five-second minimum cadence to keep degraded state visible
+without turning diagnostic persistence into a high-frequency trading dependency.
+Trailing diagnostics resolve strategy settings once per symbol and position side within
+one synchronous section build. Those resolved settings are discarded afterward; configuration
+and coin-override changes must be observed by the next snapshot.
+
+`record_error` retains the event kind, tags, known code-owned source/stage classifications, and a
+bounded exception type. It must not persist arbitrary caller strings or numbers, exception messages,
+request URLs, responses, tracebacks, or caller-supplied raw diagnostic aliases. More detailed
+incident context belongs in an explicitly sanitized event or protected developer path; persistence
+behavior and caller control flow remain unchanged.
+
+Private normal-run monitor history may retain an explicitly sanitized incident detail event. The
+startup and execution-loop `error.bot.detail` schema stores a bounded normalized frame chain,
+correlated to its compact `error.bot` summary by incident id, while excluding exception text,
+locals, source lines, URLs, payloads, and credentials. Existing rotation and retention limits bound
+this diagnostic data; its production does not depend on DEBUG logging.
+
+During an internal bot restart, a failed or timed-out event-pipeline close may leave its worker
+holding the publisher lock. The restart path therefore abandons that process-local publisher
+without calling its synchronous close; startup recovery owns any missing final checkpoint. This
+bounded observability fallback must not delay exchange-client closure or replacement-bot startup.
+
+Event sequences are monotonic within a monitor root, including across unclean restart. The startup
+watermark is the maximum of the manifest and checksummed segment recovery metadata. Never infer an
+envelope sequence from payload bytes or an invalid row.
+
+HSL account and health equity are passive observations of fresh committed balance and
+positions plus cached held-symbol quotes. Missing or stale inputs produce `null` equity rather
+than a startup placeholder or a partial portfolio sum; reporting performs no exchange I/O.
+
+## Recovery Framing
+
+Event rows carry a `_recovery` trailer whose checksum binds the envelope to its sequence. It is
+persistence metadata, not a query-facing field.
+
+Recovery must:
+
+- remain bounded for rows larger than a scan chunk
+- accept no-final-newline and CRLF framing
+- ignore malformed, torn, altered, or checksum-mismatched rows
+- ignore payload fields resembling envelope or recovery metadata
+- retain the manifest watermark when no higher valid row exists
+- tolerate older rows without recovery trailers
+
+Framing changes require restart tests proving an appended but uncheckpointed event cannot cause
+sequence reuse.
+
+## Checkpoints And Retention
+
+Ordinary appends may coalesce manifest checkpoints to the snapshot cadence. Initialization,
+rotation boundaries, successful snapshots, and close force checkpoints. Failed due checkpoints
+remain dirty for retry.
+
+Retention protects current files, counts regular files in managed roots, and deletes only direct
+non-current candidates using strict age and oldest-first cap pruning. Races must not broaden the
+deletion domain.
+
+Window-bounded smoke selection may use `current_segment_started_ms` from the
+bounded manifest as coverage proof when no rotated predecessor exists. Missing,
+oversized, malformed, or later-than-window evidence remains unavailable rather
+than treating `current.ndjson` as complete by assumption.
+
+## Validation
+
+- manifest/row/trailer corruption and oversized rows
+- uncheckpointed restart without sequence reuse
+- checkpoint retry, rotation, and relay discovery
+- retention order, protection, accounting, races, and symlinks
+- disk-full behavior, concurrency, and event/report regressions
+
+## Key Code And Tests
+
+- `src/monitor_publisher.py`
+- `src/live/event_bus.py`
+- `tests/test_monitor_publisher.py`
+- `tests/test_live_event_bus.py`

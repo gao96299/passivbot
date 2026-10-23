@@ -1,0 +1,328 @@
+"""Utilities for configuring consistent logging across Passivbot."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import time
+from uuid import uuid4
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+TRACE_LEVEL = 5
+TRACE_LEVEL_NAME = "TRACE"
+
+DEFAULT_FORMAT = "%(asctime)s %(levelname)-8s %(message)s"
+DEFAULT_FORMAT_WITH_PREFIX = "%(asctime)s %(levelname)-8s [%(log_prefix)s] %(message)s"
+DEFAULT_DATEFMT = "%Y-%m-%dT%H:%M:%SZ"
+DEFAULT_LOG_FILENAME_MAX_LEN = 100
+STABLE_LOG_POINTER_HEADER = "symlink unavailable; current run log:"
+_WINDOWS_SYMLINK_PRIVILEGE_NOT_HELD = 1314
+_STABLE_LOG_POINTER_MAX_BYTES = 4096
+
+
+class PrefixFilter(logging.Filter):
+    """Filter that adds a log_prefix attribute to log records."""
+
+    def __init__(self, prefix: str = ""):
+        super().__init__()
+        self.prefix = prefix
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.log_prefix = self.prefix
+        return True
+
+
+_LOG_LEVEL_ALIASES = {
+    "warning": 0,
+    "warn": 0,
+    "w": 0,
+    "info": 1,
+    "i": 1,
+    "debug": 2,
+    "d": 2,
+    "trace": 3,
+    "t": 3,
+}
+
+
+def normalize_log_level(value, default=None):
+    """Return normalized log level 0-3 or default when invalid/missing."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in _LOG_LEVEL_ALIASES:
+            return _LOG_LEVEL_ALIASES[cleaned]
+        try:
+            value = float(cleaned)
+        except ValueError:
+            return default
+    try:
+        level = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(level, 3))
+
+
+def resolve_log_level(cli_value, config_value, fallback=1):
+    """Resolve final log level from CLI override and config value."""
+    cli_level = normalize_log_level(cli_value, None)
+    if cli_level is not None:
+        return cli_level
+    cfg_level = normalize_log_level(config_value, None)
+    if cfg_level is not None:
+        return cfg_level
+    return fallback
+
+
+def _ensure_trace_level() -> None:
+    """Register the TRACE log level on the logging module if missing."""
+    if logging.getLevelName(TRACE_LEVEL) != TRACE_LEVEL_NAME:
+        logging.addLevelName(TRACE_LEVEL, TRACE_LEVEL_NAME)
+    if getattr(logging, TRACE_LEVEL_NAME, None) != TRACE_LEVEL:
+        setattr(logging, TRACE_LEVEL_NAME, TRACE_LEVEL)
+
+    if not hasattr(logging.Logger, "trace"):
+
+        def trace(self: logging.Logger, msg: str, *args, **kwargs) -> None:
+            if self.isEnabledFor(TRACE_LEVEL):
+                self._log(TRACE_LEVEL, msg, args, **kwargs)
+
+        logging.Logger.trace = trace  # type: ignore[attr-defined]
+
+
+def _normalize_debug(debug: Optional[int | str]) -> int:
+    level = normalize_log_level(debug, None)
+    if level is None:
+        return 1
+    return level
+
+
+def _debug_to_level(debug: int) -> int:
+    if debug <= 0:
+        return logging.WARNING
+    if debug == 1:
+        return logging.INFO
+    if debug == 2:
+        return logging.DEBUG
+    return TRACE_LEVEL
+
+
+def sanitize_log_filename(text: str, *, max_len: int = DEFAULT_LOG_FILENAME_MAX_LEN) -> str:
+    """Return a filesystem-safe filename fragment."""
+    sanitized = re.sub(r"[\s/\\]", "_", text)
+    sanitized = re.sub(r'[<>:"|?*]', "", sanitized)
+    sanitized = sanitized.strip(". ")
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len]
+    return sanitized or "log"
+
+
+def create_command_log_filename(
+    command_args: Sequence[object], *, timestamp: Optional[datetime] = None
+) -> str:
+    """Return a timestamped log filename for a command invocation."""
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc)
+    elif timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    command_str = " ".join(str(part) for part in command_args)
+    sanitized_command = sanitize_log_filename(command_str)
+    prefix = timestamp.astimezone(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{sanitized_command}_r{uuid4().hex[:12]}.log"
+
+
+def build_command_log_path(
+    command_args: Sequence[object], log_dir: str | Path, *, timestamp: Optional[datetime] = None
+) -> Path:
+    """Return the log file path for a command invocation under the given directory."""
+    return Path(log_dir).expanduser() / create_command_log_filename(command_args, timestamp=timestamp)
+
+
+def update_stable_log_alias(alias_path: str | Path, target_path: str | Path) -> None:
+    """Point a stable log alias or pointer at the current run's timestamped logfile."""
+    alias = Path(alias_path).expanduser()
+    target = Path(target_path).expanduser()
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if alias.exists() or alias.is_symlink():
+        if alias.is_dir() and not alias.is_symlink():
+            raise RuntimeError(f"stable log alias path is a directory: {alias}")
+        alias.unlink()
+    relative_target = os.path.relpath(target, start=alias.parent)
+    try:
+        alias.symlink_to(relative_target)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == _WINDOWS_SYMLINK_PRIVILEGE_NOT_HELD:
+            try:
+                alias.write_text(
+                    f"{STABLE_LOG_POINTER_HEADER}\n{target.resolve()}\n",
+                    encoding="utf-8",
+                )
+            except OSError as pointer_exc:
+                raise RuntimeError(
+                    f"failed to write stable live log pointer {alias} -> {target}: {pointer_exc}"
+                ) from pointer_exc
+            logging.getLogger(__name__).warning(
+                "[logging] symlink privilege unavailable; wrote stable live log pointer %s -> %s",
+                alias,
+                target,
+            )
+            return
+        raise RuntimeError(
+            f"failed to create stable live log alias {alias} -> {target}: {exc}"
+        ) from exc
+
+
+def resolve_stable_log_alias(alias_path: str | Path) -> Path:
+    """Resolve the bounded Windows pointer fallback while leaving normal log paths unchanged."""
+    alias = Path(alias_path).expanduser()
+    try:
+        if alias.is_symlink() or not alias.is_file():
+            return alias
+        if alias.stat().st_size > _STABLE_LOG_POINTER_MAX_BYTES:
+            return alias
+        with alias.open("r", encoding="utf-8") as pointer_file:
+            pointer_text = pointer_file.read(_STABLE_LOG_POINTER_MAX_BYTES + 1)
+    except (OSError, UnicodeError):
+        return alias
+    if len(pointer_text) > _STABLE_LOG_POINTER_MAX_BYTES:
+        return alias
+
+    lines = pointer_text.splitlines()
+    if len(lines) != 2 or lines[0] != STABLE_LOG_POINTER_HEADER:
+        return alias
+    target = Path(lines[1])
+    if not target.is_absolute():
+        return alias
+    try:
+        if target.parent.resolve() != alias.parent.resolve():
+            return alias
+    except OSError:
+        return alias
+    return target
+
+
+def configure_logging(
+    debug: Optional[int | str] = 1,
+    *,
+    log_file: Optional[str] = None,
+    current_log_file: Optional[str] = None,
+    rotation: bool = False,
+    max_bytes: int = 10 * 1024 * 1024,
+    backup_count: int = 5,
+    stream: bool = True,
+    fmt: Optional[str] = None,
+    datefmt: str = DEFAULT_DATEFMT,
+    prefix: Optional[str] = None,
+) -> None:
+    """Initialise the root logger based on Passivbot's debug settings.
+
+    Args:
+        debug: Logging level (0=warning, 1=info, 2=debug, 3=trace)
+        log_file: Optional path to canonical log file
+        current_log_file: Optional stable alias or pointer path for the current log file
+        rotation: Enable log rotation
+        max_bytes: Max bytes per log file before rotation
+        backup_count: Number of backup files to keep
+        stream: Enable console output
+        fmt: Custom log format (defaults based on prefix)
+        datefmt: Date format string
+        prefix: Optional prefix to add to all log messages (e.g., exchange name)
+    """
+    _ensure_trace_level()
+    debug_level = _normalize_debug(debug)
+    numeric_level = _debug_to_level(debug_level)
+
+    # Choose format based on prefix
+    if fmt is None:
+        fmt = DEFAULT_FORMAT_WITH_PREFIX if prefix else DEFAULT_FORMAT
+
+    formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
+    formatter.converter = time.gmtime
+    handlers: list[logging.Handler] = []
+
+    # Create prefix filter if needed
+    prefix_filter = PrefixFilter(prefix or "") if prefix else None
+
+    if stream:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(numeric_level)
+        if prefix_filter:
+            stream_handler.addFilter(prefix_filter)
+        handlers.append(stream_handler)
+
+    if log_file:
+        path = Path(log_file).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if current_log_file:
+            update_stable_log_alias(current_log_file, path)
+        if rotation:
+            file_handler = RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backup_count)
+        else:
+            file_handler = logging.FileHandler(path)
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(numeric_level)
+        if prefix_filter:
+            file_handler.addFilter(prefix_filter)
+        handlers.append(file_handler)
+
+    root = logging.getLogger()
+    root.setLevel(numeric_level)
+
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+        existing.close()
+
+    for handler in handlers:
+        root.addHandler(handler)
+
+    # Configure CCXT logger to only log at TRACE level.
+    # CCXT logs full API request/response payloads at DEBUG, which is too noisy.
+    # These payloads belong at TRACE (level 3) per log_analysis_prompt.md guidelines.
+    ccxt_logger = logging.getLogger("ccxt")
+    if debug_level >= 3:
+        # TRACE mode: allow CCXT logs through
+        ccxt_logger.setLevel(TRACE_LEVEL)
+    else:
+        # DEBUG and below: suppress CCXT's noisy API payloads
+        # Set to WARNING so only actual warnings/errors from CCXT are shown
+        ccxt_logger.setLevel(logging.WARNING)
+
+
+def resolve_live_log_file_settings(
+    config: dict[str, Any], *, user: str, command_args: Optional[Sequence[object]] = None
+) -> dict[str, Any]:
+    """Return configure_logging kwargs for canonical live file logging."""
+    logging_cfg = config.get("logging", {}) if isinstance(config, dict) else {}
+    if not isinstance(logging_cfg, dict):
+        logging_cfg = {}
+    if not bool(logging_cfg.get("persist_to_file", True)):
+        return {
+            "log_file": None,
+            "current_log_file": None,
+            "rotation": False,
+            "max_bytes": 10 * 1024 * 1024,
+            "backup_count": 5,
+        }
+
+    log_dir = str(logging_cfg.get("dir", "logs")).strip() or "logs"
+    max_bytes_mb = float(logging_cfg.get("max_bytes_mb", 10.0))
+    backup_count = int(logging_cfg.get("backup_count", 5))
+    effective_command_args: Sequence[object]
+    if command_args:
+        effective_command_args = command_args
+    else:
+        effective_command_args = ["passivbot live", "--user", user]
+    return {
+        "log_file": str(build_command_log_path(effective_command_args, log_dir)),
+        "current_log_file": str(Path(log_dir).expanduser() / f"{user}.log"),
+        "rotation": bool(logging_cfg.get("rotation", True)),
+        "max_bytes": max(1, int(max_bytes_mb * 1024 * 1024)),
+        "backup_count": max(0, backup_count),
+    }

@@ -1,0 +1,665 @@
+from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
+from live.balance_composition import (
+    normalize_ccxt_balance_composition,
+)
+from passivbot import logging
+from passivbot_exceptions import FatalBotException
+
+import asyncio
+import random
+import re
+from ccxt.base.errors import MarginModeAlreadySet
+from utils import symbol_to_coin, ts_to_date, utc_ms
+from pure_funcs import flatten
+from procedures import load_broker_code
+from config.access import require_live_value
+
+
+class BinanceBot(CCXTBot):
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.custom_id_max_length = 36
+        # Binance fill refresh can take ~15s; wait long enough to avoid closing CCXT mid-request.
+        self._shutdown_execution_grace_seconds = 20.0
+
+    def create_ccxt_sessions(self):
+        """Binance: Add broker codes after standard setup."""
+        self.broker_code_spot = load_broker_code("binance_spot")
+        super().create_ccxt_sessions()
+        for client in [self.cca, self.ccp]:
+            if client is None:
+                continue
+            if self.broker_code:
+                for key in ["future", "delivery", "swap", "option"]:
+                    client.options["broker"][key] = "x-" + self.broker_code
+            if self.broker_code_spot:
+                for key in ["spot", "margin"]:
+                    client.options["broker"][key] = "x-" + self.broker_code_spot
+
+    async def print_new_user_suggestion(self):
+        between_print_wait_ms = 1000 * 60 * 60 * 4
+        if hasattr(self, "previous_user_suggestion_print_ts"):
+            if utc_ms() - self.previous_user_suggestion_print_ts < between_print_wait_ms:
+                return
+        self.previous_user_suggestion_print_ts = utc_ms()
+
+        try:
+            res = await self.cca.fapiprivate_get_apireferral_ifnewuser(
+                params={"brokerid": self.broker_code}
+            )
+        except Exception as e:
+            # This endpoint may not be available on all accounts - expected failure
+            logging.debug(f"fapiprivate_get_apireferral_ifnewuser not available: {e}")
+            return
+        if res["ifNewUser"] and res["rebateWorking"]:
+            return
+        import json
+
+        lines = [
+            "To support continued Passivbot development, please use a Binance account which",
+            "1) was created after 2024-09-21 and",
+            "2) either:",
+            "  a) was created without a referral link, or",
+            '  b) was created with referral ID: "TII4B07C".',
+            " ",
+            "Passivbot receives commissions from trades only for accounts meeting these criteria.",
+            " ",
+            json.dumps(res),
+        ]
+        front_pad = " " * 8 + "##"
+        back_pad = "##"
+        max_len = max([len(line) for line in lines])
+        print("\n\n")
+        print(front_pad + "#" * (max_len + 2) + back_pad)
+        for line in lines:
+            print(front_pad + " " + line + " " * (max_len - len(line) + 1) + back_pad)
+        print(front_pad + "#" * (max_len + 2) + back_pad)
+        print("\n\n")
+
+    async def execute_to_exchange(self, *, prepare_cycle: bool = True):
+        res = await super().execute_to_exchange(prepare_cycle=prepare_cycle)
+        await self.print_new_user_suggestion()
+        return res
+
+    # ═══════════════════ HOOK OVERRIDES ═══════════════════
+
+    def _get_position_side_for_order(self, order: dict) -> str:
+        """Binance provides ps (positionSide) in info."""
+        info = order.get("info") or {}
+        exchange_position_side = str(
+            info.get("positionSide") or info.get("ps") or ""
+        ).lower()
+        if not bool(getattr(self, "hedge_mode", True)):
+            return self._normalize_one_way_position_side(order)
+        if exchange_position_side in {"long", "short"}:
+            return exchange_position_side
+        if exchange_position_side == "both":
+            return self._normalize_one_way_position_side(order)
+        normalized_side = str(order.get("position_side") or "").lower()
+        if normalized_side in {"long", "short"}:
+            return normalized_side
+        raise ValueError("binance order missing authoritative position-side semantics")
+
+    def _normalize_order_update(self, order: dict) -> dict:
+        """Recover owned hedge-mode websocket rows with sparse pside metadata."""
+        try:
+            return super()._normalize_order_update(order)
+        except ValueError:
+            if not bool(getattr(self, "hedge_mode", True)):
+                raise
+            info = order.get("info") or {}
+            if any(
+                value not in (None, "")
+                for value in (
+                    order.get("position_side"),
+                    order.get("positionSide"),
+                    info.get("positionSide"),
+                    info.get("ps"),
+                )
+            ):
+                raise
+            if not self._sparse_ws_order_has_emitted_identity(order):
+                raise
+            position_side = self._durable_order_position_side(order)
+            if position_side not in {"long", "short"}:
+                raise
+            order["position_side"] = position_side
+            order["qty"] = order["amount"]
+            order["_pb_order_update_requires_authoritative_refresh"] = True
+            return order
+
+    def _canonical_open_order_reduce_only(self, order: dict) -> bool:
+        """Normalize Binance hedge action semantics; reduceOnly is not submitted in hedge mode."""
+        info = order.get("info") or {}
+        exchange_position_side = str(
+            info.get("positionSide") or info.get("ps") or ""
+        ).lower()
+        if exchange_position_side == "both" or not bool(
+            getattr(self, "hedge_mode", True)
+        ):
+            reduce_only = self._strict_order_reduce_only_response(order)
+            if not isinstance(reduce_only, bool):
+                raise ValueError("binance one-way order missing authoritative reduceOnly")
+            return reduce_only
+        position_side = self._get_position_side_for_order(order)
+        side = str(order.get("side") or "").lower()
+        if side not in {"buy", "sell"}:
+            raise ValueError("binance order missing explicit buy/sell side")
+        return (position_side == "long" and side == "sell") or (
+            position_side == "short" and side == "buy"
+        )
+
+    async def _do_fetch_positions(self) -> list:
+        """Binance: Use fapiprivatev3_get_positionrisk endpoint."""
+        return await self.cca.fapiprivatev3_get_positionrisk()
+
+    def _normalize_positions(self, fetched: list) -> list:
+        """Binance: Parse positionrisk response format."""
+        positions = []
+        for elm in fetched:
+            size = float(elm["positionAmt"])
+            if size != 0.0:
+                raw_symbol = str(elm["symbol"])
+                if self._raw_symbol_is_dated_future(raw_symbol):
+                    raise FatalBotException(
+                        "Unsupported dated futures position detected on Binance: "
+                        f"{raw_symbol}. Passivbot live supports perpetual swaps; close this "
+                        "dated futures position before starting the bot."
+                    )
+                normalized = {
+                    "symbol": self.get_symbol_id_inv(raw_symbol),
+                    "position_side": elm["positionSide"].lower(),
+                    "size": size,
+                    "price": float(elm["entryPrice"]),
+                }
+                self._preserve_position_timing(elm, normalized)
+                margin_mode = self._extract_live_margin_mode(elm)
+                if margin_mode is not None:
+                    normalized["margin_mode"] = margin_mode
+                    self._record_live_margin_mode(normalized["symbol"], margin_mode)
+                positions.append(normalized)
+        return positions
+
+    def _raw_symbol_is_dated_future(self, raw_symbol: str) -> bool:
+        for market in (getattr(self, "markets_dict", {}) or {}).values():
+            if str(market.get("id") or "") == raw_symbol:
+                return self._market_has_settlement_date(market)
+        return bool(re.search(r"_\d{6}$", raw_symbol))
+
+    def _get_balance(self, fetched: dict) -> float:
+        """Binance uses totalCrossWalletBalance in info."""
+        return float(fetched["info"]["totalCrossWalletBalance"])
+
+    # ═══════════════════ BINANCE-SPECIFIC METHODS ═══════════════════
+
+    async def _do_fetch_open_orders(self, symbol: str = None, all=False) -> list:
+        """Binance: Parallel fetch per-symbol to avoid expensive all-symbols query."""
+        if all:
+            options = getattr(self.cca, "options", None)
+            previous_warn_option = None
+            had_warn_option = False
+            if isinstance(options, dict):
+                had_warn_option = "warnOnFetchOpenOrdersWithoutSymbol" in options
+                previous_warn_option = options.get("warnOnFetchOpenOrdersWithoutSymbol")
+                options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+            logging.info("fetching all open orders for binance")
+            try:
+                fetched = await self.cca.fetch_open_orders()
+            finally:
+                if isinstance(options, dict):
+                    if had_warn_option:
+                        options["warnOnFetchOpenOrdersWithoutSymbol"] = previous_warn_option
+                    else:
+                        options.pop("warnOnFetchOpenOrdersWithoutSymbol", None)
+        else:
+            symbols_ = {symbol} if symbol is not None else self._select_open_order_symbols()
+            fetched = await self._do_fetch_open_orders_for_symbols(symbols_)
+        return fetched
+
+    def _select_open_order_symbols(
+        self,
+        extra_symbols: set[str] | list[str] | tuple[str, ...] | None = None,
+        *,
+        include_approved_if_unseeded: bool = False,
+    ) -> set[str]:
+        symbols_ = set()
+        symbols_.update([s for s in self.open_orders if self.open_orders[s]])
+        symbols_.update([s for s in self.get_symbols_with_pos()])
+        if hasattr(self, "active_symbols") and self.active_symbols:
+            symbols_.update(list(self.active_symbols))
+        if extra_symbols:
+            symbols_.update(extra_symbols)
+        if include_approved_if_unseeded and not symbols_:
+            for side_symbols in getattr(self, "approved_coins_minus_ignored_coins", {}).values():
+                symbols_.update(side_symbols)
+        markets = getattr(self, "markets_dict", {}) or {}
+        if markets:
+            symbols_ = {s for s in symbols_ if s in markets}
+        return symbols_
+
+    async def _do_fetch_open_orders_for_symbols(self, symbols: set[str]) -> list:
+        if not symbols:
+            return []
+        results = await asyncio.gather(
+            *[self.cca.fetch_open_orders(symbol=s) for s in sorted(symbols)]
+        )
+        return [x for sublist in results for x in sublist]
+
+    def _normalize_open_orders(self, fetched: list) -> list:
+        open_orders = {}
+        for elm in fetched:
+            raw_symbol = str(elm.get("info", {}).get("symbol") or "")
+            if raw_symbol and self._raw_symbol_is_dated_future(raw_symbol):
+                raise FatalBotException(
+                    "Unsupported dated futures open order detected on Binance: "
+                    f"{raw_symbol}. Passivbot live supports perpetual swaps; cancel this "
+                    "dated futures order before starting the bot."
+                )
+            elm["position_side"] = self._get_position_side_for_order(elm)
+            elm["qty"] = elm["amount"]
+            self._record_live_margin_mode_from_payload(elm)
+            open_orders[elm["id"]] = elm
+        return sorted(open_orders.values(), key=lambda x: x["timestamp"])
+
+    async def fetch_open_orders(self, symbol: str = None, all=False) -> list:
+        fetched = await self._do_fetch_open_orders(symbol=symbol, all=all)
+        return self._normalize_open_orders(fetched)
+
+    async def capture_authoritative_state_staged_snapshot(
+        self, plan: set[str], timings_ms: dict[str, int]
+    ) -> dict | None:
+        """Fetch Binance positions before open orders so symbol-scoped order fetches are seeded.
+
+        Binance open-order fetching intentionally avoids the expensive all-symbols endpoint.
+        The generic staged path fetches positions and open orders concurrently, which means
+        Binance's symbol selection can see stale local positions during startup. Sequence this
+        exchange-specific surface pair while keeping independent balance/fill fetches parallel.
+        """
+        if "open_orders" not in plan or "positions" not in plan:
+            return None
+
+        out = {"plan": set(plan), "pnls_ok": True}
+        tasks = {}
+        if "balance" in plan:
+            tasks["balance"] = asyncio.create_task(
+                self._timed_authoritative_fetch(
+                    "balance", self._capture_balance_staged_snapshot(), timings_ms
+                )
+            )
+        tasks["positions"] = asyncio.create_task(
+            self._timed_authoritative_fetch(
+                "positions", self.capture_positions_snapshot(), timings_ms
+            )
+        )
+        try:
+            _raw_positions, positions = await tasks["positions"]
+            out["positions"] = positions
+            symbols = self._select_open_order_symbols(
+                [position["symbol"] for position in positions],
+                include_approved_if_unseeded=True,
+            )
+            out["open_orders"] = await self._timed_authoritative_fetch(
+                "open_orders",
+                self._fetch_open_orders_for_staged_symbols(symbols),
+                timings_ms,
+            )
+            if "fills" in plan:
+                position_symbols = {position["symbol"] for position in positions}
+                open_order_symbols = {order["symbol"] for order in out.get("open_orders", [])}
+                self._fill_symbol_scope = sorted(position_symbols | open_order_symbols)
+                try:
+                    out["pnls_ok"] = await self._timed_authoritative_fetch(
+                        "fills", self.update_pnls(source="staged_blocking"), timings_ms
+                    )
+                finally:
+                    try:
+                        delattr(self, "_fill_symbol_scope")
+                    except AttributeError:
+                        pass
+            if "balance" in tasks:
+                _raw_balance, balance_composition, balance = await tasks["balance"]
+                out["balance"] = balance
+                out["balance_composition"] = balance_composition
+            return out
+        except Exception:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            raise
+
+    def _normalize_balance_diagnostics(self, fetched: object) -> dict:
+        """Expose only CCXT's bounded unified Binance balance maps."""
+        return normalize_ccxt_balance_composition(fetched)
+
+    async def _fetch_open_orders_for_staged_symbols(self, symbols: set[str]) -> list:
+        scoped = await self._do_fetch_open_orders_for_symbols(symbols)
+        if not bool(getattr(self, "_binance_open_orders_all_symbols_swept", False)):
+            broad = await self._do_fetch_open_orders(all=True)
+            self._binance_open_orders_all_symbols_swept = True
+            fetched = self._merge_open_order_fetch_batches(scoped, broad)
+            scoped_ids = {str(order.get("id") or "") for order in scoped if order.get("id")}
+            extra = sum(
+                1
+                for order in broad
+                if str(order.get("id") or "") not in scoped_ids
+            )
+            logging.info(
+                "[state] binance all-symbol open-order sweep complete | scoped_symbols=%d scoped_orders=%d broad_orders=%d extra_orders=%d",
+                len(symbols),
+                len(scoped),
+                len(broad),
+                extra,
+            )
+            return self._normalize_open_orders(fetched)
+        return self._normalize_open_orders(scoped)
+
+    @staticmethod
+    def _merge_open_order_fetch_batches(*batches: list[dict]) -> list[dict]:
+        merged = {}
+        for batch in batches:
+            for order in batch or []:
+                key = str(order.get("id") or "")
+                if not key:
+                    key = repr(
+                        (
+                            order.get("symbol"),
+                            order.get("timestamp"),
+                            order.get("side"),
+                            order.get("price"),
+                            order.get("amount"),
+                        )
+                    )
+                merged[key] = order
+        return list(merged.values())
+
+    async def fetch_tickers(self) -> dict:
+        """Binance: Use bookticker endpoint for efficiency."""
+        fetched = await self.cca.fapipublic_get_ticker_bookticker()
+        tickers = {}
+        for elm in fetched:
+            raw_symbol = str(elm["symbol"])
+            if self._raw_symbol_is_dated_future(raw_symbol):
+                continue
+            symbol = self.get_symbol_id_inv(raw_symbol)
+            if symbol in self.markets_dict:
+                bid = float(elm["bidPrice"])
+                ask = float(elm["askPrice"])
+                tickers[symbol] = {
+                    "bid": bid,
+                    "ask": ask,
+                    "last": random.choice([bid, ask]),
+                }
+        return tickers
+
+    async def fetch_pnls(
+        self,
+        start_time: int = None,
+        end_time: int = None,
+        limit: int = None,
+    ):
+        pnls = await self.fetch_pnls_sub(start_time, end_time, limit)
+        symbols = sorted(set(self.positions) | set([x["symbol"] for x in pnls]))
+        tasks = {}
+        for symbol in symbols:
+            tasks[symbol] = asyncio.create_task(
+                self.fetch_fills_sub(symbol, start_time, end_time, limit)
+            )
+        fills = {}
+        for symbol in tasks:
+            fills[symbol] = await tasks[symbol]
+        fills = flatten(fills.values())
+        if start_time:
+            pnls = [x for x in pnls if x["timestamp"] >= start_time]
+            fills = [x for x in fills if x["timestamp"] >= start_time]
+        unified = {x["id"]: x for x in pnls}
+        for x in fills:
+            if x["id"] in unified:
+                unified[x["id"]].update(x)
+            else:
+                unified[x["id"]] = x
+        result = []
+        for x in sorted(unified.values(), key=lambda x: x["timestamp"]):
+            if "position_side" not in x:
+                logging.info(f"debug: pnl without corresponding fill {x}")
+                x["position_side"] = "unknown"
+            result.append(x)
+        return result
+
+    async def fetch_pnls_sub(
+        self,
+        start_time: int = None,
+        end_time: int = None,
+        limit: int = None,
+    ):
+        # binance needs symbol specified for fetch fills
+        # but can fetch pnls for all symbols
+        # fetch fills for all symbols with pos
+        # fetch pnls for all symbols
+        # binance returns at most 7 days worth of pnls per fetch unless both start_time and end_time are given
+        if limit is None:
+            limit = 1000
+        else:
+            limit = min(limit, 1000)
+        if end_time is None:
+            if start_time is None:
+                return await self.fetch_pnl(limit=limit)
+            end_time = self.get_exchange_time() + 1000 * 60 * 60
+        all_fetched = {}
+        week = 1000 * 60 * 60 * 24 * 7
+        while True:
+            fetched = await self.fetch_pnl(start_time, end_time, limit)
+            if fetched == []:
+                break
+            if fetched[0]["tradeId"] in all_fetched and fetched[-1]["tradeId"] in all_fetched:
+                break
+            for elm in fetched:
+                all_fetched[elm["tradeId"]] = elm
+            if len(fetched) < limit:
+                if start_time:
+                    if end_time:
+                        if end_time - start_time < week:
+                            break
+                    else:
+                        if self.get_exchange_time() - start_time < week:
+                            break
+            logging.info(
+                f"fetched {len(fetched)} pnls from {ts_to_date(fetched[0]['timestamp'])[:19]} until {ts_to_date(fetched[-1]['timestamp'])[:19]}"
+            )
+            start_time = fetched[-1]["timestamp"]
+        return sorted(all_fetched.values(), key=lambda x: x["timestamp"])
+
+    async def gather_fill_events(self, start_time=None, end_time=None, limit=None):
+        """Return canonical fill events for Binance."""
+        events = []
+        fills = await self.fetch_pnls(start_time=start_time, end_time=end_time, limit=limit)
+        for fill in fills:
+            events.append(
+                {
+                    "id": fill.get("id") or fill.get("tradeId"),
+                    "timestamp": fill.get("timestamp"),
+                    "symbol": fill.get("symbol"),
+                    "side": fill.get("side"),
+                    "position_side": fill.get("position_side", fill.get("pside")),
+                    "qty": fill.get("qty") or fill.get("amount"),
+                    "price": fill.get("price"),
+                    "pnl": fill.get("pnl"),
+                    "fee": fill.get("fee"),
+                    "info": fill.get("info"),
+                }
+            )
+        return events
+
+    async def fetch_fills_sub(self, symbol, start_time=None, end_time=None, limit=None):
+        if symbol not in self.markets_dict:
+            return []
+        # limit is max 1000
+        # fetches at most 7 days worth
+        max_limit = 1000
+        limit = min(max_limit, limit) if limit else max_limit
+        if start_time is None and end_time is None:
+            fills = await self.cca.fetch_my_trades(symbol, limit=limit)
+            all_fills = {x["id"]: x for x in fills}
+        elif start_time is None:
+            fills = await self.cca.fetch_my_trades(
+                symbol, limit=limit, params={"endTime": int(end_time)}
+            )
+            all_fills = {x["id"]: x for x in fills}
+        else:
+            if end_time is None:
+                end_time = self.get_exchange_time() + 1000 * 60 * 60
+            all_fills = {}
+            week = 1000 * 60 * 60 * 24 * 7.0
+            start_time_sub = start_time
+            while True:
+                param_start_time = int(min(start_time_sub, self.get_exchange_time() - 1000 * 60))
+                param_end_time = max(
+                    param_start_time, int(min(end_time, start_time_sub + week * 0.999))
+                )
+                fills = await self.cca.fetch_my_trades(
+                    symbol,
+                    limit=limit,
+                    params={
+                        "startTime": param_start_time,
+                        "endTime": param_end_time,
+                    },
+                )
+                if not fills:
+                    if end_time - start_time_sub < week * 0.9:
+                        self.debug_print("debug fetch_fills_sub a", symbol)
+                        break
+                    else:
+                        logging.info(
+                            f"fetched 0 fills for {symbol} between {ts_to_date(start_time_sub)[:19]} and {ts_to_date(end_time)[:19]}"
+                        )
+                        start_time_sub += week
+                        continue
+                if fills[0]["id"] in all_fills and fills[-1]["id"] in all_fills:
+                    if end_time - start_time_sub < week * 0.9:
+                        self.debug_print("debug fetch_fills_sub b", symbol)
+                        break
+                    else:
+                        logging.info(
+                            f"fetched 0 new fills for {symbol} between {ts_to_date(start_time_sub)[:19]} and {ts_to_date(end_time)[:19]}"
+                        )
+                        start_time_sub += week
+                        continue
+                else:
+                    for x in fills:
+                        all_fills[x["id"]] = x
+                if end_time - start_time_sub < week * 0.9 and len(fills) < limit:
+                    self.debug_print("debug fetch_fills_sub c", symbol)
+                    break
+                start_time_sub = fills[-1]["timestamp"]
+                logging.info(
+                    f"fetched {len(fills)} fill{'s' if len(fills) > 1 else ''} for {symbol} {ts_to_date(fills[0]['timestamp'])[:19]}"
+                )
+        all_fills = sorted(all_fills.values(), key=lambda x: x["timestamp"])
+        for i in range(len(all_fills)):
+            all_fills[i]["pnl"] = float(all_fills[i]["info"]["realizedPnl"])
+            all_fills[i]["position_side"] = all_fills[i]["info"]["positionSide"].lower()
+        return all_fills
+
+    async def fetch_pnl(
+        self,
+        start_time: int = None,
+        end_time: int = None,
+        limit: int = None,
+    ):
+        # will fetch from start_time until end_time, earliest first
+        # if start_time is None and end_time is None, will only fetch for last 7 days
+        # if end_time is None, will fetch for more than 7 days
+        # if start_time is None, will only fetch for last 7 days
+        max_limit = 1000
+        if limit is None:
+            limit = max_limit
+        params = {"incomeType": "REALIZED_PNL", "limit": min(max_limit, limit)}
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        fetched = await self.cca.fapiprivate_get_income(params=params)
+        for i in range(len(fetched)):
+            fetched[i]["symbol"] = self.get_symbol_id_inv(fetched[i]["symbol"])
+            fetched[i]["pnl"] = float(fetched[i]["income"])
+            fetched[i]["timestamp"] = float(fetched[i]["time"])
+            fetched[i]["id"] = fetched[i]["tradeId"]
+        return sorted(fetched, key=lambda x: x["timestamp"])
+
+    def _build_order_params(self, order: dict) -> dict:
+        order_type = order.get("type", "limit")
+        params = {
+            "positionSide": order["position_side"].upper(),
+            "newClientOrderId": order["custom_id"],
+        }
+        if order_type == "limit":
+            tif = require_live_value(self.config, "time_in_force")
+            params["timeInForce"] = "GTX" if tif == "post_only" else "GTC"
+        return params
+
+    async def update_exchange_config_by_symbols(self, symbols):
+        coros_to_call_lev, coros_to_call_margin_mode = {}, {}
+        for symbol in symbols:
+            margin_mode = self._get_margin_mode_for_symbol(symbol)
+            coros_to_call_margin_mode[symbol] = asyncio.create_task(
+                self.cca.set_margin_mode(margin_mode, symbol=symbol)
+            )
+            coros_to_call_lev[symbol] = asyncio.create_task(
+                self.cca.set_leverage(
+                    self._calc_leverage_for_symbol(symbol), symbol=symbol
+                )
+            )
+        for symbol in symbols:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
+            res = None
+            to_print = ""
+            try:
+                res = await coros_to_call_lev[symbol]
+                to_print += f"leverage={format_exchange_config_response(res)} "
+            except Exception as e:
+                logging.error(
+                    "[config] %s leverage update failed | %s",
+                    log_symbol,
+                    self._format_exchange_config_error(e),
+                )
+            try:
+                res_margin = await coros_to_call_margin_mode[symbol]
+                to_print += f"margin={format_exchange_config_response(res_margin)}"
+            except MarginModeAlreadySet:
+                logging.debug(
+                    "[config] %s margin mode unchanged | error_type=MarginModeAlreadySet",
+                    log_symbol,
+                )
+            except Exception as e:
+                logging.error(
+                    "[config] %s cross-margin update failed | %s",
+                    log_symbol,
+                    self._format_exchange_config_error(e),
+                )
+            if to_print:
+                logging.info(f"{log_symbol}: {to_print}")
+
+    async def _prepare_protective_account(self):
+        current = await self.cca.fetch_position_mode()
+        if current.get("hedged") is not True:
+            raise RuntimeError("Binance protective startup requires existing hedge position mode")
+
+    async def update_exchange_config(self):
+        try:
+            res = await self.cca.set_position_mode(True)
+            logging.debug(
+                "[config] set hedge mode response: %s", format_exchange_config_response(res)
+            )
+        except Exception as e:
+            if '"code":-4059' in str(e):
+                logging.debug("[config] hedge mode unchanged | code=-4059")
+            else:
+                logging.error(
+                    "[config] hedge mode update failed | %s",
+                    self._format_exchange_config_error(e),
+                )
+                raise
+
+    def format_custom_id_single(self, order_type_id: int) -> str:
+        formatted = super().format_custom_id_single(order_type_id)
+        return ("x-" + self.broker_code + formatted)[: self.custom_id_max_length]
